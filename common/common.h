@@ -715,6 +715,7 @@ struct common_params {
     uint32_t sj_kvarn_edge_layers = 0; // tiered body: first/last N cache layers sealed at sj_kvarn_edge_bits_k/v
     uint32_t sj_kvarn_edge_bits_k = 4;
     uint32_t sj_kvarn_edge_bits_v = 4;
+    std::string sj_kvarn_transform;  // EXPERIMENTAL WUSH-KV transform file (--sjkvarn-transform)
     uint32_t sj_kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
     ggml_type cache_type_s = GGML_TYPE_F32; // recurrent (gated delta-net) state cache data type
 

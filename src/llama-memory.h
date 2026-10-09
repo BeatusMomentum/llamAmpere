@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct llama_ubatch;
@@ -55,6 +56,7 @@ struct llama_sj_kvarn_config {
     // multi-sequence (--kv-unified): one record pool shared by all sequences (each sequence still gets its own
     // sink/ring stream), so one sequence can use nearly the whole budget; false: a full-length pool per sequence
     bool shared_pool = false;
+    std::string transform;    // EXPERIMENTAL WUSH-KV transform file (empty = Hadamard)
 
     bool enabled() const { return bits_k > 0 && bits_v > 0; }
 };

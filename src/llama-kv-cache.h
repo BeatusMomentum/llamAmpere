@@ -255,6 +255,17 @@ public:
     const llama_sj_kvarn_config & get_sj_kvarn() const { return sj_kvarn; }
     // SJ-KVaRN fused write rotation (#139): cpy_k/cpy_v rotate K/V inside the TQ6_0 cache write
     bool sj_kvarn_fused_rot() const { return sj_kvarn_fused_rot_on; }
+    // EXPERIMENTAL WUSH-KV (arXiv 2609.38121): per-layer transforms replacing the Hadamard; nullptr = Hadamard layer
+    struct sj_wush_layer {
+        ggml_tensor * aq = nullptr; // F32 [D, D, n_head_kv]: q' = AQ q   (row-major per head, ggml_mul_mat(A, x) = A x)
+        ggml_tensor * ak = nullptr; // k' = AK k
+        ggml_tensor * av = nullptr; // v' = AV v
+        ggml_tensor * ao = nullptr; // o  = AO o'
+    };
+    const sj_wush_layer * get_sj_wush(int32_t il) const {
+        auto it = sj_wush.find(il);
+        return it == sj_wush.end() ? nullptr : &it->second;
+    }
     int  sj_kvarn_rot_group() const { return sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? 128 : 256; }
     ggml_tensor * get_sj_kvarn_body(int32_t il) const;
     bool maintain_sj_kvarn(llama_context * lctx);
@@ -383,6 +394,10 @@ private:
     uint32_t sj_kvarn_n_groups      = 0; // records per head in the pool
     uint32_t sj_kvarn_n_groups_seal = 0; // static per-ubatch seal launch size
     bool     sj_kvarn_fused_rot_on  = false; // #139, see sj_kvarn_fused_rot()
+    void sj_wush_upload(); // (re)upload sj_wush_host into the transform tensors
+    std::map<int32_t, sj_wush_layer> sj_wush;  // EXPERIMENTAL WUSH-KV, see get_sj_wush()
+    std::map<int32_t, std::vector<float>> sj_wush_host; // file contents per layer (AQ|AK|AV|AO), uploaded after the buffer clear
+    uint64_t sj_wush_hash = 0;                 // FNV-1a 64 of the transform file (0 = off)
     size_t   sj_kvarn_rec_bytes[2]  = {0, 0}; // per tier (0 interior, 1 edge)
     uint32_t sj_kvarn_n_layers_edge = 0;      // cache layers on tier 1 (first + last edge_layers)
     // per-stream bookkeeping (one stream per sequence; a single-sequence cache has exactly one)
@@ -653,6 +668,7 @@ public:
     ggml_tensor * get_sj_kvarn_body(int32_t il) const;
     const llama_sj_kvarn_config & get_sj_kvarn() const;
     bool sj_kvarn_fused_rot() const; // #139: the cache write rotates K/V (graph skips its K/V WHT)
+    const llama_kv_cache::sj_wush_layer * get_sj_wush(int32_t il) const; // EXPERIMENTAL WUSH-KV
     ggml_tensor * build_input_sj_kvarn_desc(ggml_context * ctx, const llama_ubatch & ubatch) const;
     void set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, int tier = 0) const;
     // multi-stream caches: padded attended position count of each stream of the current ubatch (empty otherwise)

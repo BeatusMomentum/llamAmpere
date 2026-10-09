@@ -2794,6 +2794,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SJKVARN_FLUSH_CHUNK"));
     add_opt(common_arg(
+        {"--sjkvarn-transform"}, "FILE",
+        "EXPERIMENTAL (arXiv 2609.38121 WUSH-KV): per-layer, per-KV-head K/V transform file (SJWU format) applied in place "
+        "of the SJ-KVaRN Hadamard on the listed layers; disables the fused write rotation; saved states record its hash",
+        [](common_params & params, const std::string & value) {
+            params.sj_kvarn_transform = value;
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_TRANSFORM"));
+    add_opt(common_arg(
         {"--sjkvarn-sink"}, "N",
         string_format("SJ-KVaRN cache: number of leading positions kept unsealed (multiple of 64, default: %u)", params.sj_kvarn_sink),
         [](common_params & params, int value) {

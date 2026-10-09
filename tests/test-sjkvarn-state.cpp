@@ -94,6 +94,7 @@ struct sj_cfg {
     uint32_t  edge_layers = 0, edge_bits_k = 4, edge_bits_v = 4;
     ggml_type edge_body = GGML_TYPE_F32;
     bool      plain = false;        // plain f16 cache (no SJ-KVaRN)
+    const char * transform = nullptr; // EXPERIMENTAL WUSH-KV transform file (--sjkvarn-transform)
 };
 
 static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t n_seq = 1, bool unified = false) {
@@ -121,6 +122,7 @@ static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t 
         cp.sj_kvarn_edge_bits_k = c.edge_bits_k;
         cp.sj_kvarn_edge_bits_v = c.edge_bits_v;
         cp.sj_kvarn_edge_body_type = c.edge_body;
+        cp.sj_kvarn_transform = c.transform;
     }
     return llama_init_from_model(model, cp);
 }
@@ -657,6 +659,40 @@ static int run_multi(llama_model * model, const sj_cfg & c, bool unified) {
     return result;
 }
 
+// EXPERIMENTAL WUSH-KV transform file: per layer AK = Had D_k, AQ = AK^-T = Had D_k^-1, AV = Had D_v, AO = AV^-1 = D_v^-1 Had
+// (Had = normalized 256-pt Sylvester Hadamard, D = positive diagonal), so q.k and the attention output are preserved exactly.
+static std::string write_transform(const char * dir, const char * name, uint32_t seed) {
+    const uint32_t D = 256, H = 2;
+    std::vector<float> had(D*D);
+    for (uint32_t i = 0; i < D; ++i) for (uint32_t j = 0; j < D; ++j) {
+        had[i*D + j] = (__builtin_popcount(i & j) & 1 ? -1.0f : 1.0f) / 16.0f;
+    }
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> dis(0.5f, 2.0f);
+    const std::string path = std::string(dir) + "/" + name;
+    FILE * f = fopen(path.c_str(), "wb");
+    require(f != nullptr, "cannot write " + path);
+    const uint32_t hdr[4] = { 1, D, H, n_layer };
+    fwrite("SJWU", 1, 4, f); fwrite(hdr, 4, 4, f);
+    for (int32_t il = 0; il < (int32_t) n_layer; ++il) {
+        std::vector<float> dk(H*D), dv(H*D);
+        for (auto & x : dk) x = dis(gen);
+        for (auto & x : dv) x = dis(gen);
+        std::vector<float> aq(H*D*D), ak(H*D*D), av(H*D*D), ao(H*D*D);
+        for (uint32_t h = 0; h < H; ++h) for (uint32_t i = 0; i < D; ++i) for (uint32_t j = 0; j < D; ++j) {
+            const size_t o = (size_t) h*D*D + i*D + j;
+            ak[o] = had[i*D + j]*dk[h*D + j];
+            aq[o] = had[i*D + j]/dk[h*D + j];
+            av[o] = had[i*D + j]*dv[h*D + j];
+            ao[o] = had[i*D + j]/dv[h*D + i];
+        }
+        fwrite(&il, 4, 1, f);
+        for (auto * m : { &aq, &ak, &av, &ao }) fwrite(m->data(), 4, m->size(), f);
+    }
+    fclose(f);
+    return path;
+}
+
 int main(int argc, char ** argv) {
     const char * tmp_dir = argc > 1 ? argv[1] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ggml_backend_load_all();
@@ -687,8 +723,16 @@ int main(int argc, char ** argv) {
     sj_cfg m_stg  = with(s44, "q8_0 staging");   m_stg.staging = GGML_TYPE_Q8_0; m_stg.sink = GGML_TYPE_COUNT;
     sj_cfg m_plain = with(s44, "plain f16");     m_plain.plain = true;
 
+    const std::string wpath1 = write_transform(tmp_dir, "test-sjkvarn-state-w1.sjwu", 1);
+    const std::string wpath2 = write_transform(tmp_dir, "test-sjkvarn-state-w2.sjwu", 2);
+    sj_cfg w1 = s44; w1.name = "4/4 wush"; w1.transform = wpath1.c_str();
+    sj_cfg w2 = with(s44, "other transform"); w2.transform = wpath2.c_str();
+    sj_cfg w1t = s33t; w1t.name = "3/3t wush"; w1t.transform = wpath1.c_str();
+
     const std::vector<std::pair<sj_cfg, std::vector<sj_cfg>>> cases = {
-        { s44,   { s33, s33t, s32t, tier, m_tail, m_tmax, m_stg, m_plain } },
+        { s44,   { s33, s33t, s32t, tier, m_tail, m_tmax, m_stg, m_plain, w1 } },
+        { w1,    { s44, w2 } },
+        { w1t,   { s33t } },
         { s33,   { s44, s33t } },
         { s33t,  { s33, s32t, f16 } },
         { s32t,  { s33t, tier } },
@@ -710,7 +754,8 @@ int main(int argc, char ** argv) {
         fails_multi += run_multi(model, c, false);
     }
     fails_multi += run_multi(model, s44, true);
-    printf("%s: %d/%zu cases passed, multi-sequence %d/4\n", fails || fails_multi ? "FAIL" : "OK", (int) (cases.size() - fails), cases.size(), 4 - fails_multi);
+    fails_multi += run_multi(model, w1t, false); // transform with one FA node per stream
+    printf("%s: %d/%zu cases passed, multi-sequence %d/5\n", fails || fails_multi ? "FAIL" : "OK", (int) (cases.size() - fails), cases.size(), 5 - fails_multi);
     fails += fails_multi;
     llama_model_free(model);
     llama_backend_free();
