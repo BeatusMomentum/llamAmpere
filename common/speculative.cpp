@@ -3800,7 +3800,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     }
     // The nextn layer has no trunk edge tier, and no WUSH transform (the file covers trunk layers only).
     result.sj_kvarn_edge_layers = 0;
-    result.sj_kvarn_transform = nullptr;
+    result.sj_kvarn_transform.clear();
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
