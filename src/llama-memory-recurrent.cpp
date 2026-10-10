@@ -1085,6 +1085,10 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
             ++cell_count;
             uint32_t rs_idx_cur = 0;
             uint32_t span_cur   = 0;
+            // gdn_replay: s_l of this cell already holds the logical state (no rollback pending,
+            // not stale), so a reader can resume from it instead of rebuilding s_ckpt + ring --
+            // with a 16-bit state the rebuild rounds a second time and is not bit-exact
+            bool     s_exact    = true;
 
             if (n_rs_seq != 0) {
                 // under gdn_replay a pending rollback lives in replay_len, and the logical conv
@@ -1095,6 +1099,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                     rs_idx_cur = group_of[seq_id];
                     if (gdn_replay) {
                         span_cur = ckpt_span[seq_id] - std::min(ckpt_span[seq_id], replay_len[seq_id]);
+                        s_exact  = replay_len[seq_id] == 0 && !s_stale[seq_id];
                     }
                 } else {
                     bool has_rs_idx = false;
@@ -1103,6 +1108,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
                         const uint32_t seq_rs_idx = group_of[cell_seq_id];
                         const uint32_t seq_span   = gdn_replay ? ckpt_span[cell_seq_id] - std::min(ckpt_span[cell_seq_id], replay_len[cell_seq_id]) : 0;
+                        s_exact = s_exact && gdn_replay && replay_len[cell_seq_id] == 0 && !s_stale[cell_seq_id];
                         if (!has_rs_idx) {
                             rs_idx_cur = seq_rs_idx;
                             span_cur   = seq_span;
@@ -1130,7 +1136,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
             } else {
                 cell_ranges_data_s.back().second++;
             }
-            cell_spans.push_back(span_cur);
+            cell_spans.push_back(span_cur | (gdn_replay && s_exact ? REPLAY_SPAN_S_EXACT : 0u));
 
             if (cell_range_begin == size) {
                 cell_range_begin = i;
@@ -1237,7 +1243,8 @@ bool llama_memory_recurrent::state_read_replay(llama_io_read_i & io, uint32_t ce
     uint32_t n_rs_seq_ref;
     io.read(&marker,       sizeof(marker));
     io.read(&n_rs_seq_ref, sizeof(n_rs_seq_ref));
-    if (marker != 0x52504C59) {
+    const bool has_exact_bit = marker == 0x52504C32; // 'RPL2'
+    if (marker != 0x52504C59 && !has_exact_bit) {
         LLAMA_LOG_ERROR("%s: state blob has no gdn_replay section (written without --gdn-replay?)\n", __func__);
         return false;
     }
@@ -1250,6 +1257,10 @@ bool llama_memory_recurrent::state_read_replay(llama_io_read_i & io, uint32_t ce
     for (uint32_t i = 0; i < cell_count; ++i) {
         uint32_t span;
         io.read(&span, sizeof(span));
+        const bool s_exact = has_exact_bit && (span & REPLAY_SPAN_S_EXACT);
+        if (has_exact_bit) {
+            span &= ~REPLAY_SPAN_S_EXACT;
+        }
         if (span > n_rs_seq) {
             LLAMA_LOG_ERROR("%s: invalid checkpoint span %u > n_rs_seq %u\n", __func__, span, n_rs_seq);
             return false;
@@ -1258,9 +1269,11 @@ bool llama_memory_recurrent::state_read_replay(llama_io_read_i & io, uint32_t ce
             if (seq >= 0 && (size_t) seq < ckpt_span.size()) {
                 ckpt_span[seq]  = span;
                 replay_len[seq] = 0;
-                // s_l now holds the optimistic state the writer had; the logical state is
-                // s_ckpt + ring[0, span) and must be rebuilt on the next decode.
-                s_stale[seq]    = 1;
+                // s_l now holds the state the writer had. Unless the writer flagged it as the
+                // logical state (no rollback pending), the logical state is s_ckpt + ring[0, span)
+                // and must be rebuilt on the next decode. Resuming from an exact s_l keeps a
+                // 16-bit state bit-identical to the uninterrupted sequence.
+                s_stale[seq]    = s_exact ? 0 : 1;
             }
         }
     }
@@ -1408,7 +1421,9 @@ void llama_memory_recurrent::state_write_replay(llama_io_write_i & io, const std
     // section header: a marker so a non-replay reader fails on a size mismatch rather than
     // misparsing, the ring capacity, then the per-cell span of the logical state behind the
     // checkpoint (s_ckpt + ring[0, span) == the state the blob represents).
-    const uint32_t marker = 0x52504C59; // 'RPLY'
+    // 'RPL2': the span's top bit (REPLAY_SPAN_S_EXACT) says the s_l row is the logical state.
+    // 'RPLY' (older writers) had no such bit, so its reader always rebuilt.
+    const uint32_t marker = 0x52504C32; // 'RPL2'
     io.write(&marker,   sizeof(marker));
     io.write(&n_rs_seq, sizeof(n_rs_seq));
     for (const uint32_t span : cell_spans) {

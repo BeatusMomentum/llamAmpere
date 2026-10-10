@@ -22,7 +22,10 @@
 // not resident in the KV buffer and llama_state_* refuses it.
 // SJ-KVaRN pairs are covered by test-sjkvarn-state.
 //
-// usage: test-prompt-cache-types -m model-with-mtp.gguf [--full] [--cpu] [--filter SUBSTR] [--ngl N]
+// usage: test-prompt-cache-types -m model-with-mtp.gguf [--full] [--cpu] [--filter SUBSTR] [--ngl N] [--gdn-replay] [--rollback N]
+//   --gdn-replay : the trunk keeps its GDN rollback state in the ingredient-replay layout
+//   --rollback N : before the save the trunk decodes N more tokens and rolls them back (seq_rm), so the
+//                  blob is written with a rollback pending, as after a rejected draft (N <= 4)
 //   default: every trunk pair with inherited drafter types and f32 state, every drafter
 //            pair on the tq5_0/turbo4 trunk, every state type on four trunk pairs, and
 //            the core cross product (4 trunk x 4 drafter x 4 state)
@@ -111,6 +114,8 @@ struct options {
     int         ngl    = 999;
     std::string filter;
     int         n_prompt = 300;
+    bool        gdn_replay = false;
+    int         rollback   = 0;
 };
 
 struct case_result {
@@ -131,6 +136,7 @@ static llama_context * make_trunk(llama_model * model, const options & opt, cons
     cp.type_k          = kv.k;
     cp.type_v          = kv.v;
     cp.type_s          = ts;
+    cp.gdn_replay      = opt.gdn_replay;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.n_threads       = 8;
     cp.n_threads_batch = 8;
@@ -269,6 +275,13 @@ static case_result run_case(llama_model * model, const options & opt, const kv_p
     std::vector<float> ref_t, ref_d;
     bool ok = decode_trunk(a_t, prompt, 0, 0) && decode_draft(a_d, n_embd, std::vector<llama_token>(dtoks.begin(), dtoks.end() - 1), 0, 0);
     if (!ok) { r.why = "prompt decode failed"; }
+    if (ok && opt.rollback > 0) {
+        // a rejected draft: decode N tokens past the prompt, then roll them back
+        std::vector<llama_token> rej(opt.rollback);
+        for (int i = 0; i < opt.rollback; ++i) { rej[i] = prompt[(size_t) i * 7 % prompt.size()]; }
+        ok = decode_trunk(a_t, rej, n_p, 0) && llama_memory_seq_rm(llama_get_memory(a_t), 0, n_p, -1);
+        if (!ok) { r.why = "rollback decode/seq_rm failed"; }
+    }
     if (ok) {
         st_t = save_seq(a_t, 0);
         st_d = save_seq(a_d, 0);
@@ -366,6 +379,8 @@ int main(int argc, char ** argv) {
         else if (a == "--ngl" && i + 1 < argc)            { opt.ngl = atoi(argv[++i]); }
         else if (a == "--filter" && i + 1 < argc)         { opt.filter = argv[++i]; }
         else if (a == "--n-prompt" && i + 1 < argc)       { opt.n_prompt = atoi(argv[++i]); }
+        else if (a == "--gdn-replay")                     { opt.gdn_replay = true; }
+        else if (a == "--rollback" && i + 1 < argc)       { opt.rollback = atoi(argv[++i]); }
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (opt.model.empty()) {
@@ -433,7 +448,7 @@ int main(int argc, char ** argv) {
         printf("%s %s  %s\n", r.ok ? "PASS" : "FAIL", name, r.why.c_str());
         fflush(stdout);
     }
-    printf("%d cases, %d failed (%s)\n", n_run, n_fail, opt.cpu ? "CPU" : "GPU");
+    printf("%d cases, %d failed (%s%s, rollback %d)\n", n_run, n_fail, opt.cpu ? "CPU" : "GPU", opt.gdn_replay ? ", gdn-replay" : "", opt.rollback);
 
     llama_model_free(model);
     llama_backend_free();
