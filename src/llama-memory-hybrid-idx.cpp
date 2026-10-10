@@ -75,6 +75,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
     do {
         balloc.split_reset();
+        balloc.set_split_pos_grid(get_mem_attn()->get_sj_kvarn_pos_grid()); // [#197]
 
         // [TAG_GDN_REPLAY_SPLIT]
         auto rsplit = get_mem_recr()->make_replay_split(balloc);

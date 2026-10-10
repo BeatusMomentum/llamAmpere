@@ -169,6 +169,11 @@ public:
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
+    // [#197] position grid for the splits below (0 = off): a ubatch never continues past a token whose position is
+    // a multiple of the grid, so every ubatch lies inside one grid cell whatever the batch boundaries were (set by a
+    // memory whose per-ubatch state follows the cell of the ubatch start, e.g. the SJ-KVaRN sealed end)
+    void set_split_pos_grid(uint32_t grid) { split_pos_grid = grid; }
+
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
 
@@ -188,6 +193,13 @@ public:
 
 private:
     void clear();
+
+    uint32_t split_pos_grid = 0;
+
+    // true if the token at batch index idx starts a new grid cell (a ubatch must not continue into it)
+    bool split_on_grid(int32_t idx) const {
+        return split_pos_grid > 0 && batch.pos[idx] > 0 && batch.pos[idx] % (llama_pos) split_pos_grid == 0;
+    }
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
