@@ -1784,6 +1784,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             chain_rng_seeded[seq_id] = 0; // [#69] same for the sampled chain's uniform stream
         }
 
+        // [#196] new request: restart the adaptive depth controller of this seq at its floor, so the
+        // verify widths (and with them the temp-0 output) depend only on this request, not on whatever
+        // the previous request on the slot left behind. LLAMA_SPEC_ADAPTIVE_CARRY=1 keeps the old
+        // carry-over across requests (A/B arm for the speed gate).
+        if (adaptive && seq_id >= 0 && seq_id < (llama_seq_id) adaptive_ctrl.size()) {
+            static const bool carry = [] { const char * e = getenv("LLAMA_SPEC_ADAPTIVE_CARRY"); return e && atoi(e) != 0; }();
+            if (!carry) {
+                adaptive_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
+            }
+        }
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
