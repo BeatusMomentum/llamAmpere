@@ -4,6 +4,7 @@
 //   supersede / dedupe rules.
 
 #include "server-prompt-cache-disk.h"
+#include "server-task.h"
 
 #include "common.h"
 #include "log.h"
@@ -15,6 +16,8 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <algorithm>
+#include <cstdint>
 #include <vector>
 
 #ifndef _WIN32
@@ -443,6 +446,59 @@ static void test_supersede_dedupe(const std::string & root) {
     CHECK(t.n_match() == 2);
 }
 
+// [#187] recycled RAM-tier state buffers: reuse without a fresh allocation, bounded count, trimmed to the limit
+static void test_spare_pool() {
+    server_prompt_cache pc(1024, 0);
+    std::vector<uint8_t> a = pc.take_buffer(64*MiB);
+    CHECK(a.size() == 64*MiB && a.capacity() >= 72*MiB); // 1/8 headroom
+    a[0] = 42;
+    const uint8_t * pa = a.data();
+    pc.recycle(a);
+    CHECK(a.empty() && pc.spare.size() == 1 && pc.spare_size() >= 72*MiB);
+
+    // a slightly longer save of the same conversation fits the recycled buffer: same memory, no fresh allocation
+    std::vector<uint8_t> b = pc.take_buffer(70*MiB);
+    CHECK(b.data() == pa && b.size() == 70*MiB && pc.spare.empty());
+
+    // too large for every spare: a fresh buffer, the spare stays
+    pc.recycle(b);
+    std::vector<uint8_t> c = pc.take_buffer(100*MiB);
+    CHECK(c.data() != pa && pc.spare.size() == 1);
+    // the smallest fitting spare is chosen
+    pc.recycle(c);
+    std::vector<uint8_t> d = pc.take_buffer(50*MiB);
+    CHECK(d.data() == pa && pc.spare.size() == 1);
+    d.clear(); d.shrink_to_fit();
+
+    // small buffers are not kept; empty requests take nothing
+    std::vector<uint8_t> small(1*MiB);
+    pc.recycle(small);
+    CHECK(pc.spare.size() == 1 && small.empty());
+    CHECK(pc.take_buffer(0).empty() && pc.spare.size() == 1);
+
+    // at most spare_max_n buffers: the smallest is dropped
+    pc.spare.clear();
+    for (size_t mb : {20, 30, 40, 50, 60}) {
+        std::vector<uint8_t> v(mb*MiB);
+        pc.recycle(v);
+    }
+    CHECK(pc.spare.size() == 4);
+    size_t min_cap = SIZE_MAX;
+    for (const auto & v : pc.spare) {
+        min_cap = std::min(min_cap, v.capacity());
+    }
+    CHECK(min_cap == 30*MiB);
+
+    // spares count against the RAM limit and the largest go first
+    pc.limit_size = 100*MiB;
+    pc.trim_spare(0);
+    CHECK(pc.spare_size() <= 100*MiB && pc.spare.size() == 2); // 30 + 40 left
+    pc.trim_spare(50*MiB);
+    CHECK(pc.spare.size() == 1 && pc.spare_size() == 30*MiB);
+    pc.update();
+    CHECK(pc.spare.size() == 1);
+}
+
 int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
@@ -454,6 +510,7 @@ int main() {
     test_guard(root);
     test_corrupt_cleanup(root);
     test_supersede_dedupe(root);
+    test_spare_pool();
 
     std::error_code ec;
     fs::remove_all(root, ec);

@@ -668,6 +668,24 @@ struct server_prompt_cache {
     // disk tier: RAM evictions are spilled here and consulted on a RAM miss (see server-prompt-cache-disk.h)
     server_prompt_disk_tier disk;
 
+    // [#187] state buffers of restored entries, kept for the next save. A fresh multi-GiB buffer costs
+    // ~0.4-0.5 s/GiB in first-touch page faults (1.4 s of the 1.7 s save of a 100K tq5_0/turbo4 state);
+    // a recycled one only costs the D2H copy. Counted against limit_size, dropped first under pressure.
+    std::vector<std::vector<uint8_t>> spare;
+    size_t spare_max_n = 4;
+
+    size_t spare_size() const;
+
+    // [#187] a buffer of `n` bytes for a new state: the smallest spare that holds it, else a fresh one
+    // reserved with 1/8 headroom so the same conversation's next, slightly longer save fits it again
+    std::vector<uint8_t> take_buffer(size_t n);
+
+    // [#187] keep a released state buffer for reuse (no-op for small ones)
+    void recycle(std::vector<uint8_t> & buf);
+
+    // [#187] free spares until size() + spare_size() + extra fits limit_size
+    void trim_spare(size_t extra);
+
     // a prompt too large for the RAM budget is staged here and spilled straight to disk on the next update()
     server_prompt_cache_state staging;
     bool                      staging_pending = false;

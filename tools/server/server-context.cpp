@@ -728,15 +728,24 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        const int64_t t_start = ggml_time_us();
+
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
         }
 
+        const int64_t t_alloc = ggml_time_us();
+
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+
+        // [#187] the save is on the request's critical path (the next prompt waits for it)
+        SRV_INF(" - saved prompt with %d tokens to the prompt cache: %.3f MiB in %.2f ms (alloc + checkpoint copy %.2f ms, state %.2f ms)\n",
+                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0,
+                (t_alloc - t_start) / 1000.0, (ggml_time_us() - t_alloc) / 1000.0);
 
         return true;
     }
@@ -2379,6 +2388,11 @@ private:
                 }
 
                 const size_t limit = params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*(size_t) params_base.cache_disk_mib;
+
+                if (params_base.cache_disk_min_free_mib >= 0) {
+                    prompt_cache->disk.guard_frac = 0.0;
+                    prompt_cache->disk.guard_abs  = 1024ull*1024ull*(uint64_t) params_base.cache_disk_min_free_mib;
+                }
 
                 std::string err;
                 if (dir.empty() || !prompt_cache->disk_open(dir, prompt_cache_key(), limit, err)) {

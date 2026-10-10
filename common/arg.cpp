@@ -1874,6 +1874,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-min-free"}, "N",
+        "free space in MiB the prompt-cache disk tier leaves on its filesystem; writes are skipped below it "
+        "(default: -1 = max(10% of the filesystem, 8 GiB))",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("cache-disk-min-free must be -1 or a size in MiB");
+            }
+            params.cache_disk_min_free_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_FREE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--no-cache-disk"},
         "disable the prompt-cache disk tier (RAM cache only)",
         [](common_params & params) {
