@@ -499,6 +499,40 @@ static void test_spare_pool() {
     CHECK(pc.spare.size() == 1);
 }
 
+// [#187] alloc(.., hand_over) moves the checkpoints into the entry instead of copying them; holds() tracks the entry
+static void test_hand_over() {
+    server_prompt_cache pc(1024, 0);
+    server_prompt p;
+    p.tokens = server_tokens(llama_tokens{1, 2, 3, 4, 5, 6, 7, 8}, false);
+    for (int i = 0; i < 3; ++i) {
+        auto & c = p.checkpoints.emplace_back();
+        c.n_tokens = 2*(i + 1); c.pos_min = 0; c.pos_max = 2*(i + 1) - 1;
+        c.data_tgt.assign(1*MiB, (uint8_t) i);
+    }
+    const uint8_t * d0 = p.checkpoints.front().data_tgt.data();
+
+    auto * e = pc.alloc(p, 4*MiB, 0, &p.checkpoints);
+    CHECK(e != nullptr && pc.holds(e));
+    CHECK(p.checkpoints.empty() && e->prompt.checkpoints.size() == 3);
+    CHECK(e->prompt.checkpoints.front().data_tgt.data() == d0); // moved, not copied
+    CHECK(e->size() == 4*MiB + 3*MiB && pc.size() == 7*MiB);
+
+    // without hand_over the slot keeps its own copy
+    server_prompt q;
+    q.tokens = server_tokens(llama_tokens{9, 10, 11}, false);
+    q.checkpoints.emplace_back().data_tgt.assign(1*MiB, 7);
+    auto * f = pc.alloc(q, 1*MiB, 0);
+    CHECK(f != nullptr && q.checkpoints.size() == 1 && f->prompt.checkpoints.size() == 1);
+    CHECK(f->prompt.checkpoints.front().data_tgt.data() != q.checkpoints.front().data_tgt.data());
+
+    // an evicted entry is no longer held
+    const server_prompt_cache_state * none = nullptr;
+    CHECK(!pc.holds(none) && pc.holds(f));
+    pc.limit_size = 2*MiB;
+    pc.update();
+    CHECK(!pc.holds(e));
+}
+
 int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
@@ -511,6 +545,7 @@ int main() {
     test_corrupt_cleanup(root);
     test_supersede_dedupe(root);
     test_spare_pool();
+    test_hand_over();
 
     std::error_code ec;
     fs::remove_all(root, ec);

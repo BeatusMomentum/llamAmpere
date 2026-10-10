@@ -706,9 +706,11 @@ struct server_slot {
     // logged one time instead of on every request.
     mutable bool state_save_unsupported = false;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // hand_over_ckpts [#187]: the cache entry takes this slot's checkpoints by move (no multi-GiB copy on the
+    // request's critical path); the caller then runs prompt_reclaim_checkpoints once prompt_load has decided
+    server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool hand_over_ckpts = false) {
         if (prompt.tokens.size() == 0 || state_save_unsupported) {
-            return false;
+            return nullptr;
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -720,7 +722,7 @@ struct server_slot {
         if (cur_size_tgt == 0) {
             SRV_WRN("%s", "prompt cache disabled: this context cannot save KV cache state\n");
             state_save_unsupported = true;
-            return false;
+            return nullptr;
         }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
@@ -730,9 +732,9 @@ struct server_slot {
 
         const int64_t t_start = ggml_time_us();
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, hand_over_ckpts ? &prompt.checkpoints : nullptr);
         if (cur == nullptr) {
-            return false;
+            return nullptr;
         }
 
         const int64_t t_alloc = ggml_time_us();
@@ -748,7 +750,30 @@ struct server_slot {
                 cur->prompt.checkpoints.size(), (cur->size() - cur_size) / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0,
                 (t_alloc - t_start) / 1000.0, (ggml_time_us() - t_alloc) / 1000.0);
 
-        return true;
+        return cur;
+    }
+
+    // [#187] after prompt_save(.., true) + prompt_load: when the slot kept its own prompt (no better cache entry),
+    // copy back only the handed-over checkpoints the next prompt can still use (pos_max within the common prefix;
+    // the rest would be erased as invalidated anyway). A replaced prompt brought its own checkpoints.
+    void prompt_reclaim_checkpoints(const server_prompt_cache & prompt_cache, const server_prompt_cache_state * saved,
+            const server_tokens & tokens_next) {
+        if (saved == nullptr || !prompt.checkpoints.empty() || !prompt_cache.holds(saved) ||
+                saved->prompt.tokens.size() != prompt.tokens.size() ||
+                (size_t) saved->prompt.tokens.get_common_prefix(prompt.tokens) != prompt.tokens.size()) {
+            return;
+        }
+        const bool   all = prompt.tokens.has_mtmd || tokens_next.has_mtmd; // positions != token indices
+        const size_t lcp = prompt.tokens.get_common_prefix(tokens_next);
+        size_t n = 0;
+        for (const auto & ckpt : saved->prompt.checkpoints) {
+            if (all || (lcp > 0 && (size_t) ckpt.pos_max <= lcp)) {
+                prompt.checkpoints.push_back(ckpt);
+                ++n;
+            }
+        }
+        SLT_INF(*this, "kept %zu of %zu checkpoints for the next prompt (common prefix %zu tokens)\n",
+                n, saved->prompt.checkpoints.size(), lcp);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -2696,10 +2721,12 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                const auto * saved = ret->prompt_save(*prompt_cache, true);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
+                } else {
+                    ret->prompt_reclaim_checkpoints(*prompt_cache, saved, task.tokens);
                 }
 
                 prompt_cache->update();

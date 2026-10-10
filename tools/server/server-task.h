@@ -699,7 +699,13 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // [#187] hand_over: the entry takes these checkpoints by move instead of copying them (the caller is about to
+    // replace or cut its prompt); see server_slot::prompt_reclaim_checkpoints for the way back
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft,
+            std::list<common_prompt_checkpoint> * hand_over = nullptr);
+
+    // [#187] true while `state` is a RAM entry of this cache (not loaded, evicted or staged)
+    bool holds(const server_prompt_cache_state * state) const;
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
