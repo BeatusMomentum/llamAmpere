@@ -743,8 +743,9 @@ struct server_slot {
         }
 
         // [#187] the save is on the request's critical path (the next prompt waits for it)
-        SRV_INF(" - saved prompt with %d tokens to the prompt cache: %.3f MiB in %.2f ms (alloc + checkpoint copy %.2f ms, state %.2f ms)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0,
+        SRV_INF(" - saved prompt with %d tokens to the prompt cache: %.3f MiB (target %.3f, draft %.3f, %zu checkpoints %.3f) in %.2f ms (alloc + checkpoint copy %.2f ms, state %.2f ms)\n",
+                (int) prompt.tokens.size(), cur->size() / (1024.0 * 1024.0), cur_size_tgt / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0),
+                cur->prompt.checkpoints.size(), (cur->size() - cur_size) / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0,
                 (t_alloc - t_start) / 1000.0, (ggml_time_us() - t_alloc) / 1000.0);
 
         return true;
