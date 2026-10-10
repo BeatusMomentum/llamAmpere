@@ -3862,6 +3862,14 @@ private:
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
+                    // the drafter's memory goes to its own sidecar: context checkpoints no longer carry a
+                    // plain-KV drafter (ckpt_needs_dft), and the state file holds the target only
+                    if (ctx_dft) {
+                        if (llama_state_seq_save_file(ctx_dft, (filepath + ".dft").c_str(), slot->id, nullptr, 0) == 0) {
+                            SLT_WRN(*slot, "failed to write drafter sidecar %s\n", (filepath + ".dft").c_str());
+                        }
+                    }
+
                     // persist context checkpoints alongside the state file so that a
                     // restore in a fresh process can roll back mid-prompt (see restore path)
                     if (!slot->prompt.checkpoints.empty()) {
@@ -3932,6 +3940,26 @@ private:
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
+                    }
+
+                    // the drafter's memory of the slot: from its sidecar, else cleared (a stale drafter KV
+                    // of an earlier prompt would only cost acceptance, but there is no reason to keep it)
+                    if (ctx_dft) {
+                        const std::string path_dft = filepath + ".dft";
+                        size_t n_tok_dft = 0;
+                        bool has_dft = false;
+                        if (FILE * fdft = fopen(path_dft.c_str(), "rb")) {
+                            has_dft = true;
+                            fclose(fdft);
+                        }
+                        // a non-null token buffer: with tokens_out == nullptr the call only probes the token count
+                        llama_token tok_dft_dummy = 0;
+                        if (has_dft && llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id, &tok_dft_dummy, 1, &n_tok_dft) > 0) {
+                            SLT_INF(*slot, "restored the drafter state from %s\n", path_dft.c_str());
+                        } else {
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                            SLT_WRN(*slot, "no drafter sidecar %s: drafter memory of the slot cleared\n", path_dft.c_str());
+                        }
                     }
 
                     // reload the context checkpoints written at save time; without them the
