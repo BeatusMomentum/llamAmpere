@@ -118,7 +118,7 @@ static __global__ void __launch_bounds__(256) fattn_sj_kvarn_trellis_expand_body
         }
         const int group = (p0 - kv.S)/kv.G;
         const int token = (p0 - kv.S)%kv.G;
-        const char * rec = kv.body + (size_t) group*kv.rec_stride;
+        const char * rec = fattn_sj_kvarn_rec(kv, group);
         flash_attn_ext_sj_kvarn_load_tile<D2, false, rows, 256, D2, false, false>(rec, token, kv, tile_K, rows);
         flash_attn_ext_sj_kvarn_load_tile<D2, false, rows, 256, D2, false, true >(rec, token, kv, tile_V, rows);
         __syncthreads();

@@ -14647,6 +14647,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(256, 24, 4, 40, 300, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, rot));
         }
     }
+    // [TRPF x SJMULTI] trellis prefill over a paged record pool (2 and 3 streams, shuffled group->record maps)
+    for (int ns : {2, 3}) {
+        for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(512, 24, 4, 40, 600, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, 0, ns));
+        }
+    }
     // [audit 2026-10-03] 4/4 trellis bodies (I16): sjkvarn4t by default, the token-axis trellis4 under GGML_SJKVARN_TRELLIS_TOKENS=1
     for (int64_t n_q : {1, 5, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 301, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, 4, 4));
