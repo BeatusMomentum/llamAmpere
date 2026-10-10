@@ -3571,6 +3571,17 @@ private:
         return f;
     }
 
+    // Whether a context checkpoint carries the drafter's memory. A drafter whose cache can cut a sequence at any
+    // position (a plain KV cache: the MTP head of the Qwen3.5/3.8 family, COMMON_CONTEXT_SEQ_RM_TYPE_PART) does not
+    // need it: PARTIAL_ONLY does not apply to a KV cache, so the blob would be the drafter's whole KV of the
+    // sequence, while the live drafter cache already holds every position below the checkpoint and a restore trims
+    // the rest (slot.mem.seq_rm / the MTP process() trim). Only a drafter with recurrent state saves its part.
+    // LLAMA_CKPT_DFT_KV=1 keeps the drafter KV in every checkpoint (the earlier behaviour, for A/B).
+    bool ckpt_needs_dft() const {
+        static const bool force = [] { const char * s = getenv("LLAMA_CKPT_DFT_KV"); return s && s[0] == '1'; }();
+        return ctx_dft != nullptr && (force || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         // Slot restore can synthesize a checkpoint without an active inference task.
         const int id_task = slot.task ? slot.task->id : -1;
@@ -3627,7 +3638,9 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (ckpt_needs_dft()) {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
