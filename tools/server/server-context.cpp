@@ -633,6 +633,15 @@ struct server_slot {
     // speculative decoding
     common_speculative * spec;
 
+    // target data of the last erased context checkpoint, reused by the next one (see update_tgt), freed on release
+    std::vector<uint8_t> ckpt_spare;
+
+    void ckpt_recycle(common_prompt_checkpoint & c) {
+        if (c.data_tgt.size() > ckpt_spare.size()) {
+            ckpt_spare = std::move(c.data_tgt);
+        }
+    }
+
     llama_tokens spec_draft;
     // per-position draft distributions for exact p/q verification (empty: id-match), aligned with spec_draft
     std::vector<std::vector<llama_token_data>> spec_draft_q;
@@ -1047,6 +1056,8 @@ struct server_slot {
 
             sj_kvarn_idle_pending = sj_kvarn_accepted_end >= 0 && !task->is_child();
             state = SLOT_STATE_IDLE;
+
+            ckpt_spare = {};
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -3597,6 +3608,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                slot.ckpt_recycle(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -3612,6 +3624,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            slot.ckpt_recycle(slot.prompt.checkpoints.front());
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -3621,6 +3634,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    slot.ckpt_recycle(*it);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -3637,7 +3651,11 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        llama_synchronize(ctx_tgt); // (update_tgt syncs anyway) keep the previous batch's compute out of the copy time
+        const int64_t t_ckpt_us = ggml_time_us();
+        const bool had_spare = !slot.ckpt_spare.empty();
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &slot.ckpt_spare);
+        const bool reused = had_spare && slot.ckpt_spare.empty();
         if (ckpt_needs_dft()) {
             cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
@@ -3645,9 +3663,9 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %.2f ms%s)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (ggml_time_us() - t_ckpt_us) / 1000.0, reused ? ", reused buffer" : "");
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -4183,6 +4201,7 @@ private:
                     size_t n_dropped = 0;
                     for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                         if (!sj_kvarn_ckpt_reachable(slot.id, *it)) {
+                            slot.ckpt_recycle(*it);
                             it = slot.prompt.checkpoints.erase(it);
                             ++n_dropped;
                         } else {
@@ -4848,6 +4867,7 @@ private:
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
+                                        slot.ckpt_recycle(*it);
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {

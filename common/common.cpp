@@ -2632,12 +2632,21 @@ void common_prompt_checkpoint::update_pos(
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        std::vector<uint8_t> * spare) {
     if (ctx == nullptr) {
         return;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+
+    // reuse the spare only when it fits without growing and without wasting more than 1/8 of it
+    if (spare != nullptr && data_tgt.capacity() < ckpt_size &&
+            spare->size() >= ckpt_size && spare->size() - ckpt_size <= ckpt_size / 8) {
+        data_tgt.swap(*spare);
+        spare->clear();
+        spare->shrink_to_fit();
+    }
 
     data_tgt.resize(ckpt_size);
 
