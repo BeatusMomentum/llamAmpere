@@ -3644,6 +3644,19 @@ private:
         return ctx_dft != nullptr && (force || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART);
     }
 
+    // [#197] prompt-checkpoint boundary at or below n: on the seal grid (n_ubatch) as well as a group boundary, so cold
+    // and restored prefills break into the same ubatches (n when SJ-KVaRN is off)
+    llama_pos sj_kvarn_ckpt_floor(llama_pos n) const {
+        if (params_base.sj_kvarn_bits_k == 0 && !params_base.speculative.draft.sj_kvarn) {
+            return n;
+        }
+        llama_pos f = llama_sj_kvarn_ckpt_floor(ctx_tgt, n);
+        if (ctx_dft) {
+            f = std::min(f, llama_sj_kvarn_ckpt_floor(ctx_dft, f));
+        }
+        return f;
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         // Slot restore can synthesize a checkpoint without an active inference task.
         const int id_task = slot.task ? slot.task->id : -1;
@@ -5138,7 +5151,7 @@ private:
                     const bool sj_align = params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn;
                     const int64_t n_task = slot.task->n_tokens();
                     auto sj_ckpt_target = [&](int64_t n) {
-                        if (n <= 0 || n >= n_task || sj_kvarn_group_floor((llama_pos) n) != n) {
+                        if (n <= 0 || n >= n_task || sj_kvarn_ckpt_floor((llama_pos) n) != n) {
                             return false;
                         }
                         const int64_t spots[3] = {
@@ -5147,7 +5160,7 @@ private:
                             n_task - std::min<int64_t>(n_batch, 4 + n_ubatch),
                         };
                         for (int64_t q : spots) {
-                            if (q > 0 && sj_kvarn_group_floor((llama_pos) q) == n) {
+                            if (q > 0 && sj_kvarn_ckpt_floor((llama_pos) q) == n) {
                                 return true;
                             }
                         }
@@ -5281,7 +5294,7 @@ private:
                     if (sj_align) {
                         // boundary checkpoints: the targeted spots, plus one per min step along a long prompt
                         do_checkpoint = do_checkpoint && n_tokens_start > 0 &&
-                            sj_kvarn_group_floor((llama_pos) n_tokens_start) == n_tokens_start && (
+                            sj_kvarn_ckpt_floor((llama_pos) n_tokens_start) == n_tokens_start && (
                                 sj_ckpt_target(n_tokens_start) ||
                                 slot.prompt.checkpoints.empty() ||
                                 n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);

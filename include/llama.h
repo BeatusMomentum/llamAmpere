@@ -932,6 +932,11 @@ extern "C" {
     // A checkpoint taken at a boundary stays reachable by seq_rm after the rows behind it are sealed.
     LLAMA_API llama_pos llama_sj_kvarn_group_floor(struct llama_context * ctx, llama_pos pos);
 
+    // The prompt-checkpoint boundary at or below pos: the group floor of the seal-grid (n_ubatch) point at or below pos
+    // when the grid schedule is on (default), else the group floor. A prefill that breaks only on these points has the
+    // same ubatch boundaries cold and after a checkpoint restore, so the restored turn computes bit-identically.
+    LLAMA_API llama_pos llama_sj_kvarn_ckpt_floor(struct llama_context * ctx, llama_pos pos);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 

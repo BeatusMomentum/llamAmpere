@@ -2203,6 +2203,16 @@ llama_pos llama_sj_kvarn_group_floor(llama_context * ctx, llama_pos pos) {
     return (llama_pos) (c.sink + c.group*(((uint32_t) pos - c.sink)/c.group));
 }
 
+llama_pos llama_sj_kvarn_ckpt_floor(llama_context * ctx, llama_pos pos) {
+    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
+    if (!kv || !kv->is_sj_kvarn() || pos < 0) { return pos; }
+    const uint32_t grid = kv->get_sj_kvarn_pos_grid();
+    if (grid > 0) {
+        pos -= pos % (llama_pos) grid;
+    }
+    return llama_sj_kvarn_group_floor(ctx, pos);
+}
+
 enum ggml_type llama_context::get_kv_type_k() const {
     return llama_memory_get_kv_type(memory.get(), /* want_k */ true);
 }
