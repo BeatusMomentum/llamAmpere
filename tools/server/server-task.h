@@ -668,6 +668,12 @@ struct server_prompt_cache {
     // disk tier: RAM evictions are spilled here and consulted on a RAM miss (see server-prompt-cache-disk.h)
     server_prompt_disk_tier disk;
 
+    // --cache-ram-checkpoints: context checkpoints a RAM entry keeps, the newest ram_ckpt_keep plus one each time
+    // the distance from the end doubles (server_prompt_keep_checkpoints); 0 = all. The slot keeps its full list.
+    size_t ram_ckpt_keep          = 0;
+    size_t n_ram_ckpt_dropped     = 0; // checkpoints not stored in RAM entries
+    size_t bytes_ram_ckpt_dropped = 0;
+
     // [#187] state buffers of restored entries, kept for the next save. A fresh multi-GiB buffer costs
     // ~0.4-0.5 s/GiB in first-touch page faults (1.4 s of the 1.7 s save of a 100K tq5_0/turbo4 state);
     // a recycled one only costs the D2H copy. Counted against limit_size, dropped first under pressure.

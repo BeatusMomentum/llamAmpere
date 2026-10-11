@@ -2407,6 +2407,12 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, n_ctx);
 
+            prompt_cache->ram_ckpt_keep = (size_t) params_base.cache_ram_ckpt;
+            if (params_base.cache_ram_ckpt > 0) {
+                SRV_INF("prompt cache RAM entries keep the newest %d context checkpoints + one per doubling of the distance from the end\n",
+                        params_base.cache_ram_ckpt);
+            }
+
             if (params_base.cache_disk && params_base.cache_disk_mib != 0) {
                 std::string dir = params_base.cache_disk_path;
                 if (dir.empty()) {

@@ -533,6 +533,60 @@ static void test_hand_over() {
     CHECK(!pc.holds(e));
 }
 
+// --cache-ram-checkpoints: the keep-newest-plus-doubling selection, and alloc() thinning a RAM entry (the slot
+// keeps its full list, also when alloc is asked to hand the checkpoints over by move)
+static void test_ram_ckpt_keep() {
+    // 31 checkpoints, one every 900 tokens, entry of 28000 tokens
+    entry_data e = make_entry(7, 28000, 4096, 31);
+    int c = 0;
+    for (auto & ck : e.ckpts) {
+        ck.pos_min = 0;
+        ck.pos_max = 900 * (c + 1) - 1;
+        ck.n_tokens = 900 * (c + 1);
+        c++;
+    }
+    CHECK(server_prompt_keep_checkpoints(e.ckpts, e.tokens.size(), 0).size() == 31);
+    CHECK(server_prompt_keep_checkpoints(e.ckpts, e.tokens.size(), 31).size() == 31);
+    const auto k = server_prompt_keep_checkpoints(e.ckpts, e.tokens.size(), 4);
+    std::vector<int> pos;
+    for (auto * p : k) {
+        pos.push_back(p->pos_max);
+    }
+    CHECK(pos.size() >= 5 && pos.size() <= 8);
+    CHECK(std::is_sorted(pos.begin(), pos.end()));      // list order
+    for (int i = 0; i < 4; ++i) {
+        CHECK(pos[pos.size() - 1 - i] == 900 * (31 - i) - 1); // the 4 newest
+    }
+    CHECK(pos.front() < 15000);                        // something near the middle survives for branches
+    CHECK(server_prompt_keep_checkpoints(e.ckpts, e.tokens.size(), 8).size() > k.size());
+
+    server_prompt p;
+    p.tokens = server_tokens(e.tokens, false);
+    for (const auto & ck : e.ckpts) {
+        p.checkpoints.push_back(ck);
+    }
+    size_t kept_size = 0;
+    for (auto * ck : k) {
+        kept_size += ck->size();
+    }
+    {
+        server_prompt_cache pc(1024, 0);
+        pc.ram_ckpt_keep = 4;
+        auto * en = pc.alloc(p, 1*MiB, 0, &p.checkpoints);
+        CHECK(en != nullptr && en->prompt.checkpoints.size() == k.size());
+        CHECK(p.checkpoints.size() == 31);             // thinned: copied, the slot keeps all
+        CHECK(en->size() == 1*MiB + kept_size);
+        CHECK(pc.n_ram_ckpt_dropped == 31 - k.size());
+        CHECK(en->prompt.checkpoints.back().pos_max == 900 * 31 - 1);
+    }
+    {
+        server_prompt_cache pc(1024, 0);               // 0 = all, hand-over still moves
+        auto * en = pc.alloc(p, 1*MiB, 0, &p.checkpoints);
+        CHECK(en != nullptr && en->prompt.checkpoints.size() == 31 && p.checkpoints.empty());
+        CHECK(pc.n_ram_ckpt_dropped == 0);
+    }
+}
+
 int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
@@ -546,6 +600,7 @@ int main() {
     test_supersede_dedupe(root);
     test_spare_pool();
     test_hand_over();
+    test_ram_ckpt_keep();
 
     std::error_code ec;
     fs::remove_all(root, ec);

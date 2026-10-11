@@ -1885,6 +1885,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MIN_FREE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-ram-checkpoints"}, "N",
+        string_format("RAM prompt cache: context checkpoints (hybrid/recurrent models) kept per cached entry: the N newest "
+            "plus one each time the distance from the end doubles; an edit between two kept checkpoints re-processes "
+            "from the earlier one. The active slot keeps all of its checkpoints. 0 = all (default: %d)", params.cache_ram_ckpt),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-ram-checkpoints must be >= 0");
+            }
+            params.cache_ram_ckpt = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--no-cache-disk"},
         "disable the prompt-cache disk tier (RAM cache only)",
         [](common_params & params) {

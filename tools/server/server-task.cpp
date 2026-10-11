@@ -1770,10 +1770,16 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    // calculate checkpoints size to see if it will fit with the prompt
-    size_t checkpoints_size = 0;
+    // the checkpoints the RAM entry keeps (--cache-ram-checkpoints), and their size to see if it will fit with the prompt
+    const auto ckpt_kept = server_prompt_keep_checkpoints(prompt.checkpoints, prompt.n_tokens(), ram_ckpt_keep);
+    const bool ckpt_thin = ckpt_kept.size() < prompt.checkpoints.size();
+    size_t checkpoints_size     = 0;
+    size_t checkpoints_size_all = 0;
+    for (const auto * ckpt : ckpt_kept) {
+        checkpoints_size += ckpt->size();
+    }
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+        checkpoints_size_all += ckpt.size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -1836,9 +1842,16 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
+    std::list<common_prompt_checkpoint> checkpoints_ram;
 
     // check if we can allocate enough memory for the new state
     try {
+        // a thinned entry copies the kept checkpoints; the slot keeps its full list (no hand-over by move then)
+        if (ckpt_thin) {
+            for (const auto * ckpt : ckpt_kept) {
+                checkpoints_ram.push_back(*ckpt);
+            }
+        }
         state_data_tgt = take_buffer(state_size_tgt);
         state_data_dft = take_buffer(state_size_dft);
         trim_spare(state_size_new);
@@ -1854,17 +1867,24 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    if (ckpt_thin) {
+        n_ram_ckpt_dropped     += prompt.checkpoints.size() - ckpt_kept.size();
+        bytes_ram_ckpt_dropped += checkpoints_size_all - checkpoints_size;
+        SRV_TRC(" - RAM entry keeps %zu of %zu context checkpoints (%.3f of %.3f MiB)\n", ckpt_kept.size(),
+                prompt.checkpoints.size(), checkpoints_size / (1024.0 * 1024.0), checkpoints_size_all / (1024.0 * 1024.0));
+    }
+
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ hand_over ? std::move(*hand_over) : prompt.checkpoints,
+            /*.checkpoints =*/ ckpt_thin ? std::move(checkpoints_ram) : hand_over ? std::move(*hand_over) : prompt.checkpoints,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
     });
-    if (hand_over) {
+    if (hand_over && !ckpt_thin) {
         hand_over->clear(); // moved-from: make it empty for sure
     }
 
@@ -2165,6 +2185,10 @@ void server_prompt_cache::update() {
     SRV_INF("prompt cache: %zu prompts, %.1f MiB + %zu spare buffers %.1f MiB (limit %.1f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), spare.size(), spare_size() / (1024.0 * 1024.0),
             limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    if (ram_ckpt_keep > 0) {
+        SRV_INF("prompt cache: RAM checkpoint thinning (newest %zu + one per doubling): %zu checkpoints, %.1f MiB not stored so far\n",
+                ram_ckpt_keep, n_ram_ckpt_dropped, bytes_ram_ckpt_dropped / (1024.0 * 1024.0));
+    }
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
