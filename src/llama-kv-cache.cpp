@@ -3177,8 +3177,9 @@ bool llama_kv_cache::sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0) {
     }
     bool changed = false;
     if (!sj_kvarn_cut_in_reach(seq_id, p0)) {
-        // the staging rows of [replay_B(p0), reopen_lo) were overwritten (the cache ran more than the ring capacity
-        // past p0): the cut reopens what the ring still holds, the re-prefill is close to a cold one but not identical
+        // the staging rows of [replay_B(p0), reopen_lo) were overwritten (the cache ran more than about the ring
+        // capacity past p0) and the first re-prefill ubatch would still read them as exact rows in a cold prefill:
+        // the cut reopens what the ring still holds, the re-prefill is close to a cold one but not identical
         LLAMA_LOG_WARN("%s: SJ-KVaRN cut at %d: the ring reaches back to %u, a cold prefill keeps rows from %u exact; "
                 "the re-prefill will not be bit-identical to a cold one\n", __func__, (int) p0,
                 sj_kvarn_reopen_lo(strm), sj_kvarn_replay_B((uint32_t) p0));
@@ -3204,7 +3205,13 @@ bool llama_kv_cache::sj_kvarn_cut_in_reach(llama_seq_id seq_id, llama_pos p0) co
     }
     const uint32_t strm = seq_to_stream[seq_id];
     const uint32_t want = sj_kvarn_replay_B((uint32_t) p0);
-    return sj_kvarn_st[strm].B <= want || sj_kvarn_reopen_lo(strm) <= want;
+    if (sj_kvarn_st[strm].B <= want) {
+        return true;
+    }
+    // the reopen stops at the ring's lower bound; groups below it stay sealed. That only matters when the first
+    // re-prefill ubatch (at p0) would not seal them anyway: compare the sealed end both caches have at that ubatch.
+    const uint32_t B_got = std::min(sj_kvarn_st[strm].B, std::max(sj_kvarn_reopen_lo(strm), want));
+    return sj_kvarn_next_B(B_got, (uint32_t) p0) == sj_kvarn_next_B(want, (uint32_t) p0);
 }
 
 uint32_t llama_kv_cache::sj_kvarn_seq_stream(llama_seq_id seq_id) const {

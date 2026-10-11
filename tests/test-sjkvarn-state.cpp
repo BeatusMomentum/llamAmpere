@@ -746,6 +746,7 @@ int main(int argc, char ** argv) {
     const bool multi_only = getenv("SJ_TEST_MULTI_ONLY") != nullptr; // debugging: only the multi-sequence checks
     for (const auto & c : cases) {
         if (multi_only) { break; }
+        if (getenv("SJ_TEST_CASE") && strcmp(getenv("SJ_TEST_CASE"), c.first.name) != 0) { continue; } // debugging
         fails += run_case(model, c.first, c.second, tmp_dir);
     }
     if (!multi_only) { plain_mixed_control(model); }
