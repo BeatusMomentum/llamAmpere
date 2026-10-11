@@ -2421,7 +2421,10 @@ private:
 
                 const size_t limit = params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*(size_t) params_base.cache_disk_mib;
 
-                if (params_base.cache_disk_min_free_mib >= 0) {
+                if (params_base.cache_disk_min_free_pct >= 0.0f) {
+                    prompt_cache->disk.guard_frac = params_base.cache_disk_min_free_pct / 100.0;
+                    prompt_cache->disk.guard_abs  = 0;
+                } else if (params_base.cache_disk_min_free_mib >= 0) {
                     prompt_cache->disk.guard_frac = 0.0;
                     prompt_cache->disk.guard_abs  = 1024ull*1024ull*(uint64_t) params_base.cache_disk_min_free_mib;
                 }
@@ -3860,6 +3863,19 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+
+                    if (prompt_cache && prompt_cache->disk_enabled()) {
+                        const auto & disk = prompt_cache->disk;
+                        const auto   si   = disk.space_check();
+                        res->disk_enabled          = true;
+                        res->disk_guard_active     = disk.guard_active;
+                        res->disk_guard_skips      = disk.n_guard_skips;
+                        res->disk_guard_skip_bytes = disk.bytes_guard_skips;
+                        if (si.state != server_prompt_disk_tier::SPACE_UNKNOWN) {
+                            res->disk_free_bytes  = (double) si.available;
+                            res->disk_floor_bytes = (double) si.reserve;
+                        }
+                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();

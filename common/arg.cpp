@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <list>
@@ -1884,13 +1885,74 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-disk-min-free"}, "N",
-        "free space in MiB the prompt-cache disk tier leaves on its filesystem; writes are skipped below it "
+        "free space the prompt-cache disk tier leaves on its filesystem; writes are skipped (with a warning, and "
+        "counted in /metrics) below it. N = MiB, NG = GiB, N% = percent of the filesystem "
         "(default: -1 = max(10% of the filesystem, 8 GiB))",
-        [](common_params & params, int value) {
-            if (value < -1) {
-                throw std::invalid_argument("cache-disk-min-free must be -1 or a size in MiB");
+        [](common_params & params, const std::string & value) {
+            const auto bad = []() {
+                return std::invalid_argument("cache-disk-min-free must be -1, a size in MiB, NG (GiB) or N% (0-100)");
+            };
+            std::string v = value;
+            while (!v.empty() && isspace((unsigned char) v.back())) {
+                v.pop_back();
             }
-            params.cache_disk_min_free_mib = value;
+            double mul = 1.0;
+            bool   pct = false;
+            if (!v.empty() && v.back() == '%') {
+                pct = true;
+                v.pop_back();
+            } else {
+                std::string lo;
+                for (char c : v) {
+                    lo += (char) tolower((unsigned char) c);
+                }
+                for (const char * suf : { "gib", "gb", "g" }) {
+                    const size_t n = strlen(suf);
+                    if (lo.size() > n && lo.compare(lo.size() - n, n, suf) == 0) {
+                        mul = 1024.0;
+                        v.resize(v.size() - n);
+                        break;
+                    }
+                }
+                if (mul == 1.0) {
+                    for (const char * suf : { "mib", "mb", "m" }) {
+                        const size_t n = strlen(suf);
+                        if (lo.size() > n && lo.compare(lo.size() - n, n, suf) == 0) {
+                            v.resize(v.size() - n);
+                            break;
+                        }
+                    }
+                }
+            }
+            size_t pos = 0;
+            double x   = 0.0;
+            try {
+                x = std::stod(v, &pos);
+            } catch (const std::exception &) {
+                throw bad();
+            }
+            if (pos != v.size()) {
+                throw bad();
+            }
+            if (pct) {
+                if (x < 0.0 || x > 100.0) {
+                    throw bad();
+                }
+                params.cache_disk_min_free_pct = (float) x;
+                params.cache_disk_min_free_mib = -1;
+                return;
+            }
+            if (x == -1.0 && mul == 1.0) {
+                params.cache_disk_min_free_mib = -1;
+                params.cache_disk_min_free_pct = -1.0f;
+                return;
+            }
+            const double mib = x * mul;
+            if (x < 0.0 || mib > (double) INT32_MAX) {
+                throw bad();
+            }
+            params.cache_disk_min_free_mib = (int32_t) mib;
+            params.cache_disk_min_free_pct = -1.0f;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MIN_FREE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

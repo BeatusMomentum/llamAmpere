@@ -1619,6 +1619,19 @@ std::string server_task_result_metrics::to_metrics() {
     add_items("counter", counters);
     add_items("gauge",   gauges);
 
+    // prompt-cache disk tier: writes skipped by the free-space floor (they fail no request, so count them here)
+    if (disk_enabled) {
+        add_items("counter", {
+            { "prompt_cache_disk_guard_skips_total",       "Prompt-cache disk tier: writes skipped because the disk is at its free-space floor", (double) disk_guard_skips },
+            { "prompt_cache_disk_guard_skipped_bytes_total", "Prompt-cache disk tier: bytes not written because of the free-space floor",        (double) disk_guard_skip_bytes },
+        });
+        add_items("gauge", {
+            { "prompt_cache_disk_guard_active", "Prompt-cache disk tier: 1 while writes are being skipped at the free-space floor", disk_guard_active ? 1.0 : 0.0 },
+            { "prompt_cache_disk_free_bytes",   "Prompt-cache disk tier: free bytes on the cache filesystem (-1 = unknown)",       disk_free_bytes },
+            { "prompt_cache_disk_floor_bytes",  "Prompt-cache disk tier: free-space floor in bytes; writes are skipped below it",   disk_floor_bytes },
+        });
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
@@ -2211,6 +2224,28 @@ bool server_prompt_cache::disk_open(const std::string & dir, const std::string &
             dir.c_str(), disk.n_match(), disk.entries.size(), disk.size() / (1024.0 * 1024.0),
             limit_bytes > 0 ? string_format("%.0f MiB", limit_bytes / (1024.0 * 1024.0)).c_str() : "none, free-space guard only");
 
+    // the free-space guard skips writes without failing a request: say so up front when it will
+    const auto si = disk.space_check();
+    constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+    switch (si.state) {
+        case server_prompt_disk_tier::SPACE_BELOW:
+            SRV_WRN("prompt cache disk tier: WRITES DISABLED: %.1f GiB free of %.1f GiB is at or below the free-space floor of %.1f GiB "
+                    "(max(%.0f%%, %.0f GiB)); nothing will be written until space is freed or --cache-disk-min-free is lowered\n",
+                    si.available / GiB, si.capacity / GiB, si.reserve / GiB, disk.guard_frac * 100.0, disk.guard_abs / GiB);
+            break;
+        case server_prompt_disk_tier::SPACE_NEAR:
+            SRV_WRN("prompt cache disk tier: low free space: %.1f GiB free of %.1f GiB, floor %.1f GiB; only %.1f GiB can be written "
+                    "before writes are skipped (the tier wants %.1f GiB more)\n",
+                    si.available / GiB, si.capacity / GiB, si.reserve / GiB, (si.available - si.reserve) / GiB, si.want / GiB);
+            break;
+        case server_prompt_disk_tier::SPACE_OK:
+            SRV_INF("prompt cache disk tier: %.1f GiB free, floor %.1f GiB\n", si.available / GiB, si.reserve / GiB);
+            break;
+        case server_prompt_disk_tier::SPACE_UNKNOWN:
+            SRV_WRN("%s", "prompt cache disk tier: cannot query free space, the free-space floor is not enforced\n");
+            break;
+    }
+
     return true;
 }
 
@@ -2255,6 +2290,7 @@ void server_prompt_cache::flush_to_disk() {
 
     size_t n = 0;
     const size_t n_total = states.size() + (staging_pending ? 1 : 0);
+    const size_t n_guard_skips0 = disk.n_guard_skips;
     for (const auto & state : states) {
         n += disk_spill(state) ? 1 : 0;
     }
@@ -2268,4 +2304,8 @@ void server_prompt_cache::flush_to_disk() {
 
     SRV_INF("prompt cache: flushed %zu of %zu prompts to the disk tier (%zu entries, %.1f MiB on disk)\n",
             n, n_total, disk.entries.size(), disk.size() / (1024.0 * 1024.0));
+    if (disk.n_guard_skips > n_guard_skips0) {
+        SRV_WRN("prompt cache: %zu of %zu prompts NOT flushed: the disk is at its free-space floor (%zu writes skipped since start)\n",
+                disk.n_guard_skips - n_guard_skips0, n_total, disk.n_guard_skips);
+    }
 }

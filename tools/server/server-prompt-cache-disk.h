@@ -66,6 +66,11 @@ struct server_prompt_disk_tier {
     uint64_t    guard_abs  = 8ull*1024*1024*1024;
     space_fn_t  space_fn;
 
+    // while writes are being skipped, the warning is repeated at most once per this many seconds (0 = every skip)
+    double      guard_warn_interval_s = 60.0;
+    // monotonic clock in microseconds for the warning rate limit, injectable for tests (default ggml_time_us)
+    std::function<int64_t()> clock_us_fn;
+
     // temp files older than this are leftovers of a crashed writer
     int64_t     tmp_stale_s = 120;
 
@@ -73,9 +78,23 @@ struct server_prompt_disk_tier {
     std::list<server_prompt_disk_entry> entries;
 
     // counters (for logs and tests)
-    size_t n_guard_skips   = 0;
-    size_t n_removed_bad   = 0;
-    bool   guard_active    = false;
+    size_t   n_guard_skips      = 0; // writes skipped by the free-space guard since start
+    uint64_t bytes_guard_skips  = 0; // bytes those writes would have written
+    size_t   n_guard_warnings   = 0; // guard warnings logged (first one + rate-limited repeats)
+    size_t   n_removed_bad   = 0;
+    bool     guard_active    = false;
+
+    // free space against the guard's floor
+    enum space_state { SPACE_UNKNOWN, SPACE_OK, SPACE_NEAR, SPACE_BELOW };
+    struct space_info {
+        space_state state     = SPACE_UNKNOWN;
+        uint64_t    capacity  = 0;
+        uint64_t    available = 0;
+        uint64_t    reserve   = 0; // the floor: max(guard_frac * capacity, guard_abs)
+        uint64_t    want      = 0; // headroom above the floor the tier wants (room left to its limit, else guard_abs)
+    };
+    // SPACE_BELOW: writes are skipped now; SPACE_NEAR: the floor will stop writes before the tier reaches its limit
+    space_info space_check() const;
 
     // create the directory (mkdir -p), check that it is writable and index it; on failure `err` says why
     bool open(const std::string & dir, const std::string & key, size_t limit_bytes, std::string & err);
@@ -104,6 +123,11 @@ struct server_prompt_disk_tier {
 
 private:
     uint64_t seq = 0;
+
+    int64_t guard_t_warn      = 0; // time of the last guard warning (clock_us_fn)
+    size_t  guard_skips_warn  = 0; // n_guard_skips at the last guard warning
+
+    int64_t clock_us() const;
 
     bool parse_header(const std::string & file, server_prompt_disk_entry & e, bool & bad) const;
     void scan(bool initial);
