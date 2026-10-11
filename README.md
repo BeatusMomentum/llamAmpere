@@ -14,8 +14,7 @@
   of context in about 11 GB.
 - **Faster MTP verify decode on EXL3 models**, and a catch-up to upstream llama.cpp and TheTom's TurboQuant fork.
 - **New in v0.5.1:** SJ-KVaRN works with parallel decode slots (`--parallel N`, optionally `--kv-unified`);
-  `--parallel 1` output is unchanged. Also faster long-context prompt processing for 3/3t and 3/2t (x1.6 at 100K,
-  x2 at 200K). [Release notes](docs/llamampere-v0.5.1/RELEASE_NOTES.md).
+  `--parallel 1` output is unchanged. [Release notes](docs/llamampere-v0.5.1/RELEASE_NOTES.md).
 - **Coming in v0.5.2:** a Swift 1.5 EXL3 4.0 bpw model.
 - **Read more:** the [SJ-KVaRN paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper) and the standalone codec,
   [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT).
@@ -78,7 +77,7 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
 ```
 
 With a 203,568-token prompt this peaked at 12,052 MiB on the whole card, including about 1 GB used by the desktop;
-the server process itself used about 11.1 GB (11,094 MiB).
+the server process itself used about 11.1 GB.
 
 ---
 

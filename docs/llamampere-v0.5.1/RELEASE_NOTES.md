@@ -1,7 +1,6 @@
 # llamAmpere v0.5.1
 
-A point release on top of v0.5. SJ-KVaRN now works with parallel decode slots, and long-context prompt processing
-is faster for 3/3t and 3/2t (x1.6 at 100K, x2 at 200K).
+A point release on top of v0.5. One change: SJ-KVaRN now works with parallel decode slots.
 
 ## SJ-KVaRN with parallel slots
 
