@@ -4082,17 +4082,22 @@ const slot_info_vec_t *   sinfos_in) {
 //   u32 n_cfg,  i64 cfg[n_cfg]   configuration that must match the restoring cache exactly (see sj_kvarn_state_cfg)
 //   u32 n_info, i64 info[n_info] ring rows, pool groups per head, cells (capacity checks only)
 //   u32 B, u32 B_prev, u32 sj_N, u32 draining   sealed end, previous sealed end, visible end, adaptive-tail flush state
+//   u32 R                                       (version 2) first saved ring position, sink <= R <= B, on a group boundary
 //   per cache layer, in layer order:
 //     K then V staging rows of positions [0, min(sink, n))         (sink rows, staging type)
 //     K then V fp16 sink rows of positions [0, min(sink, n))       (only with the separate F16 sink)
-//     K then V staging rows of positions [B, n), in position order (ring rows; the ring offset is not saved)
+//     K then V staging rows of positions [R, n), in position order (ring rows; the ring offset is not saved)
 //     sealed records [0, (B - sink)/group) x n_head_kv             (body, exactly the bytes the seal wrote)
 //
-// Ring rows of positions below B are stale (never read again) and are not saved. The plain-cache reader fails
-// on the magic (it reads it as the v_trans flag), and this reader fails on a plain stream for the same reason.
+// Ring rows of [R, B) are not read by attention, but a seq_rm below B reopens them (re-seals from the same rows).
+// [#197] With the grid seal schedule R = the reopen bound of the live ring, so a restored state can be cut and
+// re-prefilled exactly like the live cache it was saved from (a server checkpoint restore then matches a cold run);
+// with LLAMA_SJKVARN_SEAL_GRID=0, R = B (version 1 layout, smaller state). Version 1 states (R = B) still load.
+// The plain-cache reader fails on the magic (it reads it as the v_trans flag), and this reader fails on a plain
+// stream for the same reason.
 //
 static constexpr uint32_t LLAMA_SJ_KVARN_STATE_MAGIC   = 0x564b4a53u; // "SJKV"
-static constexpr uint32_t LLAMA_SJ_KVARN_STATE_VERSION = 1;
+static constexpr uint32_t LLAMA_SJ_KVARN_STATE_VERSION = 2;
 
 namespace {
 struct sj_kvarn_state_field {
@@ -4218,7 +4223,9 @@ void llama_kv_cache::state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id se
     io.write(&n_info, sizeof(n_info));
     io.write(info, sizeof(info));
 
-    const uint32_t st[4] = { B, sst.B_prev, sst.N, sst.draining ? 1u : 0u };
+    // [#197] first saved ring position: the reopen bound of the live ring (grid schedule), else B
+    const uint32_t R = sj_kvarn_grid && B > S ? std::min(B, sj_kvarn_reopen_lo(strm)) : B;
+    const uint32_t st[5] = { B, sst.B_prev, sst.N, sst.draining ? 1u : 0u, R };
     io.write(st, sizeof(st));
 
     const uint32_t n_sink = std::min(S, n);
@@ -4240,7 +4247,7 @@ void llama_kv_cache::state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id se
             ggml_tensor * t = is_v ? tv : tk;
             const size_t r = is_v ? rv : rk;
             const size_t o = is_v ? ov : ok;
-            for (uint32_t p = std::max(B, S); p < n;) {
+            for (uint32_t p = std::max(R, S); p < n;) {
                 const uint32_t row = sj_kvarn_ring_row(p);
                 const uint32_t m   = std::min(n - p, S + sj_kvarn_cap - row);
                 io.write_tensor(t, o + (size_t) row*r, (size_t) m*r);
@@ -4338,7 +4345,7 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
                 "restore it into a context with the cache types it was saved with");
     }
     io.read(&version, sizeof(version));
-    if (version != LLAMA_SJ_KVARN_STATE_VERSION) {
+    if (version != LLAMA_SJ_KVARN_STATE_VERSION && version != 1) {
         throw std::runtime_error("SJ-KVaRN cache: state format version " + std::to_string(version) +
                 " is not supported (this build reads version " + std::to_string(LLAMA_SJ_KVARN_STATE_VERSION) + ")");
     }
@@ -4400,13 +4407,20 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
         io.read(&v, sizeof(v));
     }
 
-    uint32_t st[4];
-    io.read(st, sizeof(st));
+    uint32_t st[5];
+    io.read(st, (version >= 2 ? 5 : 4)*sizeof(uint32_t));
     const uint32_t S = sj_kvarn.sink, G = sj_kvarn.group;
     const uint32_t B = st[0], B_prev = st[1], sj_N = st[2];
     const bool draining = st[3] != 0;
-    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev < S || B_prev > B) {
+    const uint32_t R = version >= 2 ? st[4] : B; // first saved ring position
+    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev < S || B_prev > B ||
+            R > B || (R < B && (R < S || (R - S) % G != 0))) {
         throw std::runtime_error("SJ-KVaRN cache: corrupt state (sealed end " + std::to_string(B) + ", " + std::to_string(n) + " cells)");
+    }
+    // ring rows of [R, R_keep) do not fit this cache's ring (smaller n_ubatch): read and drop them
+    uint32_t R_keep = R;
+    if (R < B && n - R > sj_kvarn_cap) {
+        R_keep = std::min(B, S + G*((n - sj_kvarn_cap - S + G - 1)/G));
     }
     const uint32_t n_rec = (B - S)/G;
     if (n_rec > sj_kvarn_n_groups_seq) {
@@ -4465,7 +4479,11 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
                 ggml_tensor * t = is_v ? tv : tk;
                 const size_t r = is_v ? rv : rk;
                 const size_t o = is_v ? ov : ok;
-                for (uint32_t p = std::max(B, S); p < n;) {
+                if (R_keep > R) {
+                    std::vector<uint8_t> skip((size_t) (R_keep - std::max(R, S))*r);
+                    io.read(skip.data(), skip.size());
+                }
+                for (uint32_t p = std::max(R_keep, S); p < n;) {
                     const uint32_t row = sj_kvarn_ring_row(p);
                     const uint32_t m   = std::min(n - p, S + sj_kvarn_cap - row);
                     io.read_tensor(t, o + (size_t) row*r, (size_t) m*r);
@@ -4498,7 +4516,7 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
     sst.B_prev    = B_prev;
     sst.B_pending = B;
     sst.N         = std::max(sj_N, n);
-    sst.ring_lo   = B; // only the ring rows of [B, n) were restored
+    sst.ring_lo   = std::max(R_keep, S); // only the ring rows of [R_keep, n) were restored
     sst.draining  = draining;
 
     LLAMA_LOG_DEBUG("%s: restored %u cells, sealed end %u (%u groups), tail %u rows\n", __func__, n, B, n_rec, n - std::min(n, B));

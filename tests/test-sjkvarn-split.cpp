@@ -180,11 +180,23 @@ static int run_cfg(llama_model * model, const sj_cfg & c, llama_pos N, const std
     const uint32_t B_cold = c.plain ? 0 : cache_of(ctx)->get_sj_kvarn_sealed_end();
     printf("%-22s cold N=%d B=%u\n", c.name, (int) N, B_cold);
     for (llama_pos cut : cuts) {
-        for (int mode = 0; mode < 2; ++mode) {
+        for (int mode = 0; mode < 3; ++mode) {
             llama_memory_clear(llama_get_memory(ctx), true);
             std::vector<float> got;
             if (mode == 0) {
                 prefill(ctx, 0, cut);
+                got = decode(ctx, cut, N, (int) g_ub);
+            } else if (mode == 2) {
+                // [#197] server prompt-cache path: save the state of a longer prompt that shares [0, cut), load it
+                // back, cut at the checkpoint and re-prefill (what a RAM/disk prompt-cache hit + checkpoint restore does)
+                prefill(ctx, 0, cut);
+                prefill(ctx, cut, std::min<llama_pos>(cut + 1400, 4000), 7); // far enough that B passes the cut
+                std::vector<uint8_t> buf(llama_state_seq_get_size(ctx, 0));
+                require(llama_state_seq_get_data(ctx, buf.data(), buf.size(), 0) == buf.size(), "state save");
+                llama_memory_clear(llama_get_memory(ctx), true);
+                require(llama_state_seq_set_data(ctx, buf.data(), buf.size(), 0) == buf.size(), "state load");
+                const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), 0, cut, -1);
+                if (!ok) { printf("%-22s   state %d: seq_rm refused\n", c.name, (int) cut); continue; }
                 got = decode(ctx, cut, N, (int) g_ub);
             } else {
                 prefill(ctx, 0, cut);
@@ -196,7 +208,7 @@ static int run_cfg(llama_model * model, const sj_cfg & c, llama_pos N, const std
             const uint32_t B = c.plain ? 0 : cache_of(ctx)->get_sj_kvarn_sealed_end();
             const bool same = got.size() == cold.size() && memcmp(got.data(), cold.data(), got.size()*sizeof(float)) == 0;
             n_diff += !same;
-            printf("%-22s   %s %4d: %s max|d| = %.3g  B=%u\n", c.name, mode ? "trunc" : "split", (int) cut, same ? "identical" : "DIFFERS  ", max_diff(got, cold), B);
+            printf("%-22s   %s %4d: %s max|d| = %.3g  B=%u\n", c.name, mode == 2 ? "state" : mode ? "trunc" : "split", (int) cut, same ? "identical" : "DIFFERS  ", max_diff(got, cold), B);
         }
     }
     llama_free(ctx);
@@ -217,7 +229,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const llama_pos N = getenv("SJ_TEST_N") ? atoi(getenv("SJ_TEST_N")) : 2347;
-    const std::vector<llama_pos> cuts = { 1920, 1280, 1000, 2304 };
+    std::vector<llama_pos> cuts = { 1920, 1280, 1000, 2304 };
+    if (getenv("SJ_TEST_CUTS")) { // comma list, e.g. grid points only (the server puts SJ-KVaRN checkpoints on the grid)
+        cuts.clear();
+        for (const char * q = getenv("SJ_TEST_CUTS"); *q; ) { cuts.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+    }
 
     sj_cfg pf16 = { "plain f16", 0, 0, GGML_TYPE_F32 }; pf16.plain = true;
     sj_cfg pq8  = { "plain q8_0", 0, 0, GGML_TYPE_F32 }; pq8.plain = true; pq8.plain_type = GGML_TYPE_Q8_0;
