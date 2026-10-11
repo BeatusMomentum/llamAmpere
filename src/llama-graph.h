@@ -1192,6 +1192,7 @@ struct llm_graph_context {
         int32_t bits_v = 0;
         bool fused_rot = false; // Q/output rotation inside the FA node (ggml_sj_kvarn_fused_rot_enabled)
         const std::vector<uint32_t> * n_kv_streams = nullptr; // multi-stream: per-stream n_kv (see llm_graph_input_attn_kv)
+        ggml_tensor * wush_ao = nullptr; // EXPERIMENTAL WUSH-KV: output transform replacing the inverse Hadamard
     } sj_kvarn_pending;
     // multi-stream SJ-KVaRN: per-stream mask views cut to the stream's own n_kv are not contiguous when the ubatch
     // has more than one token row, and FA needs a contiguous mask; the contiguous copies are made once per graph

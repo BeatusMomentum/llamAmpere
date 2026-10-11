@@ -1,4 +1,4 @@
-> **llamAmpere v0.5.1**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
+> **llamAmpere v0.5.2**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
 
 ## What's new in v0.5
 
@@ -15,21 +15,28 @@
 - **Faster MTP verify decode on EXL3 models**, and a catch-up to upstream llama.cpp and TheTom's TurboQuant fork.
 - **New in v0.5.1:** SJ-KVaRN works with parallel decode slots (`--parallel N`, optionally `--kv-unified`);
   `--parallel 1` output is unchanged. [Release notes](docs/llamampere-v0.5.1/RELEASE_NOTES.md).
-- **Coming in v0.5.2:** a Swift 1.5 EXL3 4.0 bpw model.
+- **New in v0.5.2:** several prefill and SJ-KVaRN fixes were added, improving reliability and speed. The RAM prompt
+  cache keeps the newest 4 checkpoints plus one per doubling (`--cache-ram-checkpoints 0` keeps all). Optional
+  per-model SJ-KVaRN transform files (`--sjkvarn-transform`). [Release notes](docs/llamampere-v0.5.2/RELEASE_NOTES.md).
+- **Coming next:** a Swift 1.5 EXL3 4.0 bpw model.
 - **Read more:** the [SJ-KVaRN paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper) and the standalone codec,
   [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT).
 
 Release notes, including what we tried and did not ship: [docs/llamampere-v0.5/RELEASE_NOTES.md](docs/llamampere-v0.5/RELEASE_NOTES.md). Recommended settings for every card size: [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
 
-**Build and run (v0.5, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
+**Build and run (v0.5.2, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
 CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
 
 ```bash
 git clone https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
-cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DLLAMA_BUILD_BORINGSSL=ON
 cmake --build build-sm86 -j8 --target llama-server
 ```
+
+`-DLLAMA_BUILD_BORINGSSL=ON` builds HTTPS support from source so `-hf` can download the model. Without it, a machine
+that has no OpenSSL development files gets a build whose `-hf` fails with "HTTPS is not supported".
 
 Fastest decode (tq5_0 K / turbo4 V):
 
@@ -72,7 +79,8 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
   --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
 ```
 
-With a 203,568-token prompt this peaked at 12,052 MiB on the whole card, including about 1 GB used by the desktop.
+With a 203,568-token prompt this peaked at 12,052 MiB on the whole card, including about 1 GB used by the desktop;
+the server process itself used about 11.1 GB.
 
 ---
 

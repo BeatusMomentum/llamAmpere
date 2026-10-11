@@ -1948,6 +1948,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.sj_kvarn_edge_bits_k = params.sj_kvarn_edge_bits_k;
     cparams.sj_kvarn_edge_bits_v = params.sj_kvarn_edge_bits_v;
     cparams.sj_kvarn_flush_chunk = params.sj_kvarn_flush_chunk;
+    cparams.sj_kvarn_transform = params.sj_kvarn_transform.empty() ? nullptr : params.sj_kvarn_transform.c_str();
     cparams.type_s = params.cache_type_s;
 
     if (params.moe_cache.mode_explicit) {
@@ -2632,12 +2633,21 @@ void common_prompt_checkpoint::update_pos(
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        std::vector<uint8_t> * spare) {
     if (ctx == nullptr) {
         return;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+
+    // reuse the spare only when it fits without growing and without wasting more than 1/8 of it
+    if (spare != nullptr && data_tgt.capacity() < ckpt_size &&
+            spare->size() >= ckpt_size && spare->size() - ckpt_size <= ckpt_size / 8) {
+        data_tgt.swap(*spare);
+        spare->clear();
+        spare->shrink_to_fit();
+    }
 
     data_tgt.resize(ckpt_size);
 

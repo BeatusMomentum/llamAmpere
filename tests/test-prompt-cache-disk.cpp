@@ -4,6 +4,7 @@
 //   supersede / dedupe rules.
 
 #include "server-prompt-cache-disk.h"
+#include "server-task.h"
 
 #include "common.h"
 #include "log.h"
@@ -15,6 +16,8 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <algorithm>
+#include <cstdint>
 #include <vector>
 
 #ifndef _WIN32
@@ -443,6 +446,147 @@ static void test_supersede_dedupe(const std::string & root) {
     CHECK(t.n_match() == 2);
 }
 
+// [#187] recycled RAM-tier state buffers: reuse without a fresh allocation, bounded count, trimmed to the limit
+static void test_spare_pool() {
+    server_prompt_cache pc(1024, 0);
+    std::vector<uint8_t> a = pc.take_buffer(64*MiB);
+    CHECK(a.size() == 64*MiB && a.capacity() >= 72*MiB); // 1/8 headroom
+    a[0] = 42;
+    const uint8_t * pa = a.data();
+    pc.recycle(a);
+    CHECK(a.empty() && pc.spare.size() == 1 && pc.spare_size() >= 72*MiB);
+
+    // a slightly longer save of the same conversation fits the recycled buffer: same memory, no fresh allocation
+    std::vector<uint8_t> b = pc.take_buffer(70*MiB);
+    CHECK(b.data() == pa && b.size() == 70*MiB && pc.spare.empty());
+
+    // too large for every spare: a fresh buffer, the spare stays
+    pc.recycle(b);
+    std::vector<uint8_t> c = pc.take_buffer(100*MiB);
+    CHECK(c.data() != pa && pc.spare.size() == 1);
+    // the smallest fitting spare is chosen
+    pc.recycle(c);
+    std::vector<uint8_t> d = pc.take_buffer(50*MiB);
+    CHECK(d.data() == pa && pc.spare.size() == 1);
+    d.clear(); d.shrink_to_fit();
+
+    // small buffers are not kept; empty requests take nothing
+    std::vector<uint8_t> small(1*MiB);
+    pc.recycle(small);
+    CHECK(pc.spare.size() == 1 && small.empty());
+    CHECK(pc.take_buffer(0).empty() && pc.spare.size() == 1);
+
+    // at most spare_max_n buffers: the smallest is dropped
+    pc.spare.clear();
+    for (size_t mb : {20, 30, 40, 50, 60}) {
+        std::vector<uint8_t> v(mb*MiB);
+        pc.recycle(v);
+    }
+    CHECK(pc.spare.size() == 4);
+    size_t min_cap = SIZE_MAX;
+    for (const auto & v : pc.spare) {
+        min_cap = std::min(min_cap, v.capacity());
+    }
+    CHECK(min_cap == 30*MiB);
+
+    // spares count against the RAM limit and the largest go first
+    pc.limit_size = 100*MiB;
+    pc.trim_spare(0);
+    CHECK(pc.spare_size() <= 100*MiB && pc.spare.size() == 2); // 30 + 40 left
+    pc.trim_spare(50*MiB);
+    CHECK(pc.spare.size() == 1 && pc.spare_size() == 30*MiB);
+    pc.update();
+    CHECK(pc.spare.size() == 1);
+}
+
+// [#187] alloc(.., hand_over) moves the checkpoints into the entry instead of copying them; holds() tracks the entry
+static void test_hand_over() {
+    server_prompt_cache pc(1024, 0);
+    server_prompt p;
+    p.tokens = server_tokens(llama_tokens{1, 2, 3, 4, 5, 6, 7, 8}, false);
+    for (int i = 0; i < 3; ++i) {
+        auto & c = p.checkpoints.emplace_back();
+        c.n_tokens = 2*(i + 1); c.pos_min = 0; c.pos_max = 2*(i + 1) - 1;
+        c.data_tgt.assign(1*MiB, (uint8_t) i);
+    }
+    const uint8_t * d0 = p.checkpoints.front().data_tgt.data();
+
+    auto * e = pc.alloc(p, 4*MiB, 0, &p.checkpoints);
+    CHECK(e != nullptr && pc.holds(e));
+    CHECK(p.checkpoints.empty() && e->prompt.checkpoints.size() == 3);
+    CHECK(e->prompt.checkpoints.front().data_tgt.data() == d0); // moved, not copied
+    CHECK(e->size() == 4*MiB + 3*MiB && pc.size() == 7*MiB);
+
+    // without hand_over the slot keeps its own copy
+    server_prompt q;
+    q.tokens = server_tokens(llama_tokens{9, 10, 11}, false);
+    q.checkpoints.emplace_back().data_tgt.assign(1*MiB, 7);
+    auto * f = pc.alloc(q, 1*MiB, 0);
+    CHECK(f != nullptr && q.checkpoints.size() == 1 && f->prompt.checkpoints.size() == 1);
+    CHECK(f->prompt.checkpoints.front().data_tgt.data() != q.checkpoints.front().data_tgt.data());
+
+    // an evicted entry is no longer held
+    const server_prompt_cache_state * none = nullptr;
+    CHECK(!pc.holds(none) && pc.holds(f));
+    pc.limit_size = 2*MiB;
+    pc.update();
+    CHECK(!pc.holds(e));
+}
+
+// --cache-ram-checkpoints: the keep-newest-plus-doubling selection, and alloc() thinning a RAM entry (the slot
+// keeps its full list, also when alloc is asked to hand the checkpoints over by move)
+static void test_ram_ckpt_keep() {
+    // 31 checkpoints, one every 900 tokens, entry of 28000 tokens
+    entry_data e = make_entry(7, 28000, 4096, 31);
+    int c = 0;
+    for (auto & ck : e.ckpts) {
+        ck.pos_min = 0;
+        ck.pos_max = 900 * (c + 1) - 1;
+        ck.n_tokens = 900 * (c + 1);
+        c++;
+    }
+    CHECK(server_prompt_keep_checkpoints(e.ckpts, e.tokens.size(), 0).size() == 31);
+    CHECK(server_prompt_keep_checkpoints(e.ckpts, e.tokens.size(), 31).size() == 31);
+    const auto k = server_prompt_keep_checkpoints(e.ckpts, e.tokens.size(), 4);
+    std::vector<int> pos;
+    for (auto * p : k) {
+        pos.push_back(p->pos_max);
+    }
+    CHECK(pos.size() >= 5 && pos.size() <= 8);
+    CHECK(std::is_sorted(pos.begin(), pos.end()));      // list order
+    for (int i = 0; i < 4; ++i) {
+        CHECK(pos[pos.size() - 1 - i] == 900 * (31 - i) - 1); // the 4 newest
+    }
+    CHECK(pos.front() < 15000);                        // something near the middle survives for branches
+    CHECK(server_prompt_keep_checkpoints(e.ckpts, e.tokens.size(), 8).size() > k.size());
+
+    server_prompt p;
+    p.tokens = server_tokens(e.tokens, false);
+    for (const auto & ck : e.ckpts) {
+        p.checkpoints.push_back(ck);
+    }
+    size_t kept_size = 0;
+    for (auto * ck : k) {
+        kept_size += ck->size();
+    }
+    {
+        server_prompt_cache pc(1024, 0);
+        pc.ram_ckpt_keep = 4;
+        auto * en = pc.alloc(p, 1*MiB, 0, &p.checkpoints);
+        CHECK(en != nullptr && en->prompt.checkpoints.size() == k.size());
+        CHECK(p.checkpoints.size() == 31);             // thinned: copied, the slot keeps all
+        CHECK(en->size() == 1*MiB + kept_size);
+        CHECK(pc.n_ram_ckpt_dropped == 31 - k.size());
+        CHECK(en->prompt.checkpoints.back().pos_max == 900 * 31 - 1);
+    }
+    {
+        server_prompt_cache pc(1024, 0);               // 0 = all, hand-over still moves
+        auto * en = pc.alloc(p, 1*MiB, 0, &p.checkpoints);
+        CHECK(en != nullptr && en->prompt.checkpoints.size() == 31 && p.checkpoints.empty());
+        CHECK(pc.n_ram_ckpt_dropped == 0);
+    }
+}
+
 int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
@@ -454,6 +598,9 @@ int main() {
     test_guard(root);
     test_corrupt_cleanup(root);
     test_supersede_dedupe(root);
+    test_spare_pool();
+    test_hand_over();
+    test_ram_ckpt_keep();
 
     std::error_code ec;
     fs::remove_all(root, ec);

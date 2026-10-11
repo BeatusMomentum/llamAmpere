@@ -592,6 +592,15 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         task.opts       = opts;
         tasks.push_back(task);
     }
+    // an SJ-KVaRN transform given as a URL (e.g. a Hugging Face resolve link) is downloaded to the cache like --mmproj-url
+    if (params.sj_kvarn_transform.rfind("https://", 0) == 0 || params.sj_kvarn_transform.rfind("http://", 0) == 0) {
+        common_download_task task;
+        task.url        = params.sj_kvarn_transform;
+        task.local_path = get_default_local_path(task.url);
+        task.opts       = opts;
+        params.sj_kvarn_transform = task.local_path;
+        tasks.push_back(task);
+    }
     bool had_spec_url = false;
     if (!params.speculative.draft.mparams.url.empty()) {
         common_download_task task;
@@ -1874,6 +1883,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-min-free"}, "N",
+        "free space in MiB the prompt-cache disk tier leaves on its filesystem; writes are skipped below it "
+        "(default: -1 = max(10% of the filesystem, 8 GiB))",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("cache-disk-min-free must be -1 or a size in MiB");
+            }
+            params.cache_disk_min_free_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_FREE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ram-checkpoints"}, "N",
+        string_format("RAM prompt cache: context checkpoints (hybrid/recurrent models) kept per cached entry: the N newest "
+            "plus one each time the distance from the end doubles; an edit between two kept checkpoints re-processes "
+            "from the earlier one. The active slot keeps all of its checkpoints. 0 = all (default: %d)", params.cache_ram_ckpt),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-ram-checkpoints must be >= 0");
+            }
+            params.cache_ram_ckpt = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--no-cache-disk"},
         "disable the prompt-cache disk tier (RAM cache only)",
         [](common_params & params) {
@@ -2770,6 +2802,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sj_kvarn_flush_chunk = (uint32_t) value;
         }
     ).set_env("LLAMA_ARG_SJKVARN_FLUSH_CHUNK"));
+    add_opt(common_arg(
+        {"--sjkvarn-transform"}, "FILE|URL",
+        "SJ-KVaRN cache: per-layer, per-KV-head K/V transform file (SJWU format, calibrated for one model) applied in place "
+        "of the Hadamard on the layers it lists; an http(s) URL is downloaded to the cache; disables the fused write "
+        "rotation on those layers; saved states record its hash (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.sj_kvarn_transform = value;
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_TRANSFORM"));
     add_opt(common_arg(
         {"--sjkvarn-sink"}, "N",
         string_format("SJ-KVaRN cache: number of leading positions kept unsealed (multiple of 64, default: %u)", params.sj_kvarn_sink),

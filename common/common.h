@@ -715,6 +715,7 @@ struct common_params {
     uint32_t sj_kvarn_edge_layers = 0; // tiered body: first/last N cache layers sealed at sj_kvarn_edge_bits_k/v
     uint32_t sj_kvarn_edge_bits_k = 4;
     uint32_t sj_kvarn_edge_bits_v = 4;
+    std::string sj_kvarn_transform;  // EXPERIMENTAL WUSH-KV transform file (--sjkvarn-transform)
     uint32_t sj_kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
     ggml_type cache_type_s = GGML_TYPE_F32; // recurrent (gated delta-net) state cache data type
 
@@ -770,6 +771,8 @@ struct common_params {
     bool        cache_disk      = true;  // prompt-cache disk tier (--no-cache-disk turns it off)
     std::string cache_disk_path;         // disk tier directory (empty = common_prompt_cache_default_dir())
     int32_t cache_disk_mib      = 16384; // disk tier size limit in MiB, -1 = no limit (free-space guard only), 0 = disable
+    int32_t cache_disk_min_free_mib = -1; // [#187] free space the disk tier leaves on its filesystem in MiB (-1 = max(10%, 8 GiB))
+    int32_t cache_ram_ckpt      = 4;     // RAM tier: newest context checkpoints kept per entry (+ log-spaced older), 0 = all
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -1459,10 +1462,13 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
+    // spare: an optional buffer of an erased checkpoint; when it fits, it takes the place of a fresh allocation
+    // (a fresh 150 MiB buffer costs ~60 ms of page faults and zero fill before the copy even starts)
     void update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            std::vector<uint8_t> * spare = nullptr);
 
     void update_dft(
             llama_context * ctx,

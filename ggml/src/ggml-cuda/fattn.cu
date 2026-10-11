@@ -804,6 +804,37 @@ static __global__ void kv_stream_normalize_chunk_results(
     dst[row*D + tid] = denom > 0.0f ? accumulator[row*D + tid]/denom : 0.0f;
 }
 
+} // namespace (reopened below)
+
+// [TRPF] KV-chunked SJ-KVaRN trellis prefill (fattn-sjkvarn-prefill.cu): one f16 MMA partial launch per expanded KV
+// chunk, folded into a running (max, sum, numerator) with the same kernels the KV stream uses.
+void ggml_cuda_sj_kvarn_prefill_partial(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * parts, float2 * meta);
+void ggml_cuda_sj_kvarn_prefill_accumulate(const float * parts, const float2 * meta, float * acc, float2 * acc_meta,
+        int nrows, bool initialize, cudaStream_t stream);
+void ggml_cuda_sj_kvarn_prefill_normalize(const float * acc, const float2 * acc_meta, float * dst, int nrows, cudaStream_t stream);
+
+void ggml_cuda_sj_kvarn_prefill_partial(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * parts, float2 * meta) {
+    ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(ctx, dst, parts, meta);
+}
+
+void ggml_cuda_sj_kvarn_prefill_accumulate(const float * parts, const float2 * meta, float * acc, float2 * acc_meta,
+        const int nrows, const bool initialize, cudaStream_t stream) {
+    const ggml_cuda_kernel_launch_params launch_params(dim3(nrows, 1, 1), dim3(KV_STREAM_HEAD_DIM, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
+        parts, meta, acc, acc_meta, nrows, initialize, 1);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_sj_kvarn_prefill_normalize(const float * acc, const float2 * acc_meta, float * dst, const int nrows,
+        cudaStream_t stream) {
+    const ggml_cuda_kernel_launch_params launch_params(dim3(nrows, 1, 1), dim3(KV_STREAM_HEAD_DIM, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
+        acc, acc_meta, dst, nrows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+namespace {
+
 #ifdef GGML_CUDA_FA_ALL_QUANTS
 using kv_stream_native_partial_fn = void (*)(
     ggml_backend_cuda_context &, ggml_tensor *, float *, float2 *, int);

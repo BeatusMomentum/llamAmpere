@@ -3090,6 +3090,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 if (np*cols_per_warp >= warp_size || threadIdx.x < np*cols_per_warp) {
                     // Combined KQ max scale + rowsum.
                     meta_ptr[imeta * warp_size * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
+                    if constexpr (output_partial) {
+                        // Partial outputs are scaled to the combined max KQ_cmn, so the exported
+                        // meta must carry KQ_cmn (not the per-warp scale). Second free float2 of the row padding.
+                        meta_ptr[imeta * warp_size * tile_stride/2 + 1] = make_float2(KQ_cmn, KQ_crs);
+                    }
                 }
             }
 
@@ -3223,7 +3228,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                             }
                         } else if (k00 == 0 && k == 0) {
                             const int row = (jt*ncols1 + j_dst)*ne02 + c_dst;
-                            dstk_fixup[row] = make_float2(meta_j[0], meta_j[1]);
+                            dstk_fixup[row] = make_float2(np == 1 ? meta_j[0] : meta_j[2], meta_j[1]);
                         }
 
                         if (is_fixup) {

@@ -397,6 +397,39 @@ void server_prompt_disk_tier::enforce_limit() {
     }
 }
 
+std::vector<const common_prompt_checkpoint *> server_prompt_keep_checkpoints(
+        const std::list<common_prompt_checkpoint> & checkpoints, size_t n_tokens, size_t ckpt_keep) {
+    std::vector<const common_prompt_checkpoint *> all;
+    for (const auto & c : checkpoints) {
+        all.push_back(&c);
+    }
+    if (ckpt_keep == 0 || all.size() <= ckpt_keep) {
+        return all;
+    }
+    // newest first: the ckpt_keep newest, then one each time the distance from the end has doubled
+    std::vector<size_t> idx(all.size());
+    for (size_t i = 0; i < idx.size(); ++i) {
+        idx[i] = i;
+    }
+    std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return all[a]->pos_max > all[b]->pos_max; });
+    std::vector<bool> keep(all.size(), false);
+    int64_t last_dist = 0;
+    for (size_t r = 0; r < idx.size(); ++r) {
+        const int64_t dist = std::max<int64_t>(1, (int64_t) n_tokens - (int64_t) all[idx[r]]->pos_max);
+        if (r < ckpt_keep || dist >= 2 * last_dist) {
+            keep[idx[r]] = true;
+            last_dist    = dist;
+        }
+    }
+    std::vector<const common_prompt_checkpoint *> out;
+    for (size_t i = 0; i < all.size(); ++i) {
+        if (keep[i]) {
+            out.push_back(all[i]);
+        }
+    }
+    return out;
+}
+
 bool server_prompt_disk_tier::guard_allows(uint64_t need) {
     uint64_t capacity = 0, available = 0;
     if (!space_fn || !space_fn(dir, capacity, available)) {
@@ -411,6 +444,7 @@ bool server_prompt_disk_tier::guard_allows(uint64_t need) {
             SRV_WRN("prompt cache disk tier: skipping writes, %.1f GiB free of %.1f GiB (keeping at least %.1f GiB free: max(%.0f%%, %.0f GiB))\n",
                     available / (1024.0*1024.0*1024.0), capacity / (1024.0*1024.0*1024.0), reserve / (1024.0*1024.0*1024.0),
                     guard_frac * 100.0, guard_abs / (1024.0*1024.0*1024.0));
+            SRV_WRN("%s", "prompt cache disk tier: --cache-disk-min-free N (MiB) sets the free space to keep\n");
             guard_active = true;
         }
         return false;

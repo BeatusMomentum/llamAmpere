@@ -668,6 +668,30 @@ struct server_prompt_cache {
     // disk tier: RAM evictions are spilled here and consulted on a RAM miss (see server-prompt-cache-disk.h)
     server_prompt_disk_tier disk;
 
+    // --cache-ram-checkpoints: context checkpoints a RAM entry keeps, the newest ram_ckpt_keep plus one each time
+    // the distance from the end doubles (server_prompt_keep_checkpoints); 0 = all. The slot keeps its full list.
+    size_t ram_ckpt_keep          = 0;
+    size_t n_ram_ckpt_dropped     = 0; // checkpoints not stored in RAM entries
+    size_t bytes_ram_ckpt_dropped = 0;
+
+    // [#187] state buffers of restored entries, kept for the next save. A fresh multi-GiB buffer costs
+    // ~0.4-0.5 s/GiB in first-touch page faults (1.4 s of the 1.7 s save of a 100K tq5_0/turbo4 state);
+    // a recycled one only costs the D2H copy. Counted against limit_size, dropped first under pressure.
+    std::vector<std::vector<uint8_t>> spare;
+    size_t spare_max_n = 4;
+
+    size_t spare_size() const;
+
+    // [#187] a buffer of `n` bytes for a new state: the smallest spare that holds it, else a fresh one
+    // reserved with 1/8 headroom so the same conversation's next, slightly longer save fits it again
+    std::vector<uint8_t> take_buffer(size_t n);
+
+    // [#187] keep a released state buffer for reuse (no-op for small ones)
+    void recycle(std::vector<uint8_t> & buf);
+
+    // [#187] free spares until size() + spare_size() + extra fits limit_size
+    void trim_spare(size_t extra);
+
     // a prompt too large for the RAM budget is staged here and spilled straight to disk on the next update()
     server_prompt_cache_state staging;
     bool                      staging_pending = false;
@@ -681,7 +705,13 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // [#187] hand_over: the entry takes these checkpoints by move instead of copying them (the caller is about to
+    // replace or cut its prompt); see server_slot::prompt_reclaim_checkpoints for the way back
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft,
+            std::list<common_prompt_checkpoint> * hand_over = nullptr);
+
+    // [#187] true while `state` is a RAM entry of this cache (not loaded, evicted or staged)
+    bool holds(const server_prompt_cache_state * state) const;
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

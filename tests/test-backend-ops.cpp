@@ -14631,6 +14631,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(64, 24, 4, 3, 301, true, true, GGML_TYPE_F16, 128, false, GGML_TYPE_I16, bk, bv));
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(4, 24, 4, 3, 1024, true, false, GGML_TYPE_Q8_0, 256, false, GGML_TYPE_I16, bk, bv));
     }
+    // [TRPF] trellis prefill (n_q >= 128) takes the expand-once f16 path (fattn-sjkvarn-prefill.cu): bodies with tq6 /
+    // f16 / q8 staging, f16 and staging sinks, GQA 6 and 8, a partial last ubatch; GGML_SJKVARN_PREFILL_MIB=1 runs the
+    // same cases through the head-grouped scratch. rot=1 vs the CPU reference, rot=2 bit-exact vs the separate WHT graph.
+    for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}, {2, 2}}) {
+        for (int64_t n_q : {128, 129, 256, 1024}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 40, std::max<int64_t>(300, n_q), true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(257, 24, 3, 20, 1024, true, true, GGML_TYPE_F16, 128, false, GGML_TYPE_I16, bk, bv));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(512, 24, 4, 8, 512, true, false, GGML_TYPE_Q8_0, 256, false, GGML_TYPE_I16, bk, bv));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(300, 24, 4, 255, 300, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv));
+    }
+    for (int rot : {1, 2}) {
+        for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(256, 24, 4, 40, 300, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, rot));
+        }
+    }
+    // [TRPF x SJMULTI] trellis prefill over a paged record pool (2 and 3 streams, shuffled group->record maps)
+    for (int ns : {2, 3}) {
+        for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(512, 24, 4, 40, 600, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, 0, ns));
+        }
+    }
     // [audit 2026-10-03] 4/4 trellis bodies (I16): sjkvarn4t by default, the token-axis trellis4 under GGML_SJKVARN_TRELLIS_TOKENS=1
     for (int64_t n_q : {1, 5, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 301, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, 4, 4));

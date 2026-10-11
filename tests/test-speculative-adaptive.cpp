@@ -1,9 +1,10 @@
+// asserts must stay live in Release builds: undefine NDEBUG before <cassert>
+#undef NDEBUG
+
 #include "speculative-adaptive.h"
 
 #include <cassert>
 #include <cstdio>
-
-#undef NDEBUG
 
 static void test_reset(void) {
     common_speculative_adaptive ctrl;

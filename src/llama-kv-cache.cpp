@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -350,7 +351,7 @@ llama_kv_cache::llama_kv_cache(
                 // Size this for the actual layer loop below. Some models expose extra
                 // KV-bearing layers through n_layer_all, and under-reserving tensor
                 // metadata corrupts later KV/checkpoint operations.
-                /*.mem_size   =*/ size_t((3u*(1 + n_stream)*n_layer + n_layer + 3)*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((3u*(1 + n_stream)*n_layer + n_layer + 4u*n_layer + 3)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -443,6 +444,49 @@ llama_kv_cache::llama_kv_cache(
     // SJ-KVaRN tiered body: the edge tier is the first and last edge_layers MODEL layers (blocks of any type, user 2026-09-23:
     // no need to know the attention layout); whichever KV-bearing layers fall inside seal at the edge bits
     const uint32_t sj_kvarn_n_layers_model = hparams.n_layer(); // trunk only: nextn (MTP) layers live in their own context and cache
+
+    // EXPERIMENTAL WUSH-KV (arXiv 2609.38121, --sjkvarn-transform): read the per-layer transform file. Format (LE):
+    // char[4] "SJWU", u32 version 1, u32 head_dim, u32 n_head_kv, u32 n_layers, then per layer i32 il and
+    // f32 AQ|AK|AV|AO [n_head_kv][head_dim][head_dim] (row-major, y = A x). Layers of this cache absent from the file
+    // keep the Hadamard; file layers absent from this cache are ignored.
+    if (sj_kvarn.enabled() && !sj_kvarn.transform.empty()) {
+        std::ifstream f(sj_kvarn.transform, std::ios::binary);
+        if (!f) {
+            throw std::runtime_error("SJ-KVaRN transform: cannot open " + sj_kvarn.transform);
+        }
+        std::vector<char> raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        uint32_t hdr[5] = {};
+        if (raw.size() < 20 || memcmp(raw.data(), "SJWU", 4) != 0) {
+            throw std::runtime_error("SJ-KVaRN transform: " + sj_kvarn.transform + " is not an SJWU file");
+        }
+        memcpy(hdr, raw.data() + 4, 16);
+        const uint32_t D = hdr[1], H = hdr[2], NL = hdr[3];
+        const size_t per = (size_t) 4*H*D*D;
+        if (hdr[0] != 1 || D != 256 || raw.size() != 20 + (size_t) NL*(4 + per*sizeof(float))) {
+            throw std::runtime_error("SJ-KVaRN transform: bad header or size in " + sj_kvarn.transform);
+        }
+        uint64_t h = 1469598103934665603ULL;
+        for (char ch : raw) { h ^= (uint8_t) ch; h *= 1099511628211ULL; }
+        sj_wush_hash = h;
+        const char * p = raw.data() + 20;
+        for (uint32_t i = 0; i < NL; ++i) {
+            int32_t il;
+            memcpy(&il, p, 4); p += 4;
+            std::vector<float> m(per);
+            memcpy(m.data(), p, per*sizeof(float)); p += per*sizeof(float);
+            if (il >= 0 && (uint32_t) il < n_layer && hparams.has_kv(il) && (!filter || filter(il))) {
+                if (hparams.n_head_kv(il) != H || hparams.n_embd_head_k(il) != D || hparams.n_embd_head_v(il) != D) {
+                    throw std::runtime_error("SJ-KVaRN transform: layer " + std::to_string(il) + " geometry does not match the model");
+                }
+                sj_wush_host[il] = std::move(m);
+            }
+        }
+        if (sj_wush_host.empty()) {
+            sj_wush_hash = 0;
+        }
+        LLAMA_LOG_INFO("%s: SJ-KVaRN WUSH transform %s: %zu of %u file layers apply to this cache (hash %016llx)\n", __func__,
+                sj_kvarn.transform.c_str(), sj_wush_host.size(), NL, (unsigned long long) sj_wush_hash);
+    }
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -778,6 +822,19 @@ llama_kv_cache::llama_kv_cache(
             body->op_params[7] = layer_new.sj_kvarn_body_type;
             ggml_format_name(body, "cache_%ssj_kvarn_l%d", name_tag, il);
             layer_new.body = body;
+
+            auto wit = sj_wush_host.find((int32_t) il);
+            if (wit != sj_wush_host.end()) {
+                const int64_t D = hparams.n_embd_head_k(il), H = hparams.n_head_kv(il);
+                sj_wush_layer w;
+                ggml_tensor ** dst[4] = { &w.aq, &w.ak, &w.av, &w.ao };
+                static const char * nm[4] = { "aq", "ak", "av", "ao" };
+                for (int j = 0; j < 4; ++j) {
+                    *dst[j] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, D, H);
+                    ggml_format_name(*dst[j], "cache_%ssj_wush_%s_l%d", name_tag, nm[j], il);
+                }
+                sj_wush[(int32_t) il] = w;
+            }
         }
 
         map_layer_ids[il] = layers.size();
@@ -801,7 +858,10 @@ llama_kv_cache::llama_kv_cache(
     // SJ-KVaRN fused write rotation (#139, GGML_SJKVARN_FUSED_ROT): the TQ6_0 ring/sink write applies the SJ-KVaRN
     // Hadamard itself, so the graph drops its standalone K/V GGML_OP_TURBO_WHT nodes. Needs a backend kernel
     // for the fused SET_ROWS on every device that holds a layer; otherwise the unfused path stays.
-    if (sj_kvarn.enabled() && type_k == GGML_TYPE_TQ6_0 && type_v == GGML_TYPE_TQ6_0 && llama_sj_kvarn_fused_rot_switch()) {
+    if (!sj_wush.empty()) {
+        LLAMA_LOG_INFO("%s: SJ-KVaRN WUSH transform active on %zu layers: fused write rotation off\n", __func__, sj_wush.size());
+    }
+    if (sj_kvarn.enabled() && sj_wush.empty() && type_k == GGML_TYPE_TQ6_0 && type_v == GGML_TYPE_TQ6_0 && llama_sj_kvarn_fused_rot_switch()) {
         sj_kvarn_fused_rot_on = true;
         const int group = sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
         for (const auto & layer : layers) {
@@ -890,6 +950,10 @@ llama_kv_cache::llama_kv_cache(
         }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
+
+    // EXPERIMENTAL WUSH-KV: the transforms share the cache buffers, so they are uploaded here and again after every
+    // clear(data = true), which zeroes those buffers (the host copy is kept for that)
+    sj_wush_upload();
 
     {
         const size_t memory_size_k = size_k_bytes();
@@ -1057,6 +1121,8 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+
+        sj_wush_upload(); // EXPERIMENTAL WUSH-KV transforms live in these buffers too
 
         // Re-initialize turbo rotation matrices after buffer clear (clear zeroes everything)
         if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !model.hparams.no_alloc) {
@@ -4092,6 +4158,10 @@ void llama_kv_cache::state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id se
         lf.push_back({ p + "k_row",     (int64_t) layer.k->nb[1] });
         lf.push_back({ p + "v_row",     (int64_t) layer.v->nb[1] });
     }
+    if (!sj_wush.empty()) { // EXPERIMENTAL WUSH-KV: the stored rows live in the transform's basis
+        lf.push_back({ "wush_layers", (int64_t) sj_wush.size() });
+        lf.push_back({ "wush_hash",   (int64_t) sj_wush_hash });
+    }
     const auto cfg = sj_kvarn_state_cfg(sj_kvarn, layers[0].k->type, layers[0].v->type, sj_kvarn_fused_rot_on,
             sj_kvarn_rec_bytes, sj_kvarn_n_layers_edge, lf);
     const uint32_t n_cfg = cfg.size();
@@ -4241,6 +4311,10 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
         lf.push_back({ p + "n_head_kv", hparams.n_head_kv(layer.il) });
         lf.push_back({ p + "k_row",     (int64_t) layer.k->nb[1] });
         lf.push_back({ p + "v_row",     (int64_t) layer.v->nb[1] });
+    }
+    if (!sj_wush.empty()) { // EXPERIMENTAL WUSH-KV: the stored rows live in the transform's basis
+        lf.push_back({ "wush_layers", (int64_t) sj_wush.size() });
+        lf.push_back({ "wush_hash",   (int64_t) sj_wush_hash });
     }
     const auto cfg = sj_kvarn_state_cfg(sj_kvarn, layers[0].k->type, layers[0].v->type, sj_kvarn_fused_rot_on,
             sj_kvarn_rec_bytes, sj_kvarn_n_layers_edge, lf);
@@ -5131,6 +5205,24 @@ const llama_sj_kvarn_config & llama_kv_cache_context::get_sj_kvarn() const {
 
 bool llama_kv_cache_context::sj_kvarn_fused_rot() const {
     return kv->sj_kvarn_fused_rot();
+}
+
+void llama_kv_cache::sj_wush_upload() {
+    if (hparams.no_alloc) {
+        return;
+    }
+    for (auto & [il, w] : sj_wush) {
+        const auto & m = sj_wush_host.at(il);
+        const size_t n = m.size()/4;
+        ggml_backend_tensor_set(w.aq, m.data() + 0*n, 0, n*sizeof(float));
+        ggml_backend_tensor_set(w.ak, m.data() + 1*n, 0, n*sizeof(float));
+        ggml_backend_tensor_set(w.av, m.data() + 2*n, 0, n*sizeof(float));
+        ggml_backend_tensor_set(w.ao, m.data() + 3*n, 0, n*sizeof(float));
+    }
+}
+
+const llama_kv_cache::sj_wush_layer * llama_kv_cache_context::get_sj_wush(int32_t il) const {
+    return kv->get_sj_wush(il);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_sj_kvarn_desc(ggml_context * ctx, const llama_ubatch & ubatch) const {

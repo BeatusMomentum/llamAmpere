@@ -861,6 +861,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 /*.edge_body_type =*/ params.sj_kvarn_edge_body_type,
                 /*.flush_chunk =*/ params.sj_kvarn_flush_chunk,
                 /*.shared_pool =*/ sj_kvarn_shared_pool,
+                /*.transform   =*/ params.sj_kvarn_transform ? params.sj_kvarn_transform : "",
             },
         };
 
@@ -5581,6 +5582,7 @@ llama_context_params llama_context_default_params() {
         /*.sj_kvarn_edge_bits_v           =*/ 4,
         /*.sj_kvarn_edge_body_type        =*/ GGML_TYPE_COUNT,
         /*.sj_kvarn_flush_chunk           =*/ 0,
+        /*.sj_kvarn_transform             =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

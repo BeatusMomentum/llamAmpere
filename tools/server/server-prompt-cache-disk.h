@@ -46,6 +46,12 @@ struct server_prompt_disk_record {
 
 uint64_t server_prompt_disk_hash(const void * data, size_t n, uint64_t seed = 0xcbf29ce484222325ull);
 
+// the checkpoints of an entry with n_tokens tokens that a keep-newest-plus-doubling-distance policy keeps: the
+// ckpt_keep newest, then one each time the distance from the end has doubled; in list order. 0 = all. Used by
+// the RAM tier (--cache-ram-checkpoints).
+std::vector<const common_prompt_checkpoint *> server_prompt_keep_checkpoints(
+        const std::list<common_prompt_checkpoint> & checkpoints, size_t n_tokens, size_t ckpt_keep);
+
 struct server_prompt_disk_tier {
     // free-space query, injectable for tests: returns false when the filesystem cannot be queried
     using space_fn_t = std::function<bool(const std::string & dir, uint64_t & capacity, uint64_t & available)>;

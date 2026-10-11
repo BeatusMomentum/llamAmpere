@@ -40,7 +40,9 @@ log says what it chose). Entries evicted from RAM, and everything cached at shut
 `~/.cache/llamampere/prompt-cache` (`$XDG_CACHE_HOME` if set), oldest written deleted first, with writes paused while the
 filesystem has less than the larger of 10% and 8 GiB free; an entry is only restored into the same model with the same
 KV, drafter-KV and state settings. Override with `--cache-ram N` (MiB; `-1` = half of free memory, `0` = no prompt
-cache), `--cache-disk-path DIR`, `--cache-disk-limit N` (MiB; `-1` = no limit, `0` = off) or `--no-cache-disk`. Block KV
+cache), `--cache-disk-path DIR`, `--cache-disk-limit N` (MiB; `-1` = no limit, `0` = off) or `--no-cache-disk`. Each RAM
+entry keeps the newest 4 context checkpoints plus one per doubling of the distance from the end (v0.5.2;
+`--cache-ram-checkpoints 0` keeps all). Block KV
 streaming (`--kv-stream-arena-mib`) cannot be cached. SJ-KVaRN caches are cached like the others; a reused prompt restarts at the 128-token group
 boundary at or below the first changed token, so a resumed 27K-token conversation re-prefills about 150 tokens.
 

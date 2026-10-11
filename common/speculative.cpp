@@ -1784,6 +1784,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             chain_rng_seeded[seq_id] = 0; // [#69] same for the sampled chain's uniform stream
         }
 
+        // [#196] new request: restart the adaptive depth controller of this seq at its floor, so the
+        // verify widths (and with them the temp-0 output) depend only on this request, not on whatever
+        // the previous request on the slot left behind. LLAMA_SPEC_ADAPTIVE_CARRY=1 keeps the old
+        // carry-over across requests (A/B arm for the speed gate).
+        if (adaptive && seq_id >= 0 && seq_id < (llama_seq_id) adaptive_ctrl.size()) {
+            static const bool carry = [] { const char * e = getenv("LLAMA_SPEC_ADAPTIVE_CARRY"); return e && atoi(e) != 0; }();
+            if (!carry) {
+                adaptive_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
+            }
+        }
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -3787,8 +3798,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.sj_kvarn_tail_max = 0;
         result.sj_kvarn_flush_chunk = 0;
     }
-    // The nextn layer has no trunk edge tier.
+    // The nextn layer has no trunk edge tier, and no WUSH transform (the file covers trunk layers only).
     result.sj_kvarn_edge_layers = 0;
+    result.sj_kvarn_transform.clear();
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
