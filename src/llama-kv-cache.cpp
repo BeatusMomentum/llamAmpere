@@ -243,18 +243,23 @@ llama_kv_cache::llama_kv_cache(
         GGML_ASSERT(n_swa == 0 && swa_type == LLAMA_SWA_TYPE_NONE);
         GGML_ASSERT(sj_kvarn.group == 128 && sj_kvarn.sink % 64 == 0 && sj_kvarn.tail % sj_kvarn.group == 0);
         GGML_ASSERT(kv_size % 256 == 0 && "SJ-KVaRN cache: the attention kernel needs n_kv padded to 256");
-        // [#197] the seal schedule follows the grid cell of the ubatch start (cells of n_ubatch positions) instead of
-        // the ubatch start itself, and the splitter cuts ubatches at the grid lines: every query row then sees the same
-        // sealed end whatever the prefill split was (a checkpoint restore + partial prefill == a cold prefill).
-        // LLAMA_SJKVARN_SEAL_GRID=0 restores the per-ubatch-start schedule.
+        // [#197/PCR1] restore grid (n_ubatch positions). The server puts SJ-KVaRN prompt checkpoints on it, so a cold
+        // prefill and a prefill resumed from a checkpoint both start every ubatch on a grid line, and
+        // llama_sj_kvarn_prefill_cut() reopens a restored cache to the sealed end a cold prefill has at the cut
+        // (replay of the seal schedule over the grid). The live seal schedule (decode included) is unchanged.
+        // LLAMA_SJKVARN_SEAL_GRID: unset/2 = this restore grid (default); 1 = also run the seal schedule on the grid
+        // cells and cut ubatches at grid lines (#197 full mode: split-independent for any prefill split, changes the
+        // decode seal timing); 0 = off (v0.5.2: group-floor checkpoints, no replay).
         {
             const char * e = getenv("LLAMA_SJKVARN_SEAL_GRID");
-            sj_kvarn_grid = (e && atoi(e) == 0) ? 0 : sj_kvarn.n_ubatch;
+            const int mode = e ? atoi(e) : 2;
+            sj_kvarn_grid       = mode == 0 ? 0 : sj_kvarn.n_ubatch;
+            sj_kvarn_split_grid = mode == 1 ? sj_kvarn.n_ubatch : 0;
         }
-        // ring: tail + group + 2*n_ubatch rows (see apply_ubatch); the grid schedule keeps the sealed end up to one
+        // ring: tail + group + 2*n_ubatch rows (see apply_ubatch); the full grid schedule keeps the sealed end up to one
         // cell behind and a decode/verify ubatch (kept whole) may cross a grid line: one more group of rows
         sj_kvarn_cap           = GGML_PAD(std::max(sj_kvarn.tail, sj_kvarn.tail_max) + sj_kvarn.group + 2*sj_kvarn.n_ubatch +
-                                          (sj_kvarn_grid ? sj_kvarn.group : 0), 128); // see apply_ubatch
+                                          (sj_kvarn_split_grid ? sj_kvarn.group : 0), 128); // see apply_ubatch
         // Records the pool can ever hold: every seal target is sink + group*floor((end - tail - sink)/group) with
         // end <= kv_size (apply_ubatch: end = pos0 < kv_size; compress_sj_kvarn_idle: end = accepted_end <= kv_size),
         // so the newest `tail` positions never reach the body. Sizing for kv_size - sink kept `tail` positions'
@@ -1199,8 +1204,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                         __func__, p0, p1, p1, n_present);
                 return false;
             } else if (st.B > sj_kvarn.sink && (uint32_t) p0 < n_present &&
-                       ((uint32_t) p0 < st.B || (sj_kvarn_grid && sj_kvarn_replay_B((uint32_t) p0) < st.B))) {
-                // [#197] grid schedule: a cut at or above B also reopens the groups a prefill of [0, p0) would not
+                       ((uint32_t) p0 < st.B || (sj_kvarn_split_grid && sj_kvarn_replay_B((uint32_t) p0) < st.B))) {
+                // [#197] full grid schedule (restore grid: llama_sj_kvarn_prefill_cut()): a cut at or above B also reopens the groups a prefill of [0, p0) would not
                 // have sealed yet (B ran ahead on the removed positions), so the re-prefill matches a cold one
                 // a suffix below B goes through sj_kvarn_truncate_body(): groups whose staging rows are still in the
                 // ring are reopened, below them only a cut on a group boundary works (whole records are dropped)
@@ -1579,7 +1584,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
     do {
         balloc.split_reset();
-        balloc.set_split_pos_grid(sj_kvarn_grid); // [#197]
+        balloc.set_split_pos_grid(sj_kvarn_split_grid); // [#197] full grid mode only
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
@@ -2133,8 +2138,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             // seals at least one group (group positions) while adding fewer than group, so the backlog shrinks
             // every step and N - B_prev stays within tail_max + n_tokens, inside the ring. Prefill-sized
             // ubatches take the whole remaining flush at once.
-            // [#197] grid schedule: the cell start G stands in for pos0 (the splitter keeps a ubatch inside one cell)
-            const uint32_t G = sj_kvarn_grid ? pos0 - pos0 % sj_kvarn_grid : pos0;
+            // [#197] full grid mode: the cell start G stands in for pos0 (the splitter keeps a ubatch inside one cell)
+            const uint32_t G = sj_kvarn_split_grid ? pos0 - pos0 % sj_kvarn_split_grid : pos0;
             const bool due = sj_kvarn.tail_max == 0 || st.draining || (G > st.B && G - st.B >= sj_kvarn.tail_max);
             st.draining = false;
             if (due && G > sj_kvarn.sink + sj_kvarn.tail) {
@@ -3144,14 +3149,62 @@ uint32_t llama_kv_cache::sj_kvarn_next_B(uint32_t B, uint32_t G) const {
 }
 
 uint32_t llama_kv_cache::sj_kvarn_replay_B(uint32_t end) const {
-    // a prefill of [0, end) visits every grid cell below `end` (the splitter cuts at each grid line), and repeated
-    // ubatches inside one cell leave B unchanged, so B depends on `end` alone
+    // a prefill of [0, end) visits every grid cell below `end` (full mode: the splitter cuts at each grid line, and
+    // repeated ubatches inside one cell leave B unchanged; restore grid: the server's prefill ubatches start on the
+    // grid lines), so B depends on `end` alone
     GGML_ASSERT(sj_kvarn_grid > 0);
     uint32_t B = sj_kvarn.sink;
     for (uint32_t G = 0; G < end; G += sj_kvarn_grid) {
         B = sj_kvarn_next_B(B, G);
     }
     return B;
+}
+
+bool llama_kv_cache::sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0) {
+    // [PCR1] the caller is about to re-prefill seq_id from p0 (a prompt restored from the RAM/disk prompt cache or a
+    // checkpoint): put the cache into the state a cold prefill of [0, p0) has at p0, so the re-prefill computes the
+    // same values. Seals that ran ahead of that point (later prompt ubatches, decode, idle seals) are reopened from
+    // the ring rows (they re-seal from the same rows into the same records), and an unfinished decode flush is
+    // dropped (a cold prefill has none in flight at a grid line).
+    if (!sj_kvarn.enabled() || sj_kvarn_grid == 0 || p0 <= 0 || p0 % (llama_pos) sj_kvarn_grid != 0 ||
+            seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & st = sj_kvarn_st[strm];
+    if ((uint32_t) p0 >= v_cells[strm].used_max_p1() || st.B_pending != st.B) {
+        return false;
+    }
+    bool changed = false;
+    if (!sj_kvarn_cut_in_reach(seq_id, p0)) {
+        // the staging rows of [replay_B(p0), reopen_lo) were overwritten (the cache ran more than the ring capacity
+        // past p0): the cut reopens what the ring still holds, the re-prefill is close to a cold one but not identical
+        LLAMA_LOG_WARN("%s: SJ-KVaRN cut at %d: the ring reaches back to %u, a cold prefill keeps rows from %u exact; "
+                "the re-prefill will not be bit-identical to a cold one\n", __func__, (int) p0,
+                sj_kvarn_reopen_lo(strm), sj_kvarn_replay_B((uint32_t) p0));
+    }
+    if (st.B > sj_kvarn.sink && sj_kvarn_replay_B((uint32_t) p0) < st.B) {
+        uint32_t B_new = 0;
+        if (sj_kvarn_truncate_target(strm, (uint32_t) p0, B_new) && B_new < st.B) {
+            const bool ok = sj_kvarn_truncate_body(strm, (uint32_t) p0);
+            GGML_ASSERT(ok);
+            changed = true;
+        }
+    }
+    if (st.draining) {
+        st.draining = false;
+        changed = true;
+    }
+    return changed;
+}
+
+bool llama_kv_cache::sj_kvarn_cut_in_reach(llama_seq_id seq_id, llama_pos p0) const {
+    if (!sj_kvarn.enabled() || sj_kvarn_grid == 0 || p0 <= 0 || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return true;
+    }
+    const uint32_t strm = seq_to_stream[seq_id];
+    const uint32_t want = sj_kvarn_replay_B((uint32_t) p0);
+    return sj_kvarn_st[strm].B <= want || sj_kvarn_reopen_lo(strm) <= want;
 }
 
 uint32_t llama_kv_cache::sj_kvarn_seq_stream(llama_seq_id seq_id) const {

@@ -5039,6 +5039,15 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
+                    // [PCR1] SJ-KVaRN: a prefill resumed at a grid point (restored prompt / checkpoint) starts from the
+                    // sealed state a cold prefill has there, so the restored turn computes like a cold one
+                    if (llama_sj_kvarn_prefill_cut(ctx_tgt, slot.id, p0)) {
+                        SLT_INF(slot, "SJ-KVaRN: prefill from %d resumes at the cold sealed end\n", p0);
+                    }
+                    if (ctx_dft) {
+                        llama_sj_kvarn_prefill_cut(ctx_dft, slot.id, p0);
+                    }
+
                     slot.mem.seq_rm(slot.id, p0, -1);
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt

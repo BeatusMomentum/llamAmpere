@@ -2203,6 +2203,12 @@ llama_pos llama_sj_kvarn_group_floor(llama_context * ctx, llama_pos pos) {
     return (llama_pos) (c.sink + c.group*(((uint32_t) pos - c.sink)/c.group));
 }
 
+bool llama_sj_kvarn_prefill_cut(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
+    if (!kv || !kv->is_sj_kvarn() || pos <= 0) { return false; }
+    return kv->sj_kvarn_prefill_cut(seq_id, pos);
+}
+
 llama_pos llama_sj_kvarn_ckpt_floor(llama_context * ctx, llama_pos pos) {
     auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
     if (!kv || !kv->is_sj_kvarn() || pos < 0) { return pos; }

@@ -6,8 +6,10 @@
 //   split c:   [0, c) then [c, N) (each in n_ubatch chunks)
 //   trunc c:   [0, c + 300) with other tokens past c, seq_rm(c, -1), then [c, N)  (the checkpoint-restore path)
 // and compares the last logits (bit-exact) for plain caches (controls) and the SJ-KVaRN pairs, with a tail
-// long enough that nothing seals, a fixed tail and the adaptive tail. The SJ-KVaRN rows must be bit-identical (the seal
-// schedule follows the n_ubatch grid cell of each ubatch, LLAMA_SJKVARN_SEAL_GRID=0 restores the split-dependent one).
+// long enough that nothing seals, a fixed tail and the adaptive tail. The SJ-KVaRN rows must be bit-identical.
+// Default (restore grid, LLAMA_SJKVARN_SEAL_GRID unset/2): cuts on the n_ubatch grid only (where the server puts
+// SJ-KVaRN checkpoints), and the trunc/state paths call llama_sj_kvarn_prefill_cut() before the cut like the server.
+// LLAMA_SJKVARN_SEAL_GRID=1 (full grid schedule): any cut; =0 restores the v0.5.2 split-dependent behaviour.
 //
 //   test-sjkvarn-split          CPU (SJ_TEST_GPU=1: all layers offloaded)
 
@@ -35,6 +37,7 @@
 
 static const uint32_t n_vocab = 128, n_embd = 512, n_layer = 4;
 static uint32_t g_ub = 512; // n_batch = n_ubatch of every context
+static int g_out_of_reach = 0; // [PCR1] restored cuts past the ring reach (inexact by design, info)
 
 static std::string g_last_error;
 
@@ -180,9 +183,10 @@ static int run_cfg(llama_model * model, const sj_cfg & c, llama_pos N, const std
     const uint32_t B_cold = c.plain ? 0 : cache_of(ctx)->get_sj_kvarn_sealed_end();
     printf("%-22s cold N=%d B=%u\n", c.name, (int) N, B_cold);
     for (llama_pos cut : cuts) {
-        for (int mode = 0; mode < 3; ++mode) {
+        for (int mode = 0; mode < 4; ++mode) {
             llama_memory_clear(llama_get_memory(ctx), true);
             std::vector<float> got;
+            bool in_reach = true;
             if (mode == 0) {
                 prefill(ctx, 0, cut);
                 got = decode(ctx, cut, N, (int) g_ub);
@@ -195,20 +199,42 @@ static int run_cfg(llama_model * model, const sj_cfg & c, llama_pos N, const std
                 require(llama_state_seq_get_data(ctx, buf.data(), buf.size(), 0) == buf.size(), "state save");
                 llama_memory_clear(llama_get_memory(ctx), true);
                 require(llama_state_seq_set_data(ctx, buf.data(), buf.size(), 0) == buf.size(), "state load");
+                in_reach = c.plain || cache_of(ctx)->sj_kvarn_cut_in_reach(0, cut);
+                llama_sj_kvarn_prefill_cut(ctx, 0, cut); // [PCR1] what the server does before the cut
                 const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), 0, cut, -1);
                 if (!ok) { printf("%-22s   state %d: seq_rm refused\n", c.name, (int) cut); continue; }
+                got = decode(ctx, cut, N, (int) g_ub);
+            } else if (mode == 3) {
+                // [PCR1] a prompt that shares [0, cut), then 400 generated tokens one decode step at a time (the decode
+                // seal schedule moves B past the cut), saved, loaded, cut and re-prefilled (a revisit of an edited
+                // prompt after a turn, from the RAM/disk prompt cache)
+                const llama_pos e = std::min<llama_pos>(cut + 200, 3600);
+                prefill(ctx, 0, cut);
+                prefill(ctx, cut, e, 7);
+                decode(ctx, e, e + 400, 1, 9);
+                std::vector<uint8_t> buf(llama_state_seq_get_size(ctx, 0));
+                require(llama_state_seq_get_data(ctx, buf.data(), buf.size(), 0) == buf.size(), "state save");
+                llama_memory_clear(llama_get_memory(ctx), true);
+                require(llama_state_seq_set_data(ctx, buf.data(), buf.size(), 0) == buf.size(), "state load");
+                in_reach = c.plain || cache_of(ctx)->sj_kvarn_cut_in_reach(0, cut);
+                llama_sj_kvarn_prefill_cut(ctx, 0, cut);
+                const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), 0, cut, -1);
+                if (!ok) { printf("%-22s   gen %d: seq_rm refused\n", c.name, (int) cut); continue; }
                 got = decode(ctx, cut, N, (int) g_ub);
             } else {
                 prefill(ctx, 0, cut);
                 prefill(ctx, cut, std::min<llama_pos>(cut + 300, 4000), 7); // other tokens past the cut
+                llama_sj_kvarn_prefill_cut(ctx, 0, cut); // [PCR1]
                 const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), 0, cut, -1);
                 if (!ok) { printf("%-22s   trunc %d: seq_rm refused\n", c.name, (int) cut); continue; }
                 got = decode(ctx, cut, N, (int) g_ub);
             }
             const uint32_t B = c.plain ? 0 : cache_of(ctx)->get_sj_kvarn_sealed_end();
             const bool same = got.size() == cold.size() && memcmp(got.data(), cold.data(), got.size()*sizeof(float)) == 0;
-            n_diff += !same;
-            printf("%-22s   %s %4d: %s max|d| = %.3g  B=%u\n", c.name, mode == 2 ? "state" : mode ? "trunc" : "split", (int) cut, same ? "identical" : "DIFFERS  ", max_diff(got, cold), B);
+            n_diff += !same && in_reach;
+            g_out_of_reach += !in_reach;
+            printf("%-22s   %s %4d: %s max|d| = %.3g  B=%u%s\n", c.name, mode == 3 ? "gen  " : mode == 2 ? "state" : mode ? "trunc" : "split", (int) cut, same ? "identical" : "DIFFERS  ", max_diff(got, cold), B,
+                   in_reach ? "" : "  (saved state ran past the ring reach: inexact by design, info)");
         }
     }
     llama_free(ctx);
@@ -229,7 +255,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const llama_pos N = getenv("SJ_TEST_N") ? atoi(getenv("SJ_TEST_N")) : 2347;
+    const char * grid_env = getenv("LLAMA_SJKVARN_SEAL_GRID");
+    const bool full_grid = grid_env && atoi(grid_env) == 1;
     std::vector<llama_pos> cuts = { 1920, 1280, 1000, 2304 };
+    if (!full_grid) { // restore grid: the server cuts SJ-KVaRN prompts on the n_ubatch grid only
+        cuts.clear();
+        for (llama_pos c = (llama_pos) g_ub; c < N; c += (llama_pos) g_ub) { cuts.push_back(c); }
+    }
     if (getenv("SJ_TEST_CUTS")) { // comma list, e.g. grid points only (the server puts SJ-KVaRN checkpoints on the grid)
         cuts.clear();
         for (const char * q = getenv("SJ_TEST_CUTS"); *q; ) { cuts.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
@@ -259,7 +291,7 @@ int main(int argc, char ** argv) {
     }
     // the plain caches are controls only: their split (in)dependence is the backend's attention kernel (e.g. the CPU
     // f16 flash-attention path is not split-independent), outside SJ-KVaRN
-    printf("%s: SJ-KVaRN %d differing; plain controls %d differing (info) (n_ubatch %u)\n", n_bad_sj ? "FAIL" : "OK", n_bad_sj, n_bad_plain, g_ub);
+    printf("%s: SJ-KVaRN %d differing; plain controls %d differing (info); %d restored cuts past the ring reach (info) (n_ubatch %u)\n", n_bad_sj ? "FAIL" : "OK", n_bad_sj, n_bad_plain, g_out_of_reach, g_ub);
     llama_model_free(model);
     llama_backend_free();
     return n_bad_sj ? 1 : 0;
