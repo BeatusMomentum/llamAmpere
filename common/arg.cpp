@@ -592,6 +592,15 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         task.opts       = opts;
         tasks.push_back(task);
     }
+    // an SJ-KVaRN transform given as a URL (e.g. a Hugging Face resolve link) is downloaded to the cache like --mmproj-url
+    if (params.sj_kvarn_transform.rfind("https://", 0) == 0 || params.sj_kvarn_transform.rfind("http://", 0) == 0) {
+        common_download_task task;
+        task.url        = params.sj_kvarn_transform;
+        task.local_path = get_default_local_path(task.url);
+        task.opts       = opts;
+        params.sj_kvarn_transform = task.local_path;
+        tasks.push_back(task);
+    }
     bool had_spec_url = false;
     if (!params.speculative.draft.mparams.url.empty()) {
         common_download_task task;
@@ -2794,9 +2803,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SJKVARN_FLUSH_CHUNK"));
     add_opt(common_arg(
-        {"--sjkvarn-transform"}, "FILE",
-        "EXPERIMENTAL (arXiv 2609.38121 WUSH-KV): per-layer, per-KV-head K/V transform file (SJWU format) applied in place "
-        "of the SJ-KVaRN Hadamard on the listed layers; disables the fused write rotation; saved states record its hash",
+        {"--sjkvarn-transform"}, "FILE|URL",
+        "SJ-KVaRN cache: per-layer, per-KV-head K/V transform file (SJWU format, calibrated for one model) applied in place "
+        "of the Hadamard on the layers it lists; an http(s) URL is downloaded to the cache; disables the fused write "
+        "rotation on those layers; saved states record its hash (default: none)",
         [](common_params & params, const std::string & value) {
             params.sj_kvarn_transform = value;
         }
