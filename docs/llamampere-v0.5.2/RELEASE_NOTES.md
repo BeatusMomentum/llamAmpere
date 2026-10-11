@@ -18,9 +18,10 @@ trajectory, 95% CI; below 1 = closer to q8_0):
 |---|---|---|---|---|
 | ATX-4-XS (`jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF`) | `Qwen3.8-27B-ATX-4-XS.sjwu` | **0.87** [0.81, 0.92] | 0.96 [0.86, 1.09] | 0.94 [0.87, 1.03] |
 | Swift 1.5 IQ4_XS-M (`jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF`) | `ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.sjwu` | 1.01 [0.91, 1.11] | 0.93 [0.83, 1.04] | 1.07 [0.96, 1.21] |
-SA2_ROW
-Only ATX-4-XS at 3/2t shows a clear gain (13% lower KL). Everywhere else the difference is within noise, so the
-transform stays off by default. On ATX-4-XS it costs about 2.5% decode speed at 100K depth.
+| Swift 1.5 2.3bpw-MTP, 12 GB (`jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP-GGUF`) | `ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP.sjwu` | 0.90 [0.82, 1.00] | 0.89 [0.79, 1.01] | **0.82** [0.73, 0.93] |
+
+Two cells show a clear gain: ATX-4-XS at 3/2t (13% lower KL) and the 12 GB Swift model at 4/4 (18% lower). Everywhere
+else the difference is within noise, so the transform stays off by default. On ATX-4-XS it costs about 2.5% decode speed at 100K depth.
 
 Example (ATX-4-XS, SJ-KVaRN 3/2t):
 
