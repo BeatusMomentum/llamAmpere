@@ -1781,6 +1781,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             try {
                 staging.prompt.tokens      = prompt.tokens.clone();
                 staging.prompt.checkpoints = prompt.checkpoints;
+                staging.prompt.lora_scales = prompt.lora_scales;
                 staging.data.main.resize(state_size_tgt);
                 staging.data.drft.resize(state_size_dft);
                 staging.data.spec.resize(state_size_spec);
@@ -1869,6 +1870,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ ckpt_thin ? std::move(checkpoints_ram) : hand_over ? std::move(*hand_over) : prompt.checkpoints,
+            /*.lora_scales =*/ prompt.lora_scales,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -2042,6 +2044,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         // keep the server's projector flag, so media chunks can still follow the restored text prefix
         state.prompt.tokens      = server_tokens(rec.tokens, tokens_new.has_mtmd);
         state.prompt.checkpoints = std::move(rec.checkpoints);
+        state.prompt.lora_scales = std::move(rec.lora_scales);
         state.data.main          = std::move(rec.main);
         state.data.drft          = std::move(rec.drft);
         state.data.spec          = std::move(rec.spec);
@@ -2265,7 +2268,7 @@ bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
         return false;
     }
 
-    return disk.write(state.prompt.tokens.get_text_tokens(), state.data.main, state.data.drft, state.prompt.checkpoints, state.data.spec);
+    return disk.write(state.prompt.tokens.get_text_tokens(), state.data.main, state.data.drft, state.prompt.checkpoints, state.data.spec, state.prompt.lora_scales);
 }
 
 void server_prompt_cache::flush_to_disk() {

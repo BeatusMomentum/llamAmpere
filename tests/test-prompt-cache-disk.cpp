@@ -734,6 +734,41 @@ static void test_mtmd_text_only_spills(const std::string & root) {
     CHECK(record.spec == std::vector<uint8_t>(17, 7));
 }
 
+// a cache entry keeps the adapter scales its KV state was computed with: in RAM, through the staging area, and on disk
+static void test_lora_scales(const std::string & root) {
+    const std::string dir = root + "/lora";
+    server_prompt_cache pc(1024, 0);
+    pc.disk = make_tier(dir, "k", 0);
+
+    server_prompt p;
+    p.tokens      = server_tokens(make_entry(5, 300, 0).tokens, false);
+    p.lora_scales = {0.0f, 0.5f};
+
+    auto * e = pc.alloc(p, 1*MiB, 0);
+    CHECK(e != nullptr && e->prompt.lora_scales == p.lora_scales);
+    CHECK(e->prompt.clone().lora_scales == p.lora_scales);
+    pc.flush_to_disk();
+
+    server_prompt q;
+    q.tokens      = server_tokens(make_entry(6, 300, 0).tokens, false);
+    q.lora_scales = {1.0f};
+    pc.limit_size = 1*MiB;
+    auto * st = pc.alloc(q, 2*MiB, 0);
+    CHECK(st != nullptr && pc.staging_pending && st->prompt.lora_scales == q.lora_scales);
+    pc.update();
+
+    server_prompt_disk_tier t = make_tier(dir, "k", 0);
+    CHECK(t.n_match() == 2);
+    server_prompt_disk_record r;
+    CHECK(t.read(find_entry(t, p.tokens.get_text_tokens()), r) && r.lora_scales == p.lora_scales);
+    CHECK(t.read(find_entry(t, q.tokens.get_text_tokens()), r) && r.lora_scales == q.lora_scales);
+
+    // no adapters: an empty list round-trips
+    const entry_data n = make_entry(8, 50, 4096);
+    CHECK(write_entry(t, n));
+    CHECK(t.read(find_entry(t, n.tokens), r) && r.lora_scales.empty() && same(r, n));
+}
+
 int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
@@ -750,6 +785,7 @@ int main() {
     test_hand_over();
     test_ram_ckpt_keep();
     test_mtmd_text_only_spills(root);
+    test_lora_scales(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);

@@ -680,6 +680,11 @@ struct server_slot {
             return nullptr;
         }
 
+        prompt.lora_scales.clear();
+        for (const auto & la : lora) {
+            prompt.lora_scales.push_back(la.scale);
+        }
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -2723,6 +2728,18 @@ private:
                     ret->prompt_clear();
                 } else {
                     ret->prompt_reclaim_checkpoints(*prompt_cache, saved, task.tokens);
+
+                    // a restored prompt brings the adapter scales it was computed with, so the lora check in
+                    // launch_slot_with_task compares the request against the KV state and not the slot's last task
+                    // (an empty or mismatched list leaves slot.lora as is; launch_slot_with_task always fills it
+                    // with the full adapter list, so the comparison there still holds)
+                    const auto & scales = ret->prompt.lora_scales;
+                    if (!scales.empty() && scales.size() == params_base.lora_adapters.size()) {
+                        ret->lora = params_base.lora_adapters;
+                        for (size_t i = 0; i < scales.size(); ++i) {
+                            ret->lora[i].scale = scales[i];
+                        }
+                    }
                 }
 
                 prompt_cache->update();
