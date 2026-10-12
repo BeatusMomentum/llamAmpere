@@ -41,9 +41,9 @@ cmake --build build-sm86 -j8 --target llama-server
 `-DLLAMA_BUILD_BORINGSSL=ON` builds HTTPS support from source so `-hf` can download the model. Without it, a machine
 that has no OpenSSL development files gets a build whose `-hf` fails with "HTTPS is not supported".
 
-Other NVIDIA cards are not tuned for, but the same build works with a different `-DCMAKE_CUDA_ARCHITECTURES`
-value (the commands below then use your build folder name): `89` for RTX 40-series (Ada), `120` for RTX 50-series
-(Blackwell, needs CUDA toolkit 12.8 or newer).
+Other NVIDIA cards are not tuned for, but the tree builds for them with a different `-DCMAKE_CUDA_ARCHITECTURES`
+value (the commands below then use your build folder name): `89` for RTX 40-series (Ada; compile-checked only) and
+`120` for RTX 50-series (Blackwell, needs CUDA toolkit 12.8 or newer; built and op-tested on an RTX 5070).
 
 Fastest decode (tq5_0 K / turbo4 V):
 

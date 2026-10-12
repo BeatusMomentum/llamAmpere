@@ -18,6 +18,27 @@ A bug-fix release on top of v0.5.2. There are no new features and no new flags.
 - **No false "draft vocabulary shortlist not applied" warning at startup** (issue #23). The MTP drafter always used
   the shortlist; the warning came from a setup step and is gone. A real fallback still warns.
 - **Builds for RTX 50-series (Blackwell, sm_120).** v0.5.2 failed to compile for `-DCMAKE_CUDA_ARCHITECTURES=120`
-  (one GPU file, `mmvq.cu`). Fixed; the RTX 3090 build is unchanged (identical GPU machine code). 40- and 50-series
-  cards are not tuned for, see the build note in the README.
-- `--parallel 1` decode speed at 100K depth is unchanged from v0.5.2.
+  (one GPU file, `mmvq.cu`). Fixed and op-tested on an RTX 5070 (CUDA 13.2, 0 failures). The RTX 3090 build is
+  unchanged: the GPU machine code of that file is byte-identical. RTX 40-series (`89`) is compile-checked only. 40- and
+  50-series cards are not tuned for; see the build note in the README.
+
+What stays the same and what changes in output:
+- With tq5_0 K / turbo4 V (the fastest README command), answers are token-for-token identical to v0.5.2 (temperature 0,
+  5,000 tokens after a 60K-token prompt and 7,000 tokens after a 2K-token prompt).
+- With SJ-KVaRN, a fresh read of a long prompt is now cut into chunks at 1,024-token boundaries instead of 128-token ones
+  (the first fix above needs this). That changes the rounding slightly, so at temperature 0 the answer is not
+  token-for-token the same as v0.5.2's. It is no worse: over a 110K-token read, the KL divergence from a q8_0 reference
+  changed by -0.000028 at 4/4 (95% interval -0.000061 to +0.000002) and -0.000002 at 3/3 (-0.000059 to +0.000057),
+  both not significant. (That was measured on a broader version of this change that also moved when tokens get
+  compressed; the shipped version only moves the chunk boundaries.) With that one change switched off, v0.5.3 matches v0.5.2 token for token.
+- Decode speed at 100K depth is the same as v0.5.2 (see the table below).
+
+Decode speed, RTX 3090 Ti at 350 W, Swift 1.5 IQ4_XS-M, fastest README settings (tq5_0 K / turbo4 V, MTP), prompt
+about 100K tokens, 5,120 tokens generated per job at temperature 1.0, runs in the order v0.5.2, v0.5.3, v0.5.2:
+
+| job | v0.5.2 (1st) | v0.5.3 | v0.5.2 (2nd) |
+|---|---|---|---|
+| coding, 98,808-token prompt | 96.9 tok/s | 99.0 tok/s | 98.7 tok/s |
+| agentic, 100,043-token prompt | 89.8 tok/s | 90.7 tok/s | 91.2 tok/s |
+
+All three runs wrote the same tokens. Peak VRAM 18.4 GB.
