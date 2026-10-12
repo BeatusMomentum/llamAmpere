@@ -927,6 +927,11 @@ struct llm_graph_params {
     // owning model (EXL3 side tensors for build_lora_mm); may be null for graphs that carry no EXL3 weights
     const llama_model * model = nullptr;
 
+    // true for a graph built only to reserve compute buffers (llama_context::graph_reserve): its output rows are
+    // placeholders and may sit on sequences that have no backend sampler (none is attached yet at context creation)
+    // set after construction, so it stays last
+    bool is_reserve = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1163,6 +1168,7 @@ struct llm_graph_context {
     ggml_tensor       * draft_vocab_compact;     // see llm_graph_params
     const ggml_tensor * draft_vocab_compact_src; // see llm_graph_params
     std::atomic<uint32_t> * draft_vocab_warned; // see llm_graph_params
+    const bool is_reserve; // see llm_graph_params
     const std::vector<float> * mtp_chain_samp; // see llm_graph_params
 
     // [#81] logits of the compact draft head for `cur` [n_embd, n], [n_sel, n]: plain mul_mat on the activation the

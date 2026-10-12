@@ -1696,6 +1696,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     draft_vocab_compact    (params.draft_vocab_compact),
     draft_vocab_compact_src(params.draft_vocab_compact_src),
     draft_vocab_warned(params.draft_vocab_warned),
+    is_reserve       (params.is_reserve),
     mtp_chain_samp   (params.mtp_chain_samp),
     cb_func          (params.cb),
     res              (params.res),
@@ -4914,6 +4915,13 @@ static const char * draft_vocab_fallback_name(int reason) {
 }
 
 ggml_tensor * llm_graph_context::draft_vocab_fallback(int reason, const char * detail) const {
+    // a reserve graph places its output rows on placeholder sequences, and the draft's backend sampler is attached
+    // only after the context (and its first reserve) exists: a missing sampler there says nothing about decode,
+    // so it is neither counted as a fallback nor warned about. A real decode graph without a sampler still warns.
+    if (is_reserve && reason == DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER) {
+        ggml_ledger_addf("llama.draft_vocab", 1, "reserve_full_head reason=%s", draft_vocab_fallback_name(reason));
+        return nullptr;
+    }
     ggml_ledger_addf("llama.draft_vocab", 1, "full_head reason=%s", draft_vocab_fallback_name(reason));
     const uint32_t bit = 1u << reason;
     if (draft_vocab_warned == nullptr || (draft_vocab_warned->fetch_or(bit) & bit) == 0) {
