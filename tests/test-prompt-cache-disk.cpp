@@ -587,6 +587,32 @@ static void test_ram_ckpt_keep() {
     }
 }
 
+// [#35] with --mmproj loaded every prompt has has_mtmd set; a text-only prompt (no media chunks) must still reach
+// the disk tier, both from a RAM entry and through the over-limit staging area
+static void test_mtmd_text_only_spills(const std::string & root) {
+    const std::string dir = root + "/mtmd";
+    server_prompt_cache pc(1024, 0);
+    pc.disk = make_tier(dir, "k", 0);
+
+    server_prompt p;
+    p.tokens = server_tokens(make_entry(3, 300, 0).tokens, /* has_mtmd = */ true);
+    CHECK(p.tokens.has_mtmd && !p.tokens.has_media());
+
+    auto * e = pc.alloc(p, 1*MiB, 0);
+    CHECK(e != nullptr && e->prompt.tokens.has_mtmd);
+    pc.flush_to_disk();
+    CHECK(pc.disk.n_match() == 1);
+
+    // over the RAM limit: staged for the disk tier instead of skipped
+    server_prompt q;
+    q.tokens = server_tokens(make_entry(4, 300, 0).tokens, /* has_mtmd = */ true);
+    pc.limit_size = 1*MiB;
+    auto * st = pc.alloc(q, 2*MiB, 0);
+    CHECK(st != nullptr && pc.staging_pending);
+    pc.update();
+    CHECK(!pc.staging_pending && pc.disk.n_match() == 2);
+}
+
 int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
@@ -601,6 +627,7 @@ int main() {
     test_spare_pool();
     test_hand_over();
     test_ram_ckpt_keep();
+    test_mtmd_text_only_spills(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);
