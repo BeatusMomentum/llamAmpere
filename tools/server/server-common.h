@@ -236,6 +236,9 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // true when this prompt actually holds image/audio chunks; has_mtmd only says the server has a projector
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();

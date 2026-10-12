@@ -1786,7 +1786,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // skip over-limit entries to avoid disturbing the cache; with a disk tier they go straight to disk instead
     if (limit_size > 0 && state_size_new > limit_size) {
-        if (disk_enabled() && !prompt.tokens.has_mtmd) {
+        if (disk_enabled() && !prompt.tokens.has_media()) {
             SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, staging for the disk tier\n",
                     state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
 
@@ -1978,7 +1978,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     // the disk tier competes under the same rule; a RAM entry wins ties
-    if (disk_enabled() && !tokens_new.has_mtmd) {
+    // disk entries are text-only, so with a projector loaded they can still be a prefix of a prompt with media
+    if (disk_enabled()) {
         for (auto it = disk.entries.begin(); it != disk.entries.end(); ++it) {
             if (!it->match) {
                 continue; // another model or KV configuration
@@ -2041,7 +2042,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         server_prompt_cache_state state;
-        state.prompt.tokens      = server_tokens(rec.tokens, false);
+        // keep the server's projector flag, so media chunks can still follow the restored text prefix
+        state.prompt.tokens      = server_tokens(rec.tokens, tokens_new.has_mtmd);
         state.prompt.checkpoints = std::move(rec.checkpoints);
         state.data.main          = std::move(rec.main);
         state.data.drft          = std::move(rec.drft);
@@ -2225,8 +2227,16 @@ void server_prompt_cache::evict_front() {
 }
 
 bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
-    if (state.prompt.tokens.has_mtmd) {
-        SRV_WRN("%s", " - not spilling multimodal prompt to disk\n");
+    // with --mmproj every prompt has has_mtmd set; only prompts that really hold media chunks skip the disk tier
+    if (state.prompt.tokens.has_media()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            SRV_WRN("%s", " - prompts with image/audio chunks are not spilled to the disk tier (text-only prompts are); "
+                    "further skips are logged at debug level\n");
+        } else {
+            SRV_DBG("%s", " - not spilling prompt with media chunks to disk\n");
+        }
 
         return false;
     }
