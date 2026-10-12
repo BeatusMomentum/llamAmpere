@@ -42,3 +42,8 @@ about 100K tokens, 5,120 tokens generated per job at temperature 1.0, runs in th
 | agentic, 100,043-token prompt | 89.8 tok/s | 90.7 tok/s | 91.2 tok/s |
 
 All three runs wrote the same tokens. Peak VRAM 18.4 GB.
+
+Known issue (not new in this release):
+- With `--parallel 8`, the server can stop shortly after it starts with `failed to remove sequence N with p0=...` when
+  several requests start at the same moment. v0.5.1 and v0.5.2 do the same, and `--cache-ram 0` does not avoid it. In our
+  test sweep, servers with `--parallel 4` did not hit it. A fix is planned for the next release.
