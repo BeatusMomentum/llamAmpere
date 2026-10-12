@@ -1935,6 +1935,16 @@ static bool rs_ring_needs_older(const llama_memory_recurrent * mem, uint32_t cel
     return src0 >= 0 && (uint32_t) src0 != cell && src0 != mem->rs_z;
 }
 
+// PCRAM1: an extra cell (inside [head, head + n_rs) but holding a sequence that is not in this
+// ubatch, typically one find_slot swapped out of the way) is re-based to plane 0 by build_rs's
+// extra-state copy. Its K - 1 older groups must travel with it, plane for plane, or that
+// sequence loses its rollback history in the middle of a speculative round (the server then
+// aborts in seq_rm on the bystander's next partial rejection). Moved or not, the base changes.
+static bool rs_ring_extra_needs_older(const llama_memory_recurrent * mem, uint32_t cell) {
+    const int32_t src0 = mem->cells[cell].src0;
+    return mem->n_rs_seq > 0 && !mem->cells[cell].seq_id.empty() && src0 >= 0 && src0 != mem->rs_z;
+}
+
 uint32_t llama_memory_recurrent_context::get_n_older() const {
     if (!get_rs_ring()) {
         return 0;
@@ -1942,13 +1952,17 @@ uint32_t llama_memory_recurrent_context::get_n_older() const {
     const llama_ubatch & ubatch = get_ubatch();
     const uint32_t K = mem->n_rs_seq + 1;
     const uint32_t n = ubatch.n_seq_tokens;
-    if (n >= K) {
-        return 0;
-    }
     uint32_t rows = 0;
-    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
-        if (rs_ring_needs_older(mem, mem->head + s)) {
-            rows += K - n;
+    if (n < K) {
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            if (rs_ring_needs_older(mem, mem->head + s)) {
+                rows += K - n;
+            }
+        }
+    }
+    for (uint32_t s = ubatch.n_seqs; s < get_n_rs(); ++s) {
+        if (rs_ring_extra_needs_older(mem, mem->head + s)) {
+            rows += K - 1;
         }
     }
     return rows;
@@ -1966,6 +1980,11 @@ void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, 
     const bool     older     = n < K;
     GGML_ASSERT(n_written == 0 || (wr != nullptr && wr_conv != nullptr));
 
+    // PCRAM1: read every source base from the bases as they were before this ubatch. The loop
+    // re-bases each destination cell as it goes, and a later cell's source can be an earlier
+    // cell's destination (a bystander swapped out of a cell the ubatch now uses).
+    const std::vector<uint32_t> base_before = mem->rs_base;
+
     uint32_t k_old = 0;
     for (uint32_t i = 0; i < n_rs; ++i) {
         const uint32_t cell = mem->head + i;
@@ -1980,16 +1999,26 @@ void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, 
                 mem->rs_idx[seq] = 0; // consumed, like s_copy()
             }
         }
-        const uint32_t b = mem->rs_base[src0];
+        const uint32_t b = base_before[src0];
         copy[i] = (int32_t) (((b + r) % K) * size + src0);
 
         if (i >= n_seqs) {
-            // extra cell: build_rs copies its logical plane to plane 0 of its new home and its
-            // older groups do not travel -- say so, instead of letting a later rollback read them
+            // extra cell: build_rs copies its logical plane to plane 0 of its new home; the older
+            // groups follow at planes 1..K-1 (gathered before that copy, scattered after it), so
+            // the new base is 0 and rs_valid still holds. A cell with nothing to carry (empty, or a
+            // fresh seq sourced from rs_z) keeps the old honest answer: no history.
             mem->rs_base[cell] = 0;
-            for (const llama_seq_id seq : mem->cells[cell].seq_id) {
-                if (seq >= 0 && (size_t) seq < mem->rs_valid.size()) {
-                    mem->rs_valid[seq] = 0;
+            if (rs_ring_extra_needs_older(mem, cell)) {
+                for (uint32_t g = 1; g < K; ++g) {
+                    old_src[k_old] = (int32_t) (((b + r + g) % K) * size + src0);
+                    old_dst[k_old] = (int32_t) (g * size + cell);
+                    ++k_old;
+                }
+            } else {
+                for (const llama_seq_id seq : mem->cells[cell].seq_id) {
+                    if (seq >= 0 && (size_t) seq < mem->rs_valid.size()) {
+                        mem->rs_valid[seq] = 0;
+                    }
                 }
             }
             continue;
