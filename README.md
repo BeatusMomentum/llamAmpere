@@ -1,4 +1,4 @@
-> **llamAmpere v0.5.3**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
+> **llamAmpere v0.5.4**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
 
 ## What's new in v0.5
 
@@ -21,13 +21,15 @@
 - **New in v0.5.3:** bug fixes only. With SJ-KVaRN, a conversation resumed from the prompt cache (RAM or disk)
   now gives the same answer as reading it fresh; the disk cache works when `--mmproj` is loaded; the tree builds for
   RTX 50-series cards. [Release notes](docs/llamampere-v0.5.3/RELEASE_NOTES.md).
+- **New in v0.5.4:** a crash fix. With `--parallel 3` or more and the MTP drafter on, the server no longer stops
+  with `failed to remove sequence N`. No speed change. [Release notes](docs/llamampere-v0.5.4/RELEASE_NOTES.md).
 - **Coming next:** a Swift 1.5 EXL3 4.0 bpw model.
 - **Read more:** the [SJ-KVaRN paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper) and the standalone codec,
   [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT).
 
 Release notes, including what we tried and did not ship: [docs/llamampere-v0.5/RELEASE_NOTES.md](docs/llamampere-v0.5/RELEASE_NOTES.md). Recommended settings for every card size: [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
 
-**Build and run (v0.5.3, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
+**Build and run (v0.5.4, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
 CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
 
 ```bash
