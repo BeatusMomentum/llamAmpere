@@ -277,6 +277,14 @@ public:
     llama_pos sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos pos) const;
     uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_st[0].N; }
     uint32_t get_sj_kvarn_capacity() const { return sj_kvarn_cap; }
+    // [#197] position grid of the seal schedule (0 = off): the splitter must not let a ubatch cross a grid line
+    uint32_t get_sj_kvarn_pos_grid() const { return sj_kvarn_grid; }
+    // [#197] ubatch split grid (full grid mode only, 0 otherwise)
+    uint32_t get_sj_kvarn_split_grid() const { return sj_kvarn_split_grid; }
+    // [PCR1] before a re-prefill of seq_id from the grid point p0: reopen to the cold sealed end at p0 (see .cpp)
+    bool sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0);
+    // [PCR1] the ring still holds every staging row a cold prefill of [0, p0) keeps exact (the cut can be bit-identical)
+    bool sj_kvarn_cut_in_reach(llama_seq_id seq_id, llama_pos p0) const;
     uint32_t get_sj_kvarn_sink() const { return sj_kvarn.sink; }
     uint64_t get_sj_kvarn_maintenance_count() const { return sj_kvarn_maintenance_count; }
     uint64_t get_sj_kvarn_maintenance_groups() const { return sj_kvarn_maintenance_groups; }
@@ -391,6 +399,8 @@ private:
     // position (cell index == position) so the mask and the sequence bookkeeping are unchanged.
     llama_sj_kvarn_config sj_kvarn;
     uint32_t sj_kvarn_cap           = 0; // ring rows
+    uint32_t sj_kvarn_grid          = 0; // [#197] restore grid (n_ubatch): checkpoint floor, replay, state ring rows; 0 = off
+    uint32_t sj_kvarn_split_grid    = 0; // [#197] full grid mode: seal schedule on grid cells + ubatch split at grid lines
     uint32_t sj_kvarn_n_groups      = 0; // records per head in the pool
     uint32_t sj_kvarn_n_groups_seal = 0; // static per-ubatch seal launch size
     bool     sj_kvarn_fused_rot_on  = false; // #139, see sj_kvarn_fused_rot()
@@ -588,6 +598,10 @@ private:
 
     // SJ-KVaRN truncation into the sealed body (see the comment above sj_kvarn_truncate_body in llama-kv-cache.cpp)
     uint32_t sj_kvarn_floor_g(uint32_t pos) const;
+    // [#197] the sealed-end schedule: B after one more ubatch starting in the grid cell at G (or at pos0 without grid)
+    uint32_t sj_kvarn_next_B(uint32_t B, uint32_t G) const;
+    // [#197] the sealed end a split-free prefill of [0, end) leaves (grid schedule only)
+    uint32_t sj_kvarn_replay_B(uint32_t end) const;
     uint32_t sj_kvarn_seq_stream(llama_seq_id seq_id) const;
     uint32_t sj_kvarn_reopen_lo(uint32_t s) const;
     bool     sj_kvarn_truncate_target(uint32_t s, uint32_t p0, uint32_t & B_new) const;

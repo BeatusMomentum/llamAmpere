@@ -1678,11 +1678,14 @@ static constexpr bool ggml_cuda_mmvq_thin_type(ggml_type type) {
 template <ggml_type type, int ncols_dst, int nwarps>
 __launch_bounds__(nwarps*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_thin(
-        const void * GGML_CUDA_RESTRICT vx, const block_q8_1 * GGML_CUDA_RESTRICT vy, float * GGML_CUDA_RESTRICT dst,
+        const void * vx_ptr, const block_q8_1 * vy_ptr, float * dst_ptr,
         const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
         const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
         const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+    const void       * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const block_q8_1 * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    float            * GGML_CUDA_RESTRICT dst = dst_ptr;
     constexpr int qk        = ggml_cuda_type_traits<type>::qk;
     constexpr int qi        = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr       = get_vdr_mmvq(type);

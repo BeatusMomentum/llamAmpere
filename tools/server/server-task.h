@@ -539,6 +539,14 @@ struct server_task_result_metrics : server_task_result {
 
     server_metrics metrics;
 
+    // prompt-cache disk tier free-space guard (only rendered when the disk tier is on)
+    bool     disk_enabled          = false;
+    bool     disk_guard_active     = false;
+    uint64_t disk_guard_skips      = 0;
+    uint64_t disk_guard_skip_bytes = 0;
+    double   disk_free_bytes       = -1.0;
+    double   disk_floor_bytes      = -1.0;
+
     virtual json to_json() override;
 
     struct metric_item {

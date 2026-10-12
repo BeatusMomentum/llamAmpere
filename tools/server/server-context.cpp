@@ -2421,7 +2421,10 @@ private:
 
                 const size_t limit = params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*(size_t) params_base.cache_disk_mib;
 
-                if (params_base.cache_disk_min_free_mib >= 0) {
+                if (params_base.cache_disk_min_free_pct >= 0.0f) {
+                    prompt_cache->disk.guard_frac = params_base.cache_disk_min_free_pct / 100.0;
+                    prompt_cache->disk.guard_abs  = 0;
+                } else if (params_base.cache_disk_min_free_mib >= 0) {
                     prompt_cache->disk.guard_frac = 0.0;
                     prompt_cache->disk.guard_abs  = 1024ull*1024ull*(uint64_t) params_base.cache_disk_min_free_mib;
                 }
@@ -3641,6 +3644,19 @@ private:
         return ctx_dft != nullptr && (force || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART);
     }
 
+    // [#197] prompt-checkpoint boundary at or below n: on the seal grid (n_ubatch) as well as a group boundary, so cold
+    // and restored prefills break into the same ubatches (n when SJ-KVaRN is off)
+    llama_pos sj_kvarn_ckpt_floor(llama_pos n) const {
+        if (params_base.sj_kvarn_bits_k == 0 && !params_base.speculative.draft.sj_kvarn) {
+            return n;
+        }
+        llama_pos f = llama_sj_kvarn_ckpt_floor(ctx_tgt, n);
+        if (ctx_dft) {
+            f = std::min(f, llama_sj_kvarn_ckpt_floor(ctx_dft, f));
+        }
+        return f;
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         // Slot restore can synthesize a checkpoint without an active inference task.
         const int id_task = slot.task ? slot.task->id : -1;
@@ -3860,6 +3876,19 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+
+                    if (prompt_cache && prompt_cache->disk_enabled()) {
+                        const auto & disk = prompt_cache->disk;
+                        const auto   si   = disk.space_check();
+                        res->disk_enabled          = true;
+                        res->disk_guard_active     = disk.guard_active;
+                        res->disk_guard_skips      = disk.n_guard_skips;
+                        res->disk_guard_skip_bytes = disk.bytes_guard_skips;
+                        if (si.state != server_prompt_disk_tier::SPACE_UNKNOWN) {
+                            res->disk_free_bytes  = (double) si.available;
+                            res->disk_floor_bytes = (double) si.reserve;
+                        }
+                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -5010,6 +5039,15 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
+                    // [PCR1] SJ-KVaRN: a prefill resumed at a grid point (restored prompt / checkpoint) starts from the
+                    // sealed state a cold prefill has there, so the restored turn computes like a cold one
+                    if (llama_sj_kvarn_prefill_cut(ctx_tgt, slot.id, p0)) {
+                        SLT_INF(slot, "SJ-KVaRN: prefill from %d resumes at the cold sealed end\n", p0);
+                    }
+                    if (ctx_dft) {
+                        llama_sj_kvarn_prefill_cut(ctx_dft, slot.id, p0);
+                    }
+
                     slot.mem.seq_rm(slot.id, p0, -1);
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
@@ -5122,7 +5160,7 @@ private:
                     const bool sj_align = params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn;
                     const int64_t n_task = slot.task->n_tokens();
                     auto sj_ckpt_target = [&](int64_t n) {
-                        if (n <= 0 || n >= n_task || sj_kvarn_group_floor((llama_pos) n) != n) {
+                        if (n <= 0 || n >= n_task || sj_kvarn_ckpt_floor((llama_pos) n) != n) {
                             return false;
                         }
                         const int64_t spots[3] = {
@@ -5131,7 +5169,7 @@ private:
                             n_task - std::min<int64_t>(n_batch, 4 + n_ubatch),
                         };
                         for (int64_t q : spots) {
-                            if (q > 0 && sj_kvarn_group_floor((llama_pos) q) == n) {
+                            if (q > 0 && sj_kvarn_ckpt_floor((llama_pos) q) == n) {
                                 return true;
                             }
                         }
@@ -5265,7 +5303,7 @@ private:
                     if (sj_align) {
                         // boundary checkpoints: the targeted spots, plus one per min step along a long prompt
                         do_checkpoint = do_checkpoint && n_tokens_start > 0 &&
-                            sj_kvarn_group_floor((llama_pos) n_tokens_start) == n_tokens_start && (
+                            sj_kvarn_ckpt_floor((llama_pos) n_tokens_start) == n_tokens_start && (
                                 sj_ckpt_target(n_tokens_start) ||
                                 slot.prompt.checkpoints.empty() ||
                                 n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);

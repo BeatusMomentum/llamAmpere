@@ -339,6 +339,118 @@ static void test_guard(const std::string & root) {
     CHECK(write_entry(t, make_entry(9, 10, 1000)));
 }
 
+// the guard must be visible: a startup state that says writes are (about to be) skipped, a rate-limited
+// repeated warning while skipping, and counters for /metrics
+static void test_guard_visibility(const std::string & root) {
+    const std::string dir = root + "/guard-vis";
+
+    server_prompt_disk_tier t = make_tier(dir, "k", 16*GiB);
+
+    uint64_t cap = 1000*GiB, avail = 900*GiB;
+    bool     queryable = true;
+    t.space_fn = [&](const std::string &, uint64_t & c, uint64_t & a) { c = cap; a = avail; return queryable; };
+
+    int64_t now = 1000000;
+    t.clock_us_fn = [&]() { return now; };
+    t.guard_warn_interval_s = 60.0;
+
+    // startup states: floor = max(10% of 1000 GiB, 8 GiB) = 100 GiB, the tier wants its 16 GiB limit above it
+    auto st = t.space_check();
+    CHECK(st.state == server_prompt_disk_tier::SPACE_OK);
+    CHECK(st.reserve == 100*GiB && st.want == 16*GiB);
+    avail = 110*GiB;   // 10 GiB above the floor < 16 GiB wanted
+    CHECK(t.space_check().state == server_prompt_disk_tier::SPACE_NEAR);
+    avail = 100*GiB;   // exactly at the floor (the PDLA case: 91 GiB free with a 90.9 GiB floor is the same)
+    CHECK(t.space_check().state == server_prompt_disk_tier::SPACE_BELOW);
+    avail = 50*GiB;
+    CHECK(t.space_check().state == server_prompt_disk_tier::SPACE_BELOW);
+    queryable = false;
+    CHECK(t.space_check().state == server_prompt_disk_tier::SPACE_UNKNOWN);
+    queryable = true;
+
+    // no size limit: "near" means less than guard_abs (8 GiB) above the floor
+    {
+        server_prompt_disk_tier u = make_tier(dir + "-nolimit", "k", 0);
+        u.space_fn = t.space_fn;
+        avail = 105*GiB;
+        CHECK(u.space_check().state == server_prompt_disk_tier::SPACE_NEAR);
+        avail = 109*GiB;
+        CHECK(u.space_check().state == server_prompt_disk_tier::SPACE_OK);
+    }
+
+    // a percentage floor (--cache-disk-min-free 5%): guard_frac 0.05, guard_abs 0 -> floor 50 GiB
+    t.guard_frac = 0.05;
+    t.guard_abs  = 0;
+    avail = 60*GiB;
+    st = t.space_check();
+    CHECK(st.reserve == 50*GiB && st.state == server_prompt_disk_tier::SPACE_NEAR);
+    CHECK(write_entry(t, make_entry(1, 10, 1000)));
+    avail = 49*GiB;
+    CHECK(!write_entry(t, make_entry(2, 10, 1000)));
+    CHECK(t.guard_active);
+    t.guard_frac = 0.10;
+    t.guard_abs  = 8*GiB;
+    avail = 500*GiB;
+    CHECK(write_entry(t, make_entry(3, 10, 1000)));   // recovered: the next skip starts a new episode
+    CHECK(!t.guard_active);
+
+    // skipping: one warning at the start, then at most one per interval, every skip counted with its bytes
+    const size_t n_skip0 = t.n_guard_skips;
+    const size_t n_warn0 = t.n_guard_warnings;
+    avail = 90*GiB;
+    for (int i = 0; i < 10; ++i) {
+        CHECK(!write_entry(t, make_entry(10 + i, 10, 1000)));
+        now += 5*1000000ll; // 5 s apart: 50 s in total, inside one interval
+    }
+    CHECK(t.n_guard_skips == n_skip0 + 10);
+    CHECK(t.n_guard_warnings == n_warn0 + 1);
+    CHECK(t.guard_active);
+    CHECK(t.bytes_guard_skips > 10 * 1000);
+    CHECK(count_files(dir, ".bin") == 2);
+
+    now += 20*1000000ll; // 70 s after the first warning
+    CHECK(!write_entry(t, make_entry(30, 10, 1000)));
+    CHECK(t.n_guard_warnings == n_warn0 + 2);
+    CHECK(!write_entry(t, make_entry(31, 10, 1000)));
+    CHECK(t.n_guard_warnings == n_warn0 + 2);
+
+    // interval 0 = warn on every skip
+    t.guard_warn_interval_s = 0.0;
+    CHECK(!write_entry(t, make_entry(32, 10, 1000)));
+    CHECK(!write_entry(t, make_entry(33, 10, 1000)));
+    CHECK(t.n_guard_warnings == n_warn0 + 4);
+    t.guard_warn_interval_s = 60.0;
+
+    // recovery clears the active flag but keeps the totals; a new episode warns again at once
+    const size_t   n_skip1 = t.n_guard_skips;
+    const uint64_t b_skip1 = t.bytes_guard_skips;
+    avail = 500*GiB;
+    CHECK(write_entry(t, make_entry(40, 10, 1000)));
+    CHECK(!t.guard_active);
+    CHECK(t.n_guard_skips == n_skip1 && t.bytes_guard_skips == b_skip1);
+    avail = 90*GiB;
+    now += 1000000ll;
+    CHECK(!write_entry(t, make_entry(41, 10, 1000)));
+    CHECK(t.n_guard_warnings == n_warn0 + 5);
+
+    // the RAM tier's shutdown flush goes through the same guard and counts its skips
+    {
+        server_prompt_cache pc(1024, 0);
+        std::string err;
+        pc.disk.space_fn    = t.space_fn;
+        pc.disk.clock_us_fn = t.clock_us_fn;
+        CHECK(pc.disk_open(dir + "-flush", "k", 0, err)); // logs the BELOW state
+        server_prompt p;
+        p.tokens = server_tokens(llama_tokens{1, 2, 3, 4}, false);
+        auto * en = pc.alloc(p, 1*MiB, 0);
+        CHECK(en != nullptr && en->data.main.size() == 1*MiB);
+        pc.flush_to_disk();
+        CHECK(pc.disk.n_guard_skips == 1);
+        CHECK(pc.disk.n_guard_warnings == 1);
+        CHECK(count_files(dir + "-flush", ".bin") == 0);
+    }
+}
+
 static void test_corrupt_cleanup(const std::string & root) {
     const std::string dir = root + "/corrupt";
 
@@ -622,6 +734,7 @@ int main() {
     test_roundtrip_and_key(root);
     test_fifo(root);
     test_guard(root);
+    test_guard_visibility(root);
     test_corrupt_cleanup(root);
     test_supersede_dedupe(root);
     test_spare_pool();

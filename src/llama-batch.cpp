@@ -595,6 +595,10 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
         if (idxs.size() >= n_ubatch) {
             break;
         }
+
+        if (split_on_grid(cur_idx)) {
+            break;
+        }
     }
 
     return ubatch_add(idxs, idxs.size(), false);
@@ -707,6 +711,17 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
         if  ((idxs_per_seq[0].size() + 1)*n_seqs > n_ubatch) {
             break;
+        }
+
+        if (split_pos_grid > 0) {
+            bool on_grid = false;
+            for (uint32_t s = 0; s < n_seqs && !on_grid; ++s) {
+                const auto & m = seq_set_map[cur_seq_set[s]];
+                on_grid = cur_idx[s] < (int32_t) m.size() && split_on_grid(m[cur_idx[s]]);
+            }
+            if (on_grid) {
+                break;
+            }
         }
     }
 
@@ -830,6 +845,8 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
 void llama_batch_allocr::clear() {
     n_outputs = 0;
+
+    split_pos_grid = 0;
 
     batch = {};
 
