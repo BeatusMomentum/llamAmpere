@@ -1855,6 +1855,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // A sequence that starts again at position 0 has no previous target row. Clear the
+        // carry the last request on this slot left behind, so a reused server drafts the
+        // same way as a fresh one (a fresh server starts with zeros).
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] >= 0 && batch_in.pos[i_batch_beg[seq_id]] == 0) {
+                std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+            }
+        }
+
         // The draft memory can retain speculative rows after a rewind (context
         // shift, rollback, or a new prompt). Trim them before the next decode.
         if (!is_mem_shared) {
