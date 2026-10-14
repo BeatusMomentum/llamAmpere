@@ -4095,9 +4095,10 @@ const slot_info_vec_t *   sinfos_in) {
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
     // [EVALFLAG] a single sequence goes to its own stream whatever stream it was saved from, so its state also loads
-    // into a cache with another stream count (another --parallel / --kv-unified); whole-context and mirrored restores
-    // still need the same layout
-    const bool single_seq = seq_id != -1 && sinfos_out == nullptr && sinfos_in == nullptr;
+    // into a cache with another stream count (another --parallel / --kv-unified); a whole-context restore still needs
+    // the same layout. A mirrored pair (indexer cache) keys its slot infos by the stream the sequence lands in, so
+    // both caches of the pair agree for any saved stream count
+    const bool single_seq = seq_id != -1;
     if (n_stream_cur != n_stream && !single_seq) {
         throw std::runtime_error("n_stream mismatch");
     }
@@ -4116,15 +4117,15 @@ const slot_info_vec_t *   sinfos_in) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
+        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
+
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
-            if (sinfos_in && !(*sinfos_in)[s].empty()) {
+            if (sinfos_in && !(*sinfos_in)[strm].empty()) {
                 throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
             }
             continue;
         }
-
-        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
         slot_info sinfo;
 
@@ -4140,7 +4141,7 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr,
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[strm] : nullptr,
                 layout.empty() ? nullptr : &layout, layout_head);
 
         try {
@@ -4155,7 +4156,7 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (sinfos_out) {
-            (*sinfos_out)[s] = sinfo;
+            (*sinfos_out)[strm] = sinfo;
         }
     }
 }
