@@ -10043,7 +10043,12 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         auto make_ring = [&](const char * name) {
             if (!f16_sink && ns == 0) { return ggml_new_tensor_4d(ctx, staging_type, D, S + cap, hkv, 1); }
             const size_t row_bytes = ggml_row_size(staging_type, D*hkv);
-            const int64_t rows = S + cap + (f16_sink ? (S*D*hkv*2 + row_bytes - 1)/row_bytes : 0);
+            int64_t rows = S + cap + (f16_sink ? (S*D*hkv*2 + row_bytes - 1)/row_bytes : 0);
+            // several streams: pad the rows per stream to a 256-byte stream stride, as llama_kv_cache does (the MMA
+            // tile loads are 16-byte; 2 KV heads of tq6_0 rows with an odd row count land 8 mod 16)
+            while (ns > 0 && (rows*row_bytes) % 256 != 0) {
+                rows++;
+            }
             auto * storage = ggml_new_tensor_2d(ctx, staging_type, D*hkv, rows*n_streams());
             ggml_set_name(storage, name);
             return ggml_view_4d(ctx, storage, D, rows, hkv, n_streams(), row_bytes,
