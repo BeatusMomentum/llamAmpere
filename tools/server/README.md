@@ -360,7 +360,7 @@ When `--spec-type` is not given, the server looks up the model family in a small
 - The server logs one line when the default applies, e.g. `speculative: MTP drafter on by default for qwen35 (nextn=1): draft-mtp-adaptive, n-max 4, n-min-adaptive 3, p-min 0, vocab map auto; --spec-type none disables`.
 - `--spec-default` is not this default. It is the upstream n-gram preset (`--spec-type ngram-mod` with `--spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64`) and, like any explicit `--spec-type`, it replaces the MTP drafter default rather than adding to it.
 - To run without speculative decoding, pass `--spec-type none` (or set `LLAMA_ARG_SPEC_TYPE=none`). `--spec-draft-n-max 0` also keeps the default from applying.
-- The same default applies to `llama-cli`, which runs the server in-process. Other tools (`llama-perplexity`, `llama-bench`, `llama-kld-depth`, ...) are unaffected.
+- The same default applies to `llama-cli`, which runs the server in-process. Other tools (`llama-perplexity`, `llama-bench`, ...) are unaffected.
 
 ### Multimodal support
 
