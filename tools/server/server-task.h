@@ -639,12 +639,15 @@ struct server_prompt {
     }
 };
 
+struct common_speculative;
+
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + spec.size();
     }
 };
 
@@ -720,12 +723,12 @@ struct server_prompt_cache {
     // [#187] hand_over: the entry takes these checkpoints by move instead of copying them (the caller is about to
     // replace or cut its prompt); see server_slot::prompt_reclaim_checkpoints for the way back
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft,
-            std::list<common_prompt_checkpoint> * hand_over = nullptr);
+            std::list<common_prompt_checkpoint> * hand_over = nullptr, size_t state_size_spec = 0);
 
     // [#187] true while `state` is a RAM entry of this cache (not loaded, evicted or staged)
     bool holds(const server_prompt_cache_state * state) const;
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec = nullptr);
 
     void update();
 
@@ -735,7 +738,7 @@ struct server_prompt_cache {
 
 private:
     // move a RAM entry's state into the slot's contexts; clears the entry's data on success
-    bool restore(server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool restore(server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec = nullptr);
 
     // drop the oldest RAM entry, spilling it to disk first when the disk tier is enabled
     void evict_front();

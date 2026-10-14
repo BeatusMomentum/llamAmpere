@@ -70,6 +70,8 @@ eval cache: refusing to start: ./evc-mybench was built for another model or KV c
 (this server has 'ctk=q8_0', the folder was built with 'ctk=tq5_0'); ...
 ```
 
+Folders written with cache format 1 must be rebuilt. Format 2 also saves the MTP carry row, deferred catch-up rows and adaptive-depth state. The adaptive depth range and chain settings must match when building and loading a folder.
+
 Not part of the key, so free to change: `--ctx-size`, `--parallel`, `--kv-unified`, the number of GPU layers, threads, sampling.
 
 Keep `-b` / `-ub` (batch sizes) the same as at build time if you want byte-identical output: the cache is correct

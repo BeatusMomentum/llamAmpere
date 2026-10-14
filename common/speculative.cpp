@@ -1725,21 +1725,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        common_batch_clear(batch);
-        for (size_t k = 0; k < defer.tok.size(); ++k) {
-            common_batch_add(batch, defer.tok[k], defer.pos[k], { defer.seq[k] }, false);
-            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, defer.embd.data() + k * (size_t) n_embd, row_bytes);
+        // fork: Restoring several sequences can exceed one decode batch's deferred-row capacity.
+        const size_t capacity = std::min(batch_capacity, ubatch_capacity);
+        for (size_t k0 = 0; k0 < defer.tok.size(); k0 += capacity) {
+            common_batch_clear(batch);
+            const size_t end = std::min(k0 + capacity, defer.tok.size());
+            for (size_t k = k0; k < end; ++k) {
+                common_batch_add(batch, defer.tok[k], defer.pos[k], { defer.seq[k] }, false);
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, defer.embd.data() + k * (size_t) n_embd, row_bytes);
+            }
+            const int32_t rc = llama_decode(ctx_dft, batch);
+            if (rc != 0) {
+                SPC_ERR("llama_decode(ctx_dft) deferred flush failed rc=%d\n", (int) rc);
+                return false;
+            }
         }
         defer.tok.clear();
         defer.pos.clear();
         defer.seq.clear();
         defer.embd.clear();
-
-        const int32_t rc = llama_decode(ctx_dft, batch);
-        if (rc != 0) {
-            SPC_ERR("llama_decode(ctx_dft) deferred flush failed rc=%d\n", (int) rc);
-            return false;
-        }
         return true;
     }
 
@@ -1769,6 +1773,112 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         defer.embd.resize(w * (size_t) n_embd);
 
         return dropped;
+    }
+
+    // fork: Prompt snapshots need the host-side MTP carry as well as the drafter KV.
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        uint32_t n_defer = 0;
+        for (const auto s : defer.seq) {
+            n_defer += s == seq_id;
+        }
+        const common_speculative_adaptive ctrl = adaptive ? adaptive_ctrl[seq_id] : common_speculative_adaptive();
+        const uint32_t header[] = {
+            0x3150544d, (uint32_t) n_embd, n_defer,
+            (uint32_t) ctrl.n_cur, (uint32_t) ctrl.n_climb, (uint32_t) ctrl.n_drop,
+            (uint32_t) n_last[seq_id], (adaptive ? 1u : 0u) | (defer_enabled ? 2u : 0u),
+        };
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(sizeof(header) + row_bytes + n_defer * (sizeof(llama_token) + sizeof(llama_pos) + row_bytes));
+        size_t off = 0;
+        auto put = [&](const void * src, size_t n) {
+            std::memcpy(data.data() + off, src, n);
+            off += n;
+        };
+        put(header, sizeof(header));
+        put(pending_h[seq_id].data(), row_bytes);
+        // Keep deferred rows separate from KV so restoring preserves the next decode's batch shape.
+        for (size_t k = 0; k < defer.seq.size(); ++k) {
+            if (defer.seq[k] == seq_id) {
+                put(&defer.tok[k], sizeof(llama_token));
+                put(&defer.pos[k], sizeof(llama_pos));
+                put(defer.embd.data() + k * (size_t) n_embd, row_bytes);
+            }
+        }
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        uint32_t header[8];
+        if (data.size() < sizeof(header)) {
+            return;
+        }
+        std::memcpy(header, data.data(), sizeof(header));
+        const uint32_t flags = (adaptive ? 1u : 0u) | (defer_enabled ? 2u : 0u);
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (header[0] != 0x3150544d || header[1] != (uint32_t) n_embd || header[2] > (uint32_t) defer_max || header[7] != flags ||
+                header[6] > (uint32_t) params.n_max ||
+                data.size() != sizeof(header) + row_bytes + header[2] * (sizeof(llama_token) + sizeof(llama_pos) + row_bytes)) {
+            return;
+        }
+        const uint32_t cap = std::max(1, params.n_max);
+        const uint32_t floor = std::min<uint32_t>(std::max(1, params.n_min_adaptive), cap);
+        if (adaptive && (header[3] < floor || header[3] > cap ||
+                header[4] >= (uint32_t) common_speculative_adaptive::climb_threshold(header[3]) ||
+                header[5] >= (uint32_t) common_speculative_adaptive::drop_pressure(header[3]))) {
+            return;
+        }
+        if ((!adaptive && (header[3] || header[4] || header[5])) || (!defer_enabled && header[2])) {
+            return;
+        }
+
+        // Validate the complete snapshot before changing this sequence or its deferred rows.
+        size_t off = sizeof(header) + row_bytes;
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_dft)));
+        for (uint32_t i = 0; i < header[2]; ++i) {
+            llama_token tok;
+            llama_pos pos;
+            std::memcpy(&tok, data.data() + off, sizeof(tok));
+            std::memcpy(&pos, data.data() + off + sizeof(tok), sizeof(pos));
+            if (tok < 0 || tok >= n_vocab || pos < 0) {
+                return;
+            }
+            off += sizeof(tok) + sizeof(pos) + row_bytes;
+        }
+
+        drop_deferred_from(seq_id, 0);
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(header), row_bytes);
+        if (adaptive) {
+            adaptive_ctrl[seq_id].n_cur   = header[3];
+            adaptive_ctrl[seq_id].n_climb = header[4];
+            adaptive_ctrl[seq_id].n_drop  = header[5];
+        }
+        n_last[seq_id] = header[6];
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+
+        off = sizeof(header) + row_bytes;
+        for (uint32_t i = 0; i < header[2]; ++i) {
+            llama_token tok;
+            llama_pos pos;
+            std::memcpy(&tok, data.data() + off, sizeof(tok));
+            off += sizeof(tok);
+            std::memcpy(&pos, data.data() + off, sizeof(pos));
+            off += sizeof(pos);
+            defer.tok.push_back(tok);
+            defer.pos.push_back(pos);
+            defer.seq.push_back(seq_id);
+            const size_t k = defer.embd.size();
+            defer.embd.resize(k + n_embd);
+            std::memcpy(defer.embd.data() + k, data.data() + off, row_bytes);
+            off += row_bytes;
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -2263,7 +2373,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (size_t k = 0; k < defer.tok.size(); ++k) {
                     defer_other = defer_other || defer.seq[k] != seq_one;
                 }
-                if (defer_other && !flush_deferred()) {
+                if ((defer_other || defer.tok.size() + n_chain > (size_t) std::min(batch_capacity, ubatch_capacity)) && !flush_deferred()) {
                     return;
                 }
 
@@ -2460,6 +2570,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     drop_deferred_from(seq_id, dparams[seq_id].pos0);
                 }
             }
+        }
+        if (any_drafting && defer.tok.size() > (size_t) defer_capacity()) {
+            if (!flush_deferred()) {
+                return;
+            }
+            common_batch_clear(batch);
         }
         if (any_drafting && !defer.tok.empty()) {
             for (size_t k = 0; k < defer.tok.size(); ++k) {
@@ -4446,6 +4562,15 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }
+}
+
+bool common_speculative_restore_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    std::vector<uint8_t> restored;
+    if (data.empty()) {
+        return !common_speculative_get_state(spec, seq_id, restored);
+    }
+    common_speculative_set_state(spec, seq_id, data);
+    return common_speculative_get_state(spec, seq_id, restored) && restored == data;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

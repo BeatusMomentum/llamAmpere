@@ -729,17 +729,21 @@ struct server_slot {
             return nullptr;
         }
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        std::vector<uint8_t> spec_state;
+        common_speculative_get_state(spec, id, spec_state);
+        const size_t cur_size = cur_size_tgt + cur_size_dft + spec_state.size();
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
         const int64_t t_start = ggml_time_us();
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, hand_over_ckpts ? &prompt.checkpoints : nullptr);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, hand_over_ckpts ? &prompt.checkpoints : nullptr, spec_state.size());
         if (cur == nullptr) {
             return nullptr;
         }
+
+        cur->data.spec = std::move(spec_state);
 
         const int64_t t_alloc = ggml_time_us();
 
@@ -781,7 +785,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1846,6 +1850,7 @@ private:
             }
             add("dft_window", string_format("%d,%d", params_base.speculative.draft.attn_window, params_base.speculative.draft.attn_sink));
             add("dft_sj", std::to_string(params_base.speculative.draft.sj_kvarn));
+            add("dft_depth", string_format("%d,%d", params_base.speculative.draft.n_max, params_base.speculative.draft.n_min_adaptive));
             std::string types;
             for (auto t : params_base.speculative.types) {
                 types += std::to_string((int) t) + ",";
@@ -1861,6 +1866,7 @@ private:
             "LLAMA_ATTN_ROT_K_OVERRIDE", "LLAMA_ATTN_ROT_V_OVERRIDE", "LLAMA_ATTN_ROT_K_NROT", "LLAMA_ATTN_ROT_DISABLE",
             "GGML_TQ_NATIVE", "GGML_TQ_ROTCACHE", "LLAMA_GDN_REPLAY", "LLAMA_RS_RING", "LLAMA_RS_RING_ROWS",
             "LLAMA_MTP_UPDATE_KV_ONLY", "LLAMA_DRAFT_VOCAB_COMPACT", "LLAMA_DRAFT_VOCAB_COMPACT_TYPE",
+            "LLAMA_SPEC_CHAIN", "LLAMA_SPEC_CHAIN_SUB", "LLAMA_SPEC_ADAPTIVE_CARRY", "LLAMA_SPEC_PQ", "LLAMA_SPEC_CHAIN_SAMPLED",
             "GGML_SJKVARN_TRELLIS_WORDS", "GGML_SJKVARN_TRELLIS_CB", "GGML_SJKVARN_TRELLIS_CB2",
             "GGML_SJKVARN_TRELLIS_CB3", "GGML_SJKVARN_TRELLIS_CB4",
             // SJ-KVaRN record encoding: trellis payload axis, fused write rotation, refit and scalar range clip
@@ -2855,6 +2861,9 @@ private:
         if (ok && e.has_dft) {
             ok = ctx_dft != nullptr && load_file(ctx_dft, eval_cache->path_dft(e.id));
         }
+        if (ok) {
+            ok = common_speculative_restore_state(spec.get(), slot.id, rec.spec);
+        }
         if (!ok) {
             SRV_ERR("slot %d: eval cache: failed to restore entry %s, processing the prompt without it\n", slot.id, e.id.c_str());
             slot.prompt_clear();
@@ -2870,9 +2879,6 @@ private:
         // the restored checkpoints belong to this prompt: treat them like checkpoints this task created
         for (auto & c : slot.prompt.checkpoints) {
             c.id_task = task.id;
-        }
-        if (!rec.spec.empty()) {
-            common_speculative_set_state(spec.get(), slot.id, rec.spec);
         }
 
         n_eval_cache_hits++;
@@ -3708,88 +3714,93 @@ private:
     // llama_state_seq file format. persist them in a sidecar file so that
     // action=restore in a fresh process can roll back mid-prompt (e.g. after a
     // BPE boundary re-tokenization of the prompt tail) instead of re-prefilling.
-    static bool checkpoints_save_sidecar(const std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
+    static bool checkpoints_save_sidecar(const std::list<common_prompt_checkpoint> & checkpoints,
+            const std::vector<uint8_t> & spec, const std::string & filepath) {
         FILE * f = fopen(filepath.c_str(), "wb");
         if (f == nullptr) {
             return false;
         }
 
-        bool ok = true;
-
         const uint32_t magic   = 0x4C434B50; // "PKCL"
-        const uint32_t version = 1;
+        const uint32_t version = 2;
         const uint32_t count   = (uint32_t) checkpoints.size();
+        bool ok = fwrite(&magic,   sizeof(magic),   1, f) == 1 &&
+                  fwrite(&version, sizeof(version), 1, f) == 1 &&
+                  fwrite(&count,   sizeof(count),   1, f) == 1;
 
-        ok = ok && fwrite(&magic,   sizeof(magic),   1, f) == 1;
-        ok = ok && fwrite(&version, sizeof(version), 1, f) == 1;
-        ok = ok && fwrite(&count,   sizeof(count),   1, f) == 1;
-
+        auto blob = [&](const std::vector<uint8_t> & data) {
+            const uint64_t size = data.size();
+            return fwrite(&size, sizeof(size), 1, f) == 1 &&
+                   (size == 0 || fwrite(data.data(), 1, size, f) == size);
+        };
         for (const auto & cur : checkpoints) {
-            const int64_t  n_tokens = cur.n_tokens;
-            const int32_t  pos_min  = cur.pos_min;
-            const int32_t  pos_max  = cur.pos_max;
-            const uint64_t n_tgt    = cur.data_tgt.size();
-            const uint64_t n_dft    = cur.data_dft.size();
-
-            ok = ok && fwrite(&n_tokens, sizeof(n_tokens), 1, f) == 1;
-            ok = ok && fwrite(&pos_min,  sizeof(pos_min),  1, f) == 1;
-            ok = ok && fwrite(&pos_max,  sizeof(pos_max),  1, f) == 1;
-            ok = ok && fwrite(&n_tgt,    sizeof(n_tgt),    1, f) == 1;
-            ok = ok && fwrite(&n_dft,    sizeof(n_dft),    1, f) == 1;
-            ok = ok && (n_tgt == 0 || fwrite(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
-            ok = ok && (n_dft == 0 || fwrite(cur.data_dft.data(), 1, n_dft, f) == n_dft);
+            const int64_t n_tokens = cur.n_tokens;
+            ok = ok && fwrite(&n_tokens,   sizeof(n_tokens),   1, f) == 1;
+            ok = ok && fwrite(&cur.pos_min, sizeof(cur.pos_min), 1, f) == 1;
+            ok = ok && fwrite(&cur.pos_max, sizeof(cur.pos_max), 1, f) == 1;
+            ok = ok && blob(cur.data_tgt) && blob(cur.data_dft) && blob(cur.data_spec);
         }
-
-        fclose(f);
-        return ok;
+        ok = ok && blob(spec);
+        return fclose(f) == 0 && ok;
     }
 
-    static bool checkpoints_load_sidecar(std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
+    static bool checkpoints_load_sidecar(std::list<common_prompt_checkpoint> & checkpoints,
+            std::vector<uint8_t> & spec, const std::string & filepath) {
         FILE * f = fopen(filepath.c_str(), "rb");
         if (f == nullptr) {
             return false;
         }
 
         uint32_t magic = 0, version = 0, count = 0;
-
         bool ok = fread(&magic,   sizeof(magic),   1, f) == 1 &&
                   fread(&version, sizeof(version), 1, f) == 1 &&
                   fread(&count,   sizeof(count),   1, f) == 1 &&
-                  magic == 0x4C434B50 && version == 1 && count <= 1024;
+                  magic == 0x4C434B50 && version == 2 && count <= 1024;
+
+        // Bound allocations by the file itself, including truncated sidecars.
+        std::error_code ec;
+        const uint64_t file_size = std::filesystem::file_size(filepath, ec);
+        ok = ok && !ec && file_size >= 3 * sizeof(uint32_t);
+        uint64_t remaining = ok ? file_size - 3 * sizeof(uint32_t) : 0;
+        auto blob = [&](std::vector<uint8_t> & data) {
+            uint64_t size = 0;
+            if (remaining < sizeof(size) || fread(&size, sizeof(size), 1, f) != 1) {
+                return false;
+            }
+            remaining -= sizeof(size);
+            if (size > remaining || size > (1ull << 34)) {
+                return false;
+            }
+            data.resize(size);
+            remaining -= size;
+            return size == 0 || fread(data.data(), 1, size, f) == size;
+        };
 
         std::list<common_prompt_checkpoint> loaded;
-
-        for (uint32_t i = 0; ok && i < count; ++i) {
-            auto & cur = loaded.emplace_back();
-
-            uint64_t n_tgt = 0;
-            uint64_t n_dft = 0;
-
-            ok = ok && fread(&cur.n_tokens, sizeof(cur.n_tokens), 1, f) == 1;
-            ok = ok && fread(&cur.pos_min,  sizeof(cur.pos_min),  1, f) == 1;
-            ok = ok && fread(&cur.pos_max,  sizeof(cur.pos_max),  1, f) == 1;
-            ok = ok && fread(&n_tgt,        sizeof(n_tgt),        1, f) == 1;
-            ok = ok && fread(&n_dft,        sizeof(n_dft),        1, f) == 1;
-
-            // sanity: refuse absurd blob sizes (16 GiB per blob)
-            ok = ok && n_tgt <= (1ull << 34) && n_dft <= (1ull << 34);
-
-            if (ok) {
-                cur.data_tgt.resize(n_tgt);
-                cur.data_dft.resize(n_dft);
-                ok = ok && (n_tgt == 0 || fread(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
-                ok = ok && (n_dft == 0 || fread(cur.data_dft.data(), 1, n_dft, f) == n_dft);
+        std::vector<uint8_t> loaded_spec;
+        try {
+            for (uint32_t i = 0; ok && i < count; ++i) {
+                auto & cur = loaded.emplace_back();
+                const size_t metadata_size = sizeof(cur.n_tokens) + sizeof(cur.pos_min) + sizeof(cur.pos_max);
+                ok = remaining >= metadata_size && fread(&cur.n_tokens, sizeof(cur.n_tokens), 1, f) == 1 &&
+                     fread(&cur.pos_min,  sizeof(cur.pos_min),  1, f) == 1 &&
+                     fread(&cur.pos_max,  sizeof(cur.pos_max),  1, f) == 1;
+                if (ok) {
+                    remaining -= metadata_size;
+                    ok = blob(cur.data_tgt) && blob(cur.data_dft) && blob(cur.data_spec);
+                }
             }
+            ok = ok && blob(loaded_spec) && remaining == 0 && fgetc(f) == EOF && !ferror(f);
+        } catch (const std::bad_alloc &) {
+            ok = false;
         }
-
         fclose(f);
-
         if (!ok) {
             return false;
         }
 
         checkpoints = std::move(loaded);
-
+        spec = std::move(loaded_spec);
         return true;
     }
 
@@ -4157,19 +4168,19 @@ private:
                     // plain-KV drafter (ckpt_needs_dft), and the state file holds the target only
                     if (ctx_dft) {
                         if (llama_state_seq_save_file(ctx_dft, (filepath + ".dft").c_str(), slot->id, nullptr, 0) == 0) {
-                            SLT_WRN(*slot, "failed to write drafter sidecar %s\n", (filepath + ".dft").c_str());
+                            send_error(task, "Unable to save drafter sidecar", ERROR_TYPE_SERVER);
+                            break;
                         }
                     }
 
-                    // persist context checkpoints alongside the state file so that a
-                    // restore in a fresh process can roll back mid-prompt (see restore path)
-                    if (!slot->prompt.checkpoints.empty()) {
-                        if (checkpoints_save_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
-                            SLT_INF(*slot, "saved %zu context checkpoints to sidecar\n", slot->prompt.checkpoints.size());
-                        } else {
-                            SLT_WRN(*slot, "failed to write checkpoint sidecar %s\n", (filepath + ".ckpt").c_str());
-                        }
+                    // Both rollback checkpoints and the tip need the MTP carry and adaptive-depth state.
+                    std::vector<uint8_t> spec_state;
+                    common_speculative_get_state(spec.get(), slot->id, spec_state);
+                    if (!checkpoints_save_sidecar(slot->prompt.checkpoints, spec_state, filepath + ".ckpt")) {
+                        send_error(task, "Unable to save checkpoint sidecar", ERROR_TYPE_SERVER);
+                        break;
                     }
+                    SLT_INF(*slot, "saved %zu context checkpoints and speculative state to sidecar\n", slot->prompt.checkpoints.size());
 
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
@@ -4233,19 +4244,14 @@ private:
                         break;
                     }
 
-                    // the drafter's memory of the slot: from its sidecar, else cleared (a stale drafter KV
-                    // of an earlier prompt would only cost acceptance, but there is no reason to keep it)
+                    bool has_dft_state = ctx_dft == nullptr;
                     if (ctx_dft) {
                         const std::string path_dft = filepath + ".dft";
                         size_t n_tok_dft = 0;
-                        bool has_dft = false;
-                        if (FILE * fdft = fopen(path_dft.c_str(), "rb")) {
-                            has_dft = true;
-                            fclose(fdft);
-                        }
-                        // a non-null token buffer: with tokens_out == nullptr the call only probes the token count
+                        // A non-null token buffer loads the state instead of only probing its token count.
                         llama_token tok_dft_dummy = 0;
-                        if (has_dft && llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id, &tok_dft_dummy, 1, &n_tok_dft) > 0) {
+                        has_dft_state = llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id, &tok_dft_dummy, 1, &n_tok_dft) > 0;
+                        if (has_dft_state) {
                             SLT_INF(*slot, "restored the drafter state from %s\n", path_dft.c_str());
                         } else {
                             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
@@ -4253,21 +4259,27 @@ private:
                         }
                     }
 
-                    // reload the context checkpoints written at save time; without them the
-                    // next request's rollback finds no usable cache data and forces a full
-                    // re-prefill ("forcing full prompt re-processing due to lack of cache
-                    // data"). if no sidecar exists (state saved by an older build), fall back
-                    // to synthesizing a tip checkpoint from the just-restored state, which at
-                    // least covers exact continuations.
-                    if (params_base.n_ctx_checkpoints > 0 && slot->prompt.tokens.size() > 0) {
-                        if (checkpoints_load_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
-                            SLT_INF(*slot, "restored %zu context checkpoints from sidecar\n", slot->prompt.checkpoints.size());
-                        } else {
-                            const llama_pos p_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
-                            const llama_pos p_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
-                            if (p_min >= 0 && p_max >= p_min) {
-                                create_checkpoint(*slot, 0, p_min, p_max);
-                            }
+                    std::vector<uint8_t> spec_state;
+                    std::vector<uint8_t> spec_current;
+                    const bool has_sidecar = checkpoints_load_sidecar(slot->prompt.checkpoints, spec_state, filepath + ".ckpt");
+                    const bool spec_ok = common_speculative_restore_state(spec.get(), slot->id, spec_state);
+                    const bool needs_spec = common_speculative_get_state(spec.get(), slot->id, spec_current);
+                    if (!spec_ok || (needs_spec && (!has_sidecar || !has_dft_state))) {
+                        slot->prompt_clear();
+                        if (ctx_dft) {
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                        }
+                        send_error(task, "Unable to restore speculative state: save the slot again with this server version", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (has_sidecar) {
+                        SLT_INF(*slot, "restored %zu context checkpoints and speculative state from sidecar\n", slot->prompt.checkpoints.size());
+                    } else if (params_base.n_ctx_checkpoints > 0 && slot->prompt.tokens.size() > 0) {
+                        // Legacy non-speculative saves can still supply a tip checkpoint for exact continuations.
+                        const llama_pos p_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
+                        const llama_pos p_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        if (p_min >= 0 && p_max >= p_min) {
+                            create_checkpoint(*slot, 0, p_min, p_max);
                         }
                     }
 
@@ -5124,11 +5136,13 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
+                                        do_reset = !common_speculative_restore_state(spec.get(), slot.id, it->data_spec);
+                                    }
+
+                                    if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);

@@ -21,7 +21,7 @@ static int pc_getpid() { return (int) getpid(); }
 namespace fs = std::filesystem;
 
 static const char     PC_MAGIC[4] = {'L', 'C', 'P', 'C'};
-static const uint32_t PC_VERSION  = 2;
+static const uint32_t PC_VERSION  = 3;
 
 static constexpr uint64_t PC_MAX_KEY_LEN  = 1u << 20;
 static constexpr uint64_t PC_MAX_N_TOKENS = 1u << 26;
@@ -501,7 +501,8 @@ bool server_prompt_disk_tier::guard_allows(uint64_t need) {
 bool server_prompt_disk_tier::write(const llama_tokens & tokens,
                                     const std::vector<uint8_t> & main,
                                     const std::vector<uint8_t> & drft,
-                                    const std::list<common_prompt_checkpoint> & checkpoints) {
+                                    const std::list<common_prompt_checkpoint> & checkpoints,
+                                    const std::vector<uint8_t> & spec) {
     if (!enabled() || tokens.empty() || main.empty()) {
         return false;
     }
@@ -514,7 +515,7 @@ bool server_prompt_disk_tier::write(const llama_tokens & tokens,
         }
     }
 
-    uint64_t payload = 8 + main.size() + 8 + drft.size() + 4;
+    uint64_t payload = 8 + main.size() + 8 + drft.size() + 8 + spec.size() + 4;
     for (const auto & c : checkpoints) {
         payload += 8 + 4 + 4 + 4 + 8 + c.data_tgt.size() + 8 + c.data_dft.size() + 8 + c.data_spec.size();
     }
@@ -572,6 +573,7 @@ bool server_prompt_disk_tier::write(const llama_tokens & tokens,
     w.val<uint64_t>(payload);
     w.blob(main);
     w.blob(drft);
+    w.blob(spec);
     w.val<uint32_t>((uint32_t) checkpoints.size());
     for (const auto & c : checkpoints) {
         w.val<int64_t>(c.n_tokens);
@@ -680,7 +682,7 @@ bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator
     }
 
     uint32_t n_ckpt = 0;
-    if (!why && (!r.blob(out.main) || !r.blob(out.drft) || !r.val(n_ckpt) || n_ckpt > PC_MAX_N_CKPT)) {
+    if (!why && (!r.blob(out.main) || !r.blob(out.drft) || !r.blob(out.spec) || !r.val(n_ckpt) || n_ckpt > PC_MAX_N_CKPT)) {
         why = "truncated state";
     }
 

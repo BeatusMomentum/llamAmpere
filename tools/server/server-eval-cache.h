@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-#define EVAL_CACHE_FORMAT_VERSION 1
+#define EVAL_CACHE_FORMAT_VERSION 2
 
 struct server_eval_cache_entry {
     std::string  id;
