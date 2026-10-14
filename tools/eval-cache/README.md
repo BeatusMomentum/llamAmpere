@@ -33,8 +33,9 @@ normal prefill of that prompt would pause between two batches, and the server co
    ```
 
    The tool starts `llama-server` (from `build/bin`, or `--server PATH`) with your flags plus
-   `--eval-cache DIR --eval-cache-build --parallel 1 --cache-ram 0`, sends every prompt once with `max_tokens` 1,
-   and writes `manifest.json` (model sha256, flags, which entry covers which prompt, file checksums).
+   `--eval-cache DIR --eval-cache-build --parallel 1 --cache-ram 0` (the builder's own `--parallel N` changes the
+   slot count), sends every prompt once with `max_tokens` 1 from an empty cache, and writes `manifest.json` (model
+   sha256, flags, which entry covers which prompt, file checksums).
 
 3. Run the eval with the folder:
 
@@ -74,6 +75,11 @@ Not part of the key, so free to change: `--ctx-size`, `--parallel`, `--kv-unifie
 Keep `-b` / `-ub` (batch sizes) the same as at build time if you want byte-identical output: the cache is correct
 with any batch size, but the identity guarantee relies on the same batch layout. `manifest.json` records both.
 
+Sliding-window models (Gemma) with `--kv-unified` and `--parallel N` (N > 1): the slots share one window cache whose
+size grows with N, so pass the same `--parallel N` to the builder (`build --parallel N ... -- ... --kv-unified`) for
+byte-identical output. Without `--kv-unified` every slot has its own window cache of the same size, and a folder built
+with the default `--parallel 1` gives identical output at any `--parallel`.
+
 ## Prompts that share a long document
 
 Many evals ask several questions about one document. The builder groups prompts that share at least
@@ -110,5 +116,5 @@ file and settings.
 - The server only loads an entry when it covers more of the prompt than the slot already has in memory. The
   regular RAM / disk prompt cache keeps working alongside it.
 - Requests must use `cache_prompt` (the default).
-- Temperature-0 identity holds per prompt with `--parallel 1`. With several slots busy at once, batches mix
+- Temperature-0 identity holds per prompt with one request running at a time. With several slots busy at once, batches mix
   prompts, which can change the last digits of the math with or without the cache.

@@ -17,7 +17,7 @@ prompts.jsonl, one request per line, sent exactly as written (pass `reasoning_ef
 
 The llama-server flags after `--` must be the flags you will run the eval with (model, -ctk/-ctv, SJ-KVaRN,
 --cache-type-s, drafter / MTP, -fa, -b/-ub). Context size and --parallel may differ. The tool adds
---eval-cache DIR --eval-cache-build --parallel 1 --cache-ram 0 and a free --port.
+--eval-cache DIR --eval-cache-build --parallel N (default 1) --cache-ram 0 --slot-save-path and a free --port.
 
 Only the Python standard library is used.
 """
@@ -267,8 +267,13 @@ def cmd_build(a):
     for bad in ("--eval-cache", "--eval-cache-build", "--port", "--host", "-np", "--parallel"):
         if bad in server_args:
             raise SystemExit(f"do not pass {bad} after --, the tool sets it")
+    import tempfile
+    slot_dir = tempfile.mkdtemp(prefix="evc-slots-")
+    # every request starts from an empty cache (all slots erased), as a cold run in verify does; with --kv-unified the
+    # slots share one cache, and on sliding-window models its size depends on --parallel, so build with the eval's
     srv = Server(find_server(a.server), server_args, os.path.join(a.dir, "build-server.log"),
-                 ["--eval-cache", a.dir, "--eval-cache-build", "--parallel", "1", "--cache-ram", "0"])
+                 ["--eval-cache", a.dir, "--eval-cache-build", "--parallel", str(a.parallel), "--cache-ram", "0",
+                  "--slot-save-path", slot_dir])
     t_start = time.time()
     try:
         srv.wait_ready(a.timeout)
@@ -308,6 +313,8 @@ def cmd_build(a):
             body = request_body(by_id[rep])
             body.update({"eval_cache_save_at": at, "cache_prompt": False, "max_tokens": 1, "n_predict": 1,
                          "stream": False})
+            for k in range(a.parallel):
+                srv.post(f"/slots/{k}?action=erase", {})
             before = entry_stamps(a.dir)
             t0 = time.time()
             res = srv.post(endpoint(by_id[rep]), body)
@@ -382,6 +389,7 @@ def cmd_build(a):
         "server_args": server_args,
         "n_batch": evc.get("n_batch"),
         "n_ubatch": n_ubatch,
+        "build_parallel": a.parallel,
         "key": idx["key"],
         "key_hash": idx["key_hash"],
         "prompts_file": os.path.basename(a.prompts),
@@ -580,6 +588,9 @@ def main():
                    help="extra tokens a shared entry stays below the shortest member (default n_ubatch + 256)")
     b.add_argument("--full", action="store_true", help="also store every grouped prompt on its own (more disk)")
     b.add_argument("--no-model-hash", action="store_true", help="skip the model sha256 in the manifest")
+    b.add_argument("--parallel", type=int, default=1,
+                   help="slots of the build server (default 1); only matters with --kv-unified on sliding-window "
+                        "models, where it should match the eval's --parallel for byte-identical output")
     b.add_argument("--timeout", type=int, default=1800, help="seconds to wait for the server to load")
 
     v = sub.add_parser("verify", help="check a folder's files, optionally the output identity")
