@@ -14512,6 +14512,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4));
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(3, 8, 4, 5, 1000)); // GQA 2, 5 records, ring nearly full
+    // Flash-Next QSA shape (qwen4exp): 24 query heads over 2 KV heads (GQA 12) at the production staging (tq6_0 ring,
+    // f16 sink, 4/4 scalar body): decode and MTP widths, prefill ubatches, and two sequences (--parallel 2)
+    for (int64_t n_q : {1, 2, 4, 5, 8, 64, 257, 1024}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 5, 4096, true, false, GGML_TYPE_TQ6_0, 128, true));
+    }
+    for (int64_t n_q : {1, 5, 257}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 5, 400, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 2));
+    }
     // fragment-direct decode kernel: MTP widths, long body (many 128-position units per warp, several blocks per head)
     for (int64_t n_q : {3, 5, 6, 7}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4));
