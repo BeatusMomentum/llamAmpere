@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-chat.h"
+#include "server-eval-cache.h"
 #include "server-common.h"
 #include "server-decision.h"
 #include "server-http.h"
@@ -692,6 +693,9 @@ struct server_slot {
     // suffix out of mixed decode batches; the CUDA path is not stable when it is
     // evaluated concurrently with other active slots.
     bool prompt_checkpoint_restored = false;
+    // [EVALFLAG] the slot holds an eval-cache entry restored for the current task: its full state is exactly the
+    // state a cold prefill has at that token, so it continues from there without a context checkpoint
+    bool eval_cache_restored = false;
 
     stop_type stop;
 
@@ -1587,6 +1591,11 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // --eval-cache [EVALFLAG]
+    std::unique_ptr<server_eval_cache> eval_cache;
+    uint64_t n_eval_cache_hits   = 0;
+    uint64_t n_eval_cache_tokens = 0;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1757,7 +1766,9 @@ private:
     // everything that decides whether a serialized slot state can be restored into this server: the model
     // (and drafter) weights, the KV / recurrent-state layout of the trunk and the drafter, and the knobs that
     // change what the stored values mean. A disk entry with any other key is never restored.
-    std::string prompt_cache_key() const {
+    // portable [EVALFLAG]: the eval-cache key, which leaves out the build and the context / slot counts (a stored
+    // sequence state does not depend on them), so one folder serves any --ctx-size and --parallel
+    std::string prompt_cache_key(bool portable = false) const {
         std::string k;
 
         auto add = [&](const char * name, const std::string & v) {
@@ -1782,8 +1793,13 @@ private:
             add_type((s + "sjbody").c_str(),  p.sj_kvarn_body_type);
         };
 
-        add("fmt", "llamampere-prompt-cache");
-        add("build", string_format("%d-%s", llama_build_number(), llama_commit()));
+        if (portable) {
+            add("fmt", string_format("llamampere-eval-cache-v%d", EVAL_CACHE_FORMAT_VERSION));
+            add("state", string_format("%08x-%d-layout1", LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION));
+        } else {
+            add("fmt", "llamampere-prompt-cache");
+            add("build", string_format("%d-%s", llama_build_number(), llama_commit()));
+        }
 
         {
             char desc[256] = {0};
@@ -1805,9 +1821,14 @@ private:
         add_kv("", params_base);
         add("kv_stream_arena", std::to_string(params_base.kv_stream_arena_mib));
         add("fa", std::to_string((int) params_base.flash_attn_type));
-        add("n_ctx", std::to_string(llama_n_ctx(ctx_tgt)));
-        add("n_seq", std::to_string(llama_n_seq_max(ctx_tgt)));
-        add("kv_unified", std::to_string(params_base.kv_unified));
+        if (!portable) {
+            add("n_ctx", std::to_string(llama_n_ctx(ctx_tgt)));
+            add("n_seq", std::to_string(llama_n_seq_max(ctx_tgt)));
+        }
+        if (!portable) {
+            // a single sequence's state loads into any stream layout (llama_kv_cache::state_read_sinfo)
+            add("kv_unified", std::to_string(params_base.kv_unified));
+        }
         add("swa_full", std::to_string(params_base.swa_full));
         add("n_rs_seq", std::to_string(params_base.speculative.need_n_rs_seq()));
         add("gdn_replay", std::to_string(params_base.gdn_replay));
@@ -1819,8 +1840,10 @@ private:
             // the drafter's KV types as actually resolved (inherited from the trunk unless set)
             const common_params p_dft = common_base_params_to_speculative(params_base);
             add_kv("dft_", p_dft);
-            add("dft_n_ctx", std::to_string(llama_n_ctx(ctx_dft)));
-            add("dft_n_seq", std::to_string(llama_n_seq_max(ctx_dft)));
+            if (!portable) {
+                add("dft_n_ctx", std::to_string(llama_n_ctx(ctx_dft)));
+                add("dft_n_seq", std::to_string(llama_n_seq_max(ctx_dft)));
+            }
             add("dft_window", string_format("%d,%d", params_base.speculative.draft.attn_window, params_base.speculative.draft.attn_sink));
             add("dft_sj", std::to_string(params_base.speculative.draft.sj_kvarn));
             std::string types;
@@ -2440,6 +2463,24 @@ private:
         } else {
             SRV_INF("%s", "prompt cache is disabled (--cache-ram 0)\n");
         }
+
+        // [EVALFLAG] eval cache: a folder of pre-built prompt states; a folder built for other settings is refused
+        if (!params_base.eval_cache_path.empty()) {
+            eval_cache = std::make_unique<server_eval_cache>();
+            std::string err;
+            if (!eval_cache->open(params_base.eval_cache_path, prompt_cache_key(true), params_base.eval_cache_build, err)) {
+                SRV_ERR("eval cache: refusing to start: %s\n", err.c_str());
+                eval_cache.reset();
+                return false;
+            }
+            SRV_INF("eval cache: %s, %zu entries (%.3f GiB)%s%s\n", eval_cache->dir.c_str(), eval_cache->entries.size(),
+                    eval_cache->total_bytes() / (1024.0*1024.0*1024.0),
+                    eval_cache->n_skipped > 0 ? string_format(", %zu unusable entries skipped", eval_cache->n_skipped).c_str() : "",
+                    eval_cache->writable ? ", build mode (requests with eval_cache_save_at add entries)" : "");
+        } else if (params_base.eval_cache_build) {
+            SRV_ERR("%s", "--eval-cache-build needs --eval-cache DIR\n");
+            return false;
+        }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
@@ -2742,9 +2783,162 @@ private:
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
+
+            // [EVALFLAG] a stored eval prompt that covers more of this prompt than the slot can reuse
+            if (eval_cache && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
+                    task.params.eval_cache_save_at == 0 && !task.tokens.has_mtmd && !task.is_child()) {
+                eval_cache_load(*ret, task);
+            }
         }
 
         return ret;
+    }
+
+    // [EVALFLAG] the number of prompt tokens the slot can keep for `tokens` without the eval cache: the common
+    // prefix when the prompt continues the slot's content, else (memory that cannot be cut, e.g. recurrent state)
+    // the newest checkpoint inside the common prefix
+    size_t eval_cache_slot_reuse(const server_slot & slot, const server_tokens & tokens) const {
+        const size_t lcp = slot.prompt.tokens.get_common_prefix(tokens);
+        if (lcp == 0 || lcp == (size_t) slot.prompt.n_tokens() || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            return lcp;
+        }
+        size_t best = 0;
+        for (const auto & c : slot.prompt.checkpoints) {
+            if (c.pos_max < (llama_pos) lcp) {
+                best = std::max(best, (size_t) c.n_tokens);
+            }
+        }
+        return best;
+    }
+
+    // [EVALFLAG] restore the longest eval-cache entry that is a prefix of the task's prompt into the slot, when it
+    // covers more than the slot can already reuse. The slot's previous content goes to the prompt cache first.
+    void eval_cache_load(server_slot & slot, const server_task & task) {
+        const size_t have = eval_cache_slot_reuse(slot, task.tokens);
+        const llama_tokens tokens = task.tokens.get_text_tokens();
+        const int idx = eval_cache->find(tokens, have);
+        if (idx < 0) {
+            return;
+        }
+        const server_eval_cache_entry & e = eval_cache->entries[idx];
+
+        const int64_t t_start = ggml_time_us();
+
+        server_eval_cache_record rec;
+        std::string err;
+        if (!eval_cache->read_header(e.id, rec, err)) {
+            SRV_WRN("slot %d: eval cache: entry %s unusable: %s\n", slot.id, e.id.c_str(), err.c_str());
+            return;
+        }
+        if (rec.tokens != e.tokens || rec.has_dft != e.has_dft || e.has_dft != (ctx_dft != nullptr)) {
+            SRV_WRN("slot %d: eval cache: entry %s does not match its index record, skipped\n", slot.id, e.id.c_str());
+            return;
+        }
+
+        if (prompt_cache && !slot.prompt.tokens.empty()) {
+            slot.prompt_save(*prompt_cache);
+            prompt_cache->update();
+        }
+        slot.prompt_clear();
+
+        auto load_file = [&](llama_context * ctx, const std::string & path) {
+            llama_tokens tmp(e.tokens.size());
+            size_t n = 0;
+            const size_t nread = llama_state_seq_load_file_ext(ctx, path.c_str(), slot.id, tmp.data(), tmp.size(), &n,
+                    LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT);
+            return nread > 0 && n == e.tokens.size() && tmp == e.tokens;
+        };
+
+        bool ok = load_file(ctx_tgt, eval_cache->path_tgt(e.id));
+        if (ok && e.has_dft) {
+            ok = ctx_dft != nullptr && load_file(ctx_dft, eval_cache->path_dft(e.id));
+        }
+        if (!ok) {
+            SRV_ERR("slot %d: eval cache: failed to restore entry %s, processing the prompt without it\n", slot.id, e.id.c_str());
+            slot.prompt_clear();
+            if (ctx_dft) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+            }
+            return;
+        }
+
+        slot.prompt.tokens = server_tokens(e.tokens, false);
+        slot.eval_cache_restored = true;
+        slot.prompt.checkpoints = std::move(rec.checkpoints);
+        // the restored checkpoints belong to this prompt: treat them like checkpoints this task created
+        for (auto & c : slot.prompt.checkpoints) {
+            c.id_task = task.id;
+        }
+        if (!rec.spec.empty()) {
+            common_speculative_set_state(spec.get(), slot.id, rec.spec);
+        }
+
+        n_eval_cache_hits++;
+        n_eval_cache_tokens += e.tokens.size();
+
+        SRV_INF("slot %d: eval cache: restored entry %s, %zu of %zu prompt tokens (slot could reuse %zu), %.3f MiB in %.2f ms\n",
+                slot.id, e.id.c_str(), e.tokens.size(), tokens.size(), have, e.bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
+    }
+
+    // [EVALFLAG] builder: store the slot's state (the first n_tokens prompt tokens, already decoded) as an entry
+    bool eval_cache_save(server_slot & slot, int64_t n_tokens) {
+        const int64_t t_start = ggml_time_us();
+
+        llama_tokens tokens = slot.prompt.tokens.get_text_tokens();
+        tokens.resize(n_tokens);
+
+        const std::string id   = server_eval_cache::entry_id(tokens);
+        const std::string ptgt = eval_cache->path_tgt(id);
+        const std::string pdft = eval_cache->path_dft(id);
+
+        // the state files go to temp names first; the header written by add() makes the entry visible
+        if (llama_state_seq_save_file_ext(ctx_tgt, (ptgt + ".tmp").c_str(), slot.id, tokens.data(), tokens.size(),
+                    LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == 0) {
+            SLT_ERR(slot, "eval cache: failed to write %s\n", ptgt.c_str());
+            return false;
+        }
+        const bool has_dft = ctx_dft != nullptr;
+        if (has_dft && llama_state_seq_save_file_ext(ctx_dft, (pdft + ".tmp").c_str(), slot.id, tokens.data(), tokens.size(),
+                    LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == 0) {
+            SLT_ERR(slot, "eval cache: failed to write %s\n", pdft.c_str());
+            return false;
+        }
+        std::error_code ec;
+        std::filesystem::rename(ptgt + ".tmp", ptgt, ec);
+        if (!ec && has_dft) {
+            std::filesystem::rename(pdft + ".tmp", pdft, ec);
+        }
+        if (ec) {
+            SLT_ERR(slot, "eval cache: cannot rename state files: %s\n", ec.message().c_str());
+            return false;
+        }
+
+        // checkpoints the prompt has so far, so that a restored prompt makes the same checkpoint and batch decisions
+        std::list<common_prompt_checkpoint> ckpts;
+        for (const auto & c : slot.prompt.checkpoints) {
+            if (c.n_tokens <= n_tokens) {
+                ckpts.push_back(c);
+            }
+        }
+        std::vector<uint8_t> spec_state;
+        common_speculative_get_state(spec.get(), slot.id, spec_state);
+
+        std::string out_id;
+        std::string err;
+        if (!eval_cache->add(tokens, ckpts, spec_state, has_dft, out_id, err)) {
+            SLT_ERR(slot, "eval cache: failed to add entry: %s\n", err.c_str());
+            return false;
+        }
+
+        uint64_t bytes = 0;
+        for (const auto & e : eval_cache->entries) {
+            if (e.id == out_id) {
+                bytes = e.bytes;
+            }
+        }
+        SLT_INF(slot, "eval cache: stored entry %s, %" PRId64 " tokens, %zu checkpoints, %.3f MiB in %.2f ms\n",
+                out_id.c_str(), n_tokens, ckpts.size(), bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
+        return true;
     }
 
     // return true if at least one slot has been cleared
@@ -4895,7 +5089,17 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // [EVALFLAG] an eval-cache entry is a full snapshot taken at a batch boundary of a cold
+                                // prefill: SWA layers hold exactly the window that prefill had and the recurrent state
+                                // ends at the entry's last token, so continuing at n_past == entry length is the cold
+                                // computation. The checkpoint search below would otherwise fall back to an early
+                                // checkpoint (or a full re-prefill) on SWA and hybrid models.
+                                const bool eval_cache_exact = slot.eval_cache_restored && has_new_tokens &&
+                                                              n_past == (int) slot.prompt.n_tokens();
+                                if (eval_cache_exact && pos_min >= pos_min_thold) {
+                                    slot.prompt_checkpoint_restored = true;
+                                    SLT_INF(slot, "eval cache: continuing from the restored entry at n_past = %d (pos_min = %d)\n", n_past, pos_min);
+                                } else if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4983,6 +5187,7 @@ private:
                             }
                         }
 
+                        slot.eval_cache_restored      = false;
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
@@ -5315,6 +5520,23 @@ private:
                                 n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+
+                    // [EVALFLAG] builder: store the state at the start of the batch that contains the requested
+                    // length (or of the last batch), i.e. at a batch boundary the same prompt also has without a
+                    // cache, so a restored prompt runs the rest of its batches exactly as an uncached one. Taken
+                    // before this batch's checkpoint, which the restored prompt then creates itself.
+                    if (eval_cache && eval_cache->writable && slot.task->params.eval_cache_save_at > 0 && !has_mtmd &&
+                            slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                        const int64_t at  = std::min<int64_t>(slot.task->params.eval_cache_save_at, slot.task->n_tokens());
+                        const int64_t end = slot.prompt.n_tokens();
+                        if (n_tokens_start <= at && (at < end || end == slot.task->n_tokens())) {
+                            if (n_tokens_start == 0) {
+                                SLT_WRN(slot, "eval cache: nothing to store, the first prompt batch already reaches %" PRId64 " tokens\n", at);
+                            } else {
+                                eval_cache_save(slot, n_tokens_start);
+                            }
+                        }
+                    }
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
@@ -6465,6 +6687,12 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
+        { "eval_cache",                  {
+            { "path",     params.eval_cache_path },
+            { "build",    params.eval_cache_build },
+            { "n_batch",  params.n_batch },
+            { "n_ubatch", params.n_ubatch },
+        } },
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },

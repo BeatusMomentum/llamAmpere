@@ -66,6 +66,10 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
+    // eval-cache builder (--eval-cache-build): snapshot the prompt state at the start of the prompt batch that
+    // contains this token count (a batch boundary the same prompt also has without a cache), 0 = off
+    int32_t eval_cache_save_at = 0;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 

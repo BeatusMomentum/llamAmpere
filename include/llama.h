@@ -1057,6 +1057,13 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// [EVALFLAG] save every cell of the sequence (also SWA-masked ones) with its cell index and the cache head, and on
+// load put each cell back at the same index when that cell is free. A sequence restored into a clean slot then has
+// the same cell layout as the prefill that produced it, so attention adds its terms in the same order (byte-identical
+// continuation on sliding-window models). Both the save and the load must use it; the data is not compatible with
+// states saved without it.
+#define LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
@@ -1076,6 +1083,24 @@ extern "C" {
                    const uint8_t * src,
                           size_t   size,
                     llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags);
+
+    // llama_state_seq_save_file / llama_state_seq_load_file with state flags
+    LLAMA_API size_t llama_state_seq_save_file_ext(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_load_file_ext(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out,
            llama_state_seq_flags   flags);
 
     //
