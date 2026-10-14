@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import struct
 import shlex
 import socket
 import subprocess
@@ -152,6 +153,25 @@ def entry_stamps(d):
         except OSError:
             pass
     return out
+
+
+def header_tokens(d, eid):
+    """The prompt tokens stored in an entry header (magic, u32 version, u64 key hash, u32 key length, key,
+    u64 token count, i32 tokens), or None if the header cannot be read."""
+    try:
+        with open(os.path.join(d, "entries", eid + ".evh"), "rb") as f:
+            head = f.read(20)
+            if len(head) < 20 or head[:4] != b"LEVC":
+                return None
+            klen = struct.unpack("<I", head[16:20])[0]
+            f.seek(20 + klen)
+            ntok = struct.unpack("<Q", f.read(8))[0]
+            raw = f.read(4 * ntok)
+            if len(raw) != 4 * ntok:
+                return None
+            return list(struct.unpack(f"<{ntok}i", raw))
+    except (OSError, struct.error):
+        return None
 
 
 def request_body(rec):
@@ -319,6 +339,21 @@ def cmd_build(a):
                     prompt_rows.setdefault(i, {"entry": None, "entry_tokens": 0})
     finally:
         srv.stop()
+
+    # which entry serves which prompt: the longest stored prompt that the prompt starts with, the same rule the
+    # server uses, read from the entry headers (not from which file changed during which request)
+    stored = []
+    for e in read_index(a.dir)["entries"]:
+        t = header_tokens(a.dir, e["id"])
+        if t is not None:
+            stored.append((len(t), e["id"], t))
+    for p in prompts:
+        pt = toks[p["id"]]
+        best = None
+        for n, eid, t in stored:
+            if n < len(pt) and pt[:n] == t and (best is None or n > best[0]):
+                best = (n, eid)
+        prompt_rows[p["id"]] = {"entry": best[1], "entry_tokens": best[0]} if best else {"entry": None, "entry_tokens": 0}
 
     idx = read_index(a.dir)
     entries = []
