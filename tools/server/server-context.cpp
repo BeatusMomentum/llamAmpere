@@ -2721,8 +2721,10 @@ private:
                 }
             }
 
-            if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+            // a slot named by id_slot may be empty: f_keep is then 0 (not 0/0 = NaN, which skipped the prompt cache and
+            // re-processed a cached prompt); a named slot that is busy is left alone, the task is deferred
+            if (ret != nullptr && !ret->is_processing()) {
+                const float f_keep = ret->prompt.tokens.empty() ? 0.0f : (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
