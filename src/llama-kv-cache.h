@@ -591,7 +591,8 @@ private:
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr,
+            const std::vector<uint32_t> * layout = nullptr, uint32_t layout_head = 0);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
@@ -609,7 +610,7 @@ private:
 
     // SJ-KVaRN sequence state (format: see the comment above state_write_sj_kvarn in llama-kv-cache.cpp)
     void state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id seq_id) const;
-    void state_read_sj_kvarn (llama_io_read_i  & io, llama_seq_id seq_id);
+    uint32_t state_read_sj_kvarn (llama_io_read_i  & io, llama_seq_id seq_id); // returns the cells restored
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

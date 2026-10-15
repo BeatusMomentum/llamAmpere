@@ -1871,6 +1871,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--eval-cache"}, "DIR",
+        "folder of pre-built prompt states for prompts that are sent again and again (evals, benchmarks); build it with "
+        "tools/eval-cache/llama-eval-cache.py. A prompt that starts with a stored prompt skips the prefill of that part. "
+        "The folder is tied to the model file and the KV-cache settings it was built with: the server refuses to start "
+        "with other settings (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.eval_cache_path = value;
+        }
+    ).set_env("LLAMA_ARG_EVAL_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--eval-cache-build"},
+        "let requests that carry \"eval_cache_save_at\" write new entries to the --eval-cache folder (created if missing); "
+        "used by the eval-cache builder, not needed to read a folder (default: off)",
+        [](common_params & params) {
+            params.eval_cache_build = true;
+        }
+    ).set_env("LLAMA_ARG_EVAL_CACHE_BUILD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-disk-limit"}, "N",
         string_format("size limit of the prompt-cache disk tier in MiB; the oldest-written entries are deleted first, "
             "and writes are skipped while the filesystem has less than max(10%%, 8 GiB) free "

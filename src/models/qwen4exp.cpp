@@ -886,6 +886,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
+    // SJ-KVaRN: the same Q/K/V rotation build_attn applies; the FA node gets the sealed records attached below
+    const bool sj       = inp->self_sj_kvarn_desc != nullptr;
+    const bool sj_fused = sj && build_attn_sj_kvarn_rot(inp, q_cur, k_cur, v_cur, il);
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
@@ -904,6 +908,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    if (sj) {
+        build_attn_sj_kvarn_pend(inp, sj_fused, il);
+    }
+
     // the selection mask already carries the causal mask
     ggml_tensor * kq_mask = inp->get_kq_mask();
     ggml_tensor * mask    = ggml_reshape_4d(ctx0, sel, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
@@ -918,6 +926,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, mask, nullptr, nullptr, n_sel, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    GGML_ASSERT(sj_kvarn_pending.body == nullptr && "SJ-KVaRN cache requires the flash-attention path");
 
     cur = build_attn_turbo_v_out(cur, v, il);
 

@@ -503,6 +503,7 @@ llama_kv_cache::llama_kv_cache(
                 sj_kvarn.transform.c_str(), sj_wush_host.size(), NL, (unsigned long long) sj_wush_hash);
     }
 
+    bool sj_kvarn_gqa_warned = false;
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -832,6 +833,15 @@ llama_kv_cache::llama_kv_cache(
             GGML_ASSERT(rb == sj_kvarn_rec_bytes[layer_new.sj_kvarn_tier] && "SJ-KVaRN cache: head size must be constant across layers");
             if (edge) {
                 sj_kvarn_n_layers_edge++;
+            }
+            // the CUDA kernels of the low-bit pairs (every pair but 4/4) serve GQA ratios 5..8 only; at other ratios that
+            // attention runs on the CPU, which works but is many times slower
+            const uint32_t gqa = hparams.n_head(il)/std::max<uint32_t>(1, hparams.n_head_kv(il));
+            if ((layer_new.sj_kvarn_bits_k != 4 || layer_new.sj_kvarn_bits_v != 4) && (gqa <= 4 || gqa > 8) && !sj_kvarn_gqa_warned) {
+                sj_kvarn_gqa_warned = true;
+                LLAMA_LOG_WARN("%s: SJ-KVaRN K%u/V%u: this model has %u query heads per KV head; the CUDA low-bit attention "
+                        "kernels serve 5 to 8, so this attention runs on the CPU (it works, but much slower). Use -ctk sjkvarn4 "
+                        "-ctv sjkvarn4 on this model.\n", __func__, layer_new.sj_kvarn_bits_k, layer_new.sj_kvarn_bits_v, gqa);
             }
             body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * sj_kvarn_n_groups);
             body->op_params[7] = layer_new.sj_kvarn_body_type;
@@ -3911,7 +3921,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    GGML_UNUSED(flags);
+    // [EVALFLAG] keep the cell layout of the sequence: masked SWA cells are saved too, and each cell's index and the
+    // stream head follow the cell count, so the load puts every cell back where it was and attention sums over the
+    // cells in the same order as before the save
+    const bool keep_layout = (flags & LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) && seq_id != -1;
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -3933,7 +3946,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
 
             // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
+            if (add_cell && seq_id != -1 && !keep_layout) {
                 const bool is_masked = cells.pos_get(i) >= (llama_pos) n_swa_sink &&
                     llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
@@ -3969,6 +3982,16 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         // skip empty streams
         if (cell_count == 0) {
             continue;
+        }
+
+        if (keep_layout) {
+            const uint32_t head_w = v_heads[s];
+            io.write(&head_w, sizeof(head_w));
+            for (const auto & range : cr.data) {
+                for (uint32_t i = range.first; i < range.second; ++i) {
+                    io.write(&i, sizeof(i));
+                }
+            }
         }
 
         state_write_meta(io, cr, seq_id);
@@ -4011,13 +4034,28 @@ const slot_info_vec_t *   sinfos_in) {
             "streaming is active (--kv-stream-arena-mib)");
     }
 
-    GGML_UNUSED(flags);
-
     if (sj_kvarn.enabled()) {
-        if (sinfos_out || sinfos_in) {
-            throw std::runtime_error("SJ-KVaRN cache: mirrored (indexer) state restore is not supported");
+        if (sinfos_in) {
+            throw std::runtime_error("SJ-KVaRN cache: an SJ-KVaRN cache cannot mirror another cache's restored layout");
         }
-        state_read_sj_kvarn(io, seq_id);
+        const uint32_t n = state_read_sj_kvarn(io, seq_id);
+        if (sinfos_out) {
+            // a cache that mirrors this one (the qwen4exp QSA indexer) takes the restored layout: one stream per
+            // sequence, position p at cell p, so the sequence's stream holds cells [0, n)
+            sinfos_out->assign(n_stream, slot_info{});
+            if (n > 0) {
+                const uint32_t strm = sj_kvarn_seq_stream(seq_id);
+                slot_info & si = (*sinfos_out)[strm];
+                si.s0 = strm;
+                si.s1 = strm;
+                si.resize(1);
+                si.strm[0] = strm;
+                si.idxs[0].resize(n);
+                for (uint32_t i = 0; i < n; ++i) {
+                    si.idxs[0][i] = i;
+                }
+            }
+        }
         return;
     }
 
@@ -4034,8 +4072,16 @@ const slot_info_vec_t *   sinfos_in) {
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
+    // [EVALFLAG] a single sequence goes to its own stream whatever stream it was saved from, so its state also loads
+    // into a cache with another stream count (another --parallel / --kv-unified); a whole-context restore still needs
+    // the same layout. A mirrored pair (indexer cache) keys its slot infos by the stream the sequence lands in, so
+    // both caches of the pair agree for any saved stream count
+    const bool single_seq = seq_id != -1;
+    if (n_stream_cur != n_stream && !single_seq) {
         throw std::runtime_error("n_stream mismatch");
+    }
+    if (n_stream_cur == 0 || n_stream_cur > LLAMA_MAX_SEQ) {
+        throw std::runtime_error("failed to restore kv cache: bad stream count");
     }
 
     // a whole-context restore replaces every stream, so the cache is emptied once here. clear()
@@ -4045,24 +4091,43 @@ const slot_info_vec_t *   sinfos_in) {
         clear(true);
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    // the mirrored layout is keyed by the stream the cells land in (for one sequence: that sequence's stream,
+    // whichever stream the file held it in), so the two caches agree even when the file came from another sequence
+    // or from a server with another stream count
+    bool mirror_used = false;
+
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
+        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
+
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
-            if (sinfos_in && !(*sinfos_in)[s].empty()) {
+            // (one sequence: the other streams of the file are empty, checked after the loop instead)
+            if (seq_id == -1 && sinfos_in && !(*sinfos_in)[strm].empty()) {
                 throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
             }
             continue;
         }
 
-        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
-
         slot_info sinfo;
 
+        // [EVALFLAG] the saved cell layout (see state_write)
+        std::vector<uint32_t> layout;
+        uint32_t layout_head = 0;
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) && seq_id != -1) {
+            io.read(&layout_head, sizeof(layout_head));
+            layout.resize(cell_count);
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                io.read(&layout[i], sizeof(layout[i]));
+            }
+        }
+
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[strm] : nullptr,
+                layout.empty() ? nullptr : &layout, layout_head);
+        mirror_used = true;
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -4076,8 +4141,13 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (sinfos_out) {
-            (*sinfos_out)[s] = sinfo;
+            (*sinfos_out)[strm] = sinfo;
         }
+    }
+
+    // one sequence: the mirrored cache restored cells for it, so this cache must have restored some as well
+    if (seq_id != -1 && sinfos_in && !mirror_used && !(*sinfos_in)[seq_to_stream[seq_id]].empty()) {
+        throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
     }
 }
 
@@ -4280,7 +4350,7 @@ void llama_kv_cache::state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id se
     }
 }
 
-void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_id) {
+uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_id) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
     if (seq_id == -1 && n_stream > 1) {
         throw std::runtime_error("SJ-KVaRN cache: with several sequences (--parallel > 1) the state is restored per sequence");
@@ -4313,7 +4383,7 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
         if (seq_id == -1) {
             clear(true);
         }
-        return;
+        return 0;
     }
 
     if (n > cells.size()) {
@@ -4531,6 +4601,8 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
     sst.draining  = draining;
 
     LLAMA_LOG_DEBUG("%s: restored %u cells, sealed end %u (%u groups), tail %u rows\n", __func__, n, B, n_rec, n - std::min(n, B));
+
+    return n;
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
@@ -4665,7 +4737,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in,
+        const std::vector<uint32_t> * layout, uint32_t layout_head) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -4756,7 +4829,26 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         } else {
-            sinfo = find_slot(ubatch, false);
+            // [EVALFLAG] put the cells back at their saved indices when all of them are free in this stream
+            bool use_layout = layout != nullptr && layout->size() == cell_count && layout_head <= cells.size();
+            for (uint32_t i = 0; use_layout && i < cell_count; ++i) {
+                const uint32_t idx = (*layout)[i];
+                use_layout = idx < cells.size() && cells.is_empty(idx) && (i == 0 || idx > (*layout)[i - 1]);
+            }
+
+            if (use_layout) {
+                sinfo = {};
+                sinfo.s0 = strm;
+                sinfo.s1 = strm;
+                sinfo.resize(1);
+                sinfo.strm[0] = strm;
+                sinfo.idxs[0] = *layout;
+            } else {
+                if (layout != nullptr) {
+                    LLAMA_LOG_WARN("%s: the saved cell layout does not fit this cache, the cells are placed anew\n", __func__);
+                }
+                sinfo = find_slot(ubatch, false);
+            }
             if (sinfo.empty()) {
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
                 return false;
@@ -4774,6 +4866,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // is what the whole-context path below already does.
         for (uint32_t i = 0; i < (uint32_t) exts.size(); ++i) {
             cells.ext_set(sinfo.idxs[0][i], exts[i]);
+        }
+
+        if (layout != nullptr && layout_head <= cells.size() && sinfo.idxs[0] == *layout) {
+            head = layout_head;
         }
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);

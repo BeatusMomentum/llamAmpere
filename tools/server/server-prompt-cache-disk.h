@@ -8,11 +8,11 @@
 // match is never restored. Several servers (different models, different KV settings) can share a directory:
 // foreign entries count toward the size limit and the FIFO order, but are never read.
 //
-// file layout (little-endian), version 2:
+// file layout (little-endian), version 3:
 //   magic "LCPC", u32 version, u64 key_hash, u32 key_len, char key[key_len],
 //   u64 n_tokens, i32 tokens[n_tokens], u64 payload_len, payload[payload_len], u64 checksum
 // payload:
-//   u64 main_len, bytes, u64 drft_len, bytes, u32 n_checkpoints, then per checkpoint:
+//   u64 main_len, bytes, u64 drft_len, bytes, u64 spec_len, bytes, u32 n_checkpoints, then per checkpoint:
 //   i64 n_tokens, i32 id_task, i32 pos_min, i32 pos_max, u64 len_tgt, bytes, u64 len_dft, bytes, u64 len_spec, bytes
 // checksum: word-wise FNV-1a over every byte before it
 //
@@ -41,6 +41,7 @@ struct server_prompt_disk_record {
     llama_tokens                        tokens;
     std::vector<uint8_t>                main;
     std::vector<uint8_t>                drft;
+    std::vector<uint8_t>                spec;
     std::list<common_prompt_checkpoint> checkpoints;
 };
 
@@ -110,7 +111,8 @@ struct server_prompt_disk_tier {
     bool write(const llama_tokens & tokens,
                const std::vector<uint8_t> & main,
                const std::vector<uint8_t> & drft,
-               const std::list<common_prompt_checkpoint> & checkpoints);
+               const std::list<common_prompt_checkpoint> & checkpoints,
+               const std::vector<uint8_t> & spec = {});
 
     // read a matching entry; a file that fails to parse or to verify is deleted
     bool read(std::list<server_prompt_disk_entry>::iterator it, server_prompt_disk_record & out);
