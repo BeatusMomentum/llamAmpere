@@ -3,6 +3,26 @@
 One new opt-in feature: **`--eval-cache DIR`**, a prompt cache on disk for prompts you send again and again, such as
 eval and benchmark prompts. Nothing changes unless you pass the flag.
 
+## Why it matters
+
+- **Long-context evals stop waiting on prefill.** Swift 1.5 (Qwen3.8 27B) on a ~102K-token prompt: 1.6-1.7 s to load
+  the saved prompt against 104.6-105.1 s to read it fresh, about **64x less prefill** (RTX 3090 Ti, 350 W). Time to
+  first answer goes from 105.7 s to 4.4 s.
+- **Hours back per run.** About 101 s saved per 100K prompt: a 100-prompt long-context eval saves about 2.8 hours per
+  pass, and every re-run (new settings, new seeds, a new sampler) saves it again. The folder is built once.
+- **Same answers.** At temperature 0 the text is byte-for-byte the same as a fresh prefill, so scores stay comparable
+  with runs that don't use the cache.
+- **Stacks with MTP and parallel slots.** The cache removes the wait before the answer; the MTP drafter speeds up the
+  answer itself. Approximate typical speed-up per 100K eval prompt, as arithmetic from measured parts (not one
+  end-to-end run): about **6-7x** for a 2,000-token answer with eval cache + MTP + `--parallel 2`, about 17x for a
+  500-token answer, about 3x for a 10,000-token reasoning answer. Parts: 105.1 s vs 1.65 s prefill; 91 tok/s
+  decode with MTP at 100K; MTP 2.19x and two slots 1.06x (with MTP) in a same-card A/B with tq5_0/turbo4 KV.
+- **Download instead of building.** Ready-made folders for AA-LCR, LongCodeQA 32K/64K/128K, MRCR, RULER 128K and
+  LongBench v2 (being completed) for Swift 1.5 IQ4_XS-M with SJ-KVaRN 4/4:
+  https://huggingface.co/datasets/jakeatx/llamampere-evalcache
+- **No SSD wear at eval time.** The server only reads the folder.
+- **Safe by default.** Opt-in; a folder that doesn't match the model or cache settings is refused at startup.
+
 ## What it does
 
 Before a model writes its first word, the server has to read the whole prompt. This step is called **prefill**. A
