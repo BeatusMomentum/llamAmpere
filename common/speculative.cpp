@@ -21,49 +21,10 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
-#include <numeric>
 #include <random>
 #include <mutex>
 #include <thread>
 #include <cinttypes>
-
-// [#47] host phase split of the MTP draft call (LLAMA_HOST_PHASES=1), see speculative.h
-bool common_speculative_host_phases_enabled() {
-    static const bool v = [] { const char * e = getenv("LLAMA_HOST_PHASES"); return e && atoi(e) != 0; }();
-    return v;
-}
-
-static std::mutex                     g_spec_host_phases_mtx;
-static common_speculative_host_phases g_spec_host_phases;
-
-common_speculative_host_phases common_speculative_host_phases_take() {
-    std::lock_guard<std::mutex> lock(g_spec_host_phases_mtx);
-    common_speculative_host_phases r = g_spec_host_phases;
-    g_spec_host_phases = {};
-    return r;
-}
-
-// one draft call: accumulates locally, adds to the process totals on destruction (rest = wall - the named parts)
-struct common_spec_host_phase_call {
-    const bool on = common_speculative_host_phases_enabled();
-    const int64_t t0 = on ? ggml_time_us() : 0;
-    common_speculative_host_phases acc;
-
-    ~common_spec_host_phase_call() {
-        if (!on) {
-            return;
-        }
-        const uint64_t wall  = (uint64_t) (ggml_time_us() - t0);
-        const uint64_t named = acc.decode_us + acc.sync_us + acc.sample_us;
-        std::lock_guard<std::mutex> lock(g_spec_host_phases_mtx);
-        g_spec_host_phases.n_calls   += 1;
-        g_spec_host_phases.n_steps   += acc.n_steps;
-        g_spec_host_phases.decode_us += acc.decode_us;
-        g_spec_host_phases.sync_us   += acc.sync_us;
-        g_spec_host_phases.sample_us += acc.sample_us;
-        g_spec_host_phases.rest_us   += wall > named ? wall - named : 0;
-    }
-};
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1466,9 +1427,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // [#69] sampled chain (LLAMA_SPEC_CHAIN_SAMPLED=1 with the chain graph and exact p/q): the chain draws each
     // step in-graph against uniforms drawn here, the host re-derives every step and cuts at the first
-    // disagreement. LLAMA_SPEC_CHAIN_CHECK=1 replays each sampled round serially and counts token identity.
+    // disagreement.
     bool chain_sampled = false;
-    bool chain_check   = false;
     std::vector<std::mt19937_64> chain_rng;
     std::vector<uint8_t>         chain_rng_seeded;
     std::vector<float>           chain_u;
@@ -1477,8 +1437,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         uint64_t steps     = 0; // draft tokens taken from them
         uint64_t cut       = 0; // rounds cut where the GPU draw disagreed with the host
         uint64_t bad       = 0; // rounds stopped on a malformed row
-        uint64_t chk_steps = 0; // LLAMA_SPEC_CHAIN_CHECK: replayed steps
-        uint64_t chk_same  = 0; //   ... whose serial draw equalled the chain's token
     } chain_st;
     struct {
         std::vector<llama_token>  tok;
@@ -1610,11 +1568,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     chain_sampled = true;
                     chain_rng.resize(n_seq);
                     chain_rng_seeded.assign(n_seq, 0);
-                    const char * env_c = getenv("LLAMA_SPEC_CHAIN_CHECK");
-                    chain_check = env_c != nullptr && std::strcmp(env_c, "0") != 0;
                     SPC_INF("sampled draft chain enabled (LLAMA_SPEC_CHAIN_SAMPLED): steps draw in-graph over top_k <= %d, "
-                            "the host re-derives each step%s\n", LLAMA_MTP_CHAIN_TOP_K_MAX,
-                            chain_check ? "; LLAMA_SPEC_CHAIN_CHECK replays every round serially" : "");
+                            "the host re-derives each step\n", LLAMA_MTP_CHAIN_TOP_K_MAX);
                 } else {
                     SPC_WRN("%s", "LLAMA_SPEC_CHAIN_SAMPLED needs exact p/q drafting (LLAMA_SPEC_PQ=0 is set); the chain stays argmax\n");
                 }
@@ -2254,75 +2209,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void chain_log_stats() const {
-        SPC_INF("sampled chain: %llu rounds, %llu draft tokens, %llu cut on a GPU/host disagreement, %llu malformed%s\n",
+        SPC_INF("sampled chain: %llu rounds, %llu draft tokens, %llu cut on a GPU/host disagreement, %llu malformed\n",
                 (unsigned long long) chain_st.rounds, (unsigned long long) chain_st.steps,
-                (unsigned long long) chain_st.cut, (unsigned long long) chain_st.bad,
-                chain_check ? string_format("; serial replay identical %llu/%llu",
-                        (unsigned long long) chain_st.chk_same, (unsigned long long) chain_st.chk_steps).c_str() : "");
-    }
-
-    // [#69] identity gate (LLAMA_SPEC_CHAIN_CHECK=1): replay the round's chain tokens as serial draft decodes over the
-    // full head (the leading LLAMA_SPEC_CHAIN_SUB rows, as the chain graph uses), re-derive each step from the serial
-    // logits with the same uniform, and count the steps whose token equals the chain's. Like-for-like only without a
-    // draft vocabulary map. Leaves the serial rows in the draft KV; the server trims the draft region after verify.
-    void chain_check_replay(llama_seq_id seq, const common_speculative_draft_params & dp, int32_t k, float temp, float top_p, float min_p) {
-        auto * ctx_dft = params.ctx_dft;
-        const auto & result = *dp.result;
-        if (result.empty() || !llama_memory_seq_rm(llama_get_memory(ctx_dft), seq, dp.pos0, -1)) {
-            return;
-        }
-
-        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-        static const int64_t n_sub = [] {
-            const char * env = getenv("LLAMA_SPEC_CHAIN_SUB");
-            return env != nullptr ? atoll(env) : 32768;
-        }();
-        const int32_t n_cand = n_sub > 0 && n_sub < n_vocab ? (int32_t) n_sub : n_vocab;
-        const size_t  row_bytes = (size_t) n_embd * sizeof(float);
-
-        std::vector<float>   h(pending_h[seq]);
-        std::vector<float>   row(LLAMA_MTP_CHAIN_ROW(k));
-        std::vector<int32_t> idx(n_cand);
-        std::vector<llama_token_data> q;
-
-        for (size_t j = 0; j < result.size(); ++j) {
-            common_batch_clear(batch);
-            common_batch_add(batch, j == 0 ? dp.id_last : result[j - 1], dp.pos0 + (llama_pos) j, { seq }, true);
-            std::memcpy(batch.embd, h.data(), row_bytes);
-            if (llama_decode(ctx_dft, batch) != 0) {
-                SPC_WRN("%s", "chain check: serial replay decode failed\n");
-                return;
-            }
-            const float * lg = llama_get_logits_ith(ctx_dft, 0);
-
-            // top-k by logit, ties to the lower id
-            std::iota(idx.begin(), idx.end(), 0);
-            std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int32_t a, int32_t b) {
-                return lg[a] > lg[b] || (lg[a] == lg[b] && a < b);
-            });
-            for (int32_t i = 0; i < k; ++i) {
-                row[2 + i]     = (float) idx[i];
-                row[2 + k + i] = lg[idx[i]];
-            }
-
-            const int32_t pick = llama_mtp_chain_rederive(row.data(), k, temp, top_p, min_p, (double) chain_u[j], n_vocab, q);
-            const llama_token id = pick >= 0 ? (llama_token) row[2 + pick] : LLAMA_TOKEN_NULL;
-            chain_st.chk_steps++;
-            if (id == result[j]) {
-                chain_st.chk_same++;
-            } else {
-                SPC_WRN("chain check: seq %d step %zu: the chain drew %d, the serial replay drew %d\n", (int) seq, j, result[j], id);
-            }
-
-            const float * hn = llama_get_embeddings_nextn_ith(ctx_dft, 0);
-            h.assign(hn, hn + n_embd);
-        }
+                (unsigned long long) chain_st.cut, (unsigned long long) chain_st.bad);
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
-
-        common_spec_host_phase_call hp; // [#47]
 
         common_batch_clear(batch);
 
@@ -2507,9 +2400,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         }
                     }
 
-                    if (chain_check) {
-                        chain_check_replay(seq_one, dp, s_k, s_temp, s_top_p, s_min_p);
-                    }
                     if ((chain_st.rounds & 1023) == 0) {
                         chain_log_stats();
                     }
@@ -2639,19 +2529,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            const int64_t t_dec0 = hp.on ? ggml_time_us() : 0;
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
-            }
-            if (hp.on) {
-                const int64_t t_dec1 = ggml_time_us();
-                llama_synchronize(ctx_dft); // [#47] separates the GPU wait from host sampling; the sampler syncs anyway
-                const int64_t t_dec2 = ggml_time_us();
-                hp.acc.decode_us += t_dec1 - t_dec0;
-                hp.acc.sync_us   += t_dec2 - t_dec1;
-                hp.acc.n_steps   += 1;
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
@@ -2673,11 +2554,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = pq ? pq_sampler(seq_id, *dp.sampling) : smpls[seq_id].get();
 
-                const int64_t t_smp0 = hp.on ? ggml_time_us() : 0;
                 llama_token id = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                if (hp.on) {
-                    hp.acc.sample_us += ggml_time_us() - t_smp0;
-                }
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 if (pq && llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]) != LLAMA_TOKEN_NULL) {
@@ -2712,13 +2589,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                {
-                    const int64_t t_acc0 = hp.on ? ggml_time_us() : 0;
-                    common_sampler_accept(smpl, id, true);
-                    if (hp.on) {
-                        hp.acc.sample_us += ggml_time_us() - t_acc0;
-                    }
-                }
+                common_sampler_accept(smpl, id, true);
 
                 if (dp.result_q) {
                     if (pq) {

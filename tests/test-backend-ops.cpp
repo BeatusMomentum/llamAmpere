@@ -19,7 +19,6 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
-#include "ggml-ledger.h"
 
 #include <algorithm>
 #include <atomic>
@@ -52,8 +51,8 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-// GGML_TBO_SEED=<n>: deterministic tensor data per test case (seeded from the case's vars() and the init order), so
-// two binaries or two routing switches can be compared output-for-output (GGML_TBO_DUMP_DIR writes backend1 outputs).
+// GGML_TBO_SEED=<n>: deterministic tensor data per test case (seeded from the case's vars() and the init order), so a
+// failing case reproduces with the same inputs on every run.
 static thread_local uint64_t g_tbo_case_seed    = 0;
 static thread_local uint64_t g_tbo_case_counter = 0;
 static bool tbo_seeded() {
@@ -1608,37 +1607,7 @@ struct test_case {
                 }
             }
 
-            if (t1->op == GGML_OP_FLASH_ATTN_EXT && getenv("GGML_TEST_DUMP_HASH")) {
-                // raw backend1 output bytes (FNV-1a 64) for bit-identity checks between two builds
-                std::vector<uint8_t> raw(ggml_nbytes(t1));
-                ggml_backend_tensor_get(t1, raw.data(), 0, raw.size());
-                uint64_t h = 1469598103934665603ULL;
-                for (const uint8_t b : raw) { h = (h ^ b) * 1099511628211ULL; }
-                printf("TBOHASH\t%s\t%s\t%016" PRIx64 "\n", ggml_op_desc(t1), ud->tc->vars().c_str(), h);
-            }
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
-            if (const char * dir = getenv("GGML_TBO_DUMP_DIR"); dir != nullptr && t1->op == GGML_OP_FLASH_ATTN_EXT) {
-                // backend1 output as raw f32, named by the case vars hash; TBOOUT line maps hash -> vars
-                const std::string v = ud->tc->vars();
-                const uint64_t vh = tbo_fnv1a(v.data(), v.size());
-                const uint64_t oh = tbo_fnv1a(f1.data(), f1.size()*sizeof(float));
-                char path[1024];
-                snprintf(path, sizeof(path), "%s/%016llx.f32", dir, (unsigned long long) vh);
-                if (FILE * fo = fopen(path, "wb")) {
-                    fwrite(f1.data(), sizeof(float), f1.size(), fo);
-                    fclose(fo);
-                }
-                printf("TBOOUT\t%016llx\t%016llx\t%s\n", (unsigned long long) vh, (unsigned long long) oh, v.c_str());
-            }
-            if (getenv("GGML_TBO_DUMP_ERR")) {
-                // machine-parseable: op, shape vars, error vs the CPU reference
-                printf("TBOERR\t%s\t%s\t%.12g\n", ggml_op_desc(t1), ud->tc->vars().c_str(), err);
-            }
-            static const bool print_nmse = getenv("GGML_TEST_BACKEND_PRINT_NMSE") != nullptr;
-            if (print_nmse && t1->op == GGML_OP_FLASH_ATTN_EXT) {
-                std::lock_guard<std::mutex> guard(g_test_output_mutex);
-                printf("[FLASH_ATTN_EXT] NMSE=%.12g (%s)\n", err, ud->tc->vars().c_str());
-            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -1688,37 +1657,6 @@ struct test_case {
             }
         }
 
-        const bool check_replay = replay && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend1))), "CUDA") == 0;
-        const auto graph_replays = [] {
-            int64_t total = 0;
-            ggml_ledger_foreach([](const char * site, const char * key, int64_t count, void * data) {
-                if (strcmp(site, "cuda.graph") == 0 && (strcmp(key, "replay") == 0 || strncmp(key, "replay ", 7) == 0)) {
-                    *static_cast<int64_t *>(data) += count;
-                }
-            }, &total);
-            return total;
-        };
-        const int64_t replay_before = check_replay ? graph_replays() : 0;
-        const auto attention_routes = [] {
-            std::array<int64_t, 6> counts = {};
-            ggml_ledger_foreach([](const char * site, const char * key, int64_t count, void * data) {
-                auto & routes = *static_cast<std::array<int64_t, 6> *>(data);
-                if (strcmp(site, "cuda.fattn.early_v") == 0) {
-                    routes[0] += count;
-                } else if (strcmp(site, "cuda.fattn") == 0 && strncmp(key, "path=q5g6_compact32 ", 20) == 0) {
-                    routes[1] += count;
-                } else if (strcmp(site, "cuda.fattn.fixup") == 0) {
-                    routes[2] += strcmp(key, "q5g6_uniform") == 0 ? count : 0;
-                    routes[3] += strcmp(key, "q5g6_general") == 0 ? count : 0;
-                } else if (strcmp(site, "cuda.fattn") == 0 && strncmp(key, "path=slowkv_wide88 ", 19) == 0) {
-                    routes[4] += count; // GGML_SLOWKV turbo4/tq6_0 widths 5-8 on the fused (8,8) tile
-                } else if (strcmp(site, "cuda.fattn") == 0 && strncmp(key, "path=slowkv_q5_1 ", 17) == 0) {
-                    routes[5] += count; // GGML_SLOWKV q8_0 K / q5_1 V on the fused tiles
-                }
-            }, &counts);
-            return counts;
-        };
-        const auto routes_before = check_replay ? attention_routes() : std::array<int64_t, 6>{};
         bool cmp_ok = true;
         for (int round = 0; round < (replay ? 4 : 1); ++round) {
             // Keep graph shapes and pointers fixed while changing inputs between replays.
@@ -1729,17 +1667,6 @@ struct test_case {
                                                         run_whole_graph() || replay ? fused_nodes_to_verify.data() : nullptr,
                                                         fused_nodes_to_verify.size()) && cmp_ok;
         }
-        if (check_replay) {
-            const int64_t count = graph_replays() - replay_before;
-            const auto routes_after = attention_routes();
-            printf("[FLASH_ATTN_EXT] REPLAY=%" PRId64 " (%s)\n", count, vars().c_str());
-            printf("[FLASH_ATTN_EXT] ROUTES=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 " (%s)\n",
-                   routes_after[0] - routes_before[0], routes_after[1] - routes_before[1],
-                   routes_after[2] - routes_before[2], routes_after[3] - routes_before[3],
-                   routes_after[4] - routes_before[4], routes_after[5] - routes_before[5], vars().c_str());
-            cmp_ok = count >= 2 && cmp_ok;
-        }
-
         bool        fusion_ok = true;
         std::string fusion_err;
         if (fusion_count != nullptr && fusion != nullptr) {
@@ -6412,16 +6339,14 @@ struct test_exl3_ffn : public test_case {
     bool run_whole_graph() override { return true; }
 
     // mirrors the CUDA gates: ggml_cuda_exl3_ffn_bridge_enabled, ggml_cuda_exl3_gemv_supported (T <= 16),
-    // exl3_gemv_fused_enabled and exl3_envelope_enabled (either one makes the bridge decline)
+    // exl3_gemv_fused_enabled (which makes the bridge decline)
     static bool bridge_env_on() {
         const char * br  = getenv("GGML_CUDA_EXL3_FFN_BRIDGE");
         const char * gv  = getenv("GGML_CUDA_EXL3_GEMV");
         const char * fu  = getenv("GGML_CUDA_EXL3_FUSED");
-        const char * env = getenv("GGML_CUDA_EXL3_ENVELOPE");
         return (br == nullptr || atoi(br) != 0) &&
                (gv == nullptr || strcmp(gv, "0") != 0) &&
-               !(fu != nullptr && strcmp(fu, "1") == 0) &&
-               !(env != nullptr && env[0] != '\0' && env[0] != '0');
+               !(fu != nullptr && strcmp(fu, "1") == 0);
     }
     const char * required_fusion() override { return T <= 16 && bridge_env_on() ? "exl3_ffn_bridge" : nullptr; }
     const char * forbidden_fusion() override { return T > 16 ? "exl3_ffn_bridge" : nullptr; }
@@ -12914,42 +12839,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
-    // Opt-in target-shape microbenchmarks for the Qwen3.8 SM86 narrow-N work.
-    // Kept out of the normal suite because the large matrices make CPU
-    // correctness comparison and the default performance sweep expensive.
-    if (getenv("GGML_W58_BS") != nullptr) {
-        for (int64_t n : {5, 6, 7, 8, 9, 10, 12, 16}) {
-            for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
-                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
-            }
-        }
-    }
-
-    if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-            for (int64_t n : {3, 4, 5}) {
-                for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 7>{{
-                        {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
-                        {6144, 5120}, {12288, 5120}, {1024, 5120}}}) {
-                    test_cases.emplace_back(new test_mul_mat(
-                        type_a, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
-                }
-            }
-        }
-        // ATX-4-XS body shapes (all IQ4_XS): decode widths 1..5.
-        for (int64_t n : {1, 2, 3, 4, 5}) {
-            for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 6>{{
-                    {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
-                    {6144, 5120}, {12288, 5120}}}) {
-                test_cases.emplace_back(new test_mul_mat(
-                    GGML_TYPE_IQ4_XS, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
-            }
-        }
-    }
-
-    // Opt-in reuse-kernel correctness (GGML_QWEN38_REUSE_TEST=1). Separate from the MMVQ_BENCH
-    // gate because those shapes are large enough that the CPU reference dominates; these are
-    // small and are the only cases in the suite that reach ncols_dst 2..5 for these types.
+    // Opt-in reuse-kernel correctness (GGML_QWEN38_REUSE_TEST=1): small shapes keep the CPU
+    // reference cheap, and these are the only cases in the suite that reach ncols_dst 2..5 for these types.
     if (getenv("GGML_QWEN38_REUSE_TEST") != nullptr) {
         // QC2/QC3 reuse-kernel correctness. The cross-column reuse kernels only run at
         // ncols_dst 2..5, and the default MUL_MAT list never reaches that range for these
@@ -14254,8 +14145,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the switch they cover the f16 MMA prefill route. Production head dims 256 (Qwen3.8, GQA 6) and 128, the production
     // KV pairs, causal / random / no mask, permuted Q, a partial query tile (200), a single KV head and large logits
     // (q_range 20: peaked softmax, online rescaling). F16/F16 checks the fallback (f16 caches keep the f16 route).
-    // GGML_FATTN_PATH_STATS=1 shows the route taken; GGML_CUDA_PREFILL_KV_MIB=1 sends the D 256 cases through the
-    // bounded per-KV-head-group branch (first > 0).
+    // GGML_CUDA_PREFILL_KV_MIB=1 sends the D 256 cases through the bounded per-KV-head-group branch (first > 0).
     for (const auto & types : {std::pair{GGML_TYPE_F16,      GGML_TYPE_F16},      std::pair{GGML_TYPE_Q8_0,  GGML_TYPE_Q8_0},
                                std::pair{GGML_TYPE_TQ5_0,    GGML_TYPE_TURBO4_0}, std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0},
                                std::pair{GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0}, std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0},
@@ -15253,71 +15143,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    if (getenv("GGML_W58_BS") != nullptr) {
-        for (int64_t n : {5, 6, 7, 8, 9, 10, 12, 16}) {
-            for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
-                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
-            }
-        }
-    }
-
-    // [#41 EXL3W] EXL3 verify widths at the Qwen3.8-27B projection shapes (m = N out, k = K in), with the suh/svh glue,
-    // next to IQ4_XS on its default path at the same shapes: ffn_gate/up, ffn_down, GDN attn_qkv / attn_gate / ssm_out
-    // (= attn_output), attn_q (+gate), attn_k/v; widths 1..8, plus the output head (exl3_6 vs q6_K)
-    if (getenv("GGML_EXL3W_BENCH") != nullptr) {
-        const std::array<std::array<int64_t, 2>, 7> shapes = {{
-            {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {12288, 5120}, {1024, 5120}}};
-        for (int64_t n = 1; n <= 8; ++n) {
-            for (const auto & mk : shapes) {
-                test_cases.emplace_back(new test_mul_mat_exl3(GGML_TYPE_EXL3_4, mk[0], n, mk[1], true));
-            }
-            test_cases.emplace_back(new test_mul_mat_exl3(GGML_TYPE_EXL3_6, 248320, n, 5120, true));
-            for (const auto & mk : shapes) {
-                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
-            }
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
-        }
-    }
-
-    if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-            for (int64_t n : {3, 4, 5}) {
-                for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 7>{{
-                        {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
-                        {6144, 5120}, {12288, 5120}, {1024, 5120}}}) {
-                    test_cases.emplace_back(new test_mul_mat(
-                        type_a, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
-                }
-            }
-        }
-        // ATX-4-XS body shapes (all IQ4_XS): decode widths 1..5.
-        for (int64_t n : {1, 2, 3, 4, 5}) {
-            for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 6>{{
-                    {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
-                    {6144, 5120}, {12288, 5120}}}) {
-                test_cases.emplace_back(new test_mul_mat(
-                    GGML_TYPE_IQ4_XS, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
-            }
-        }
-        // QC2/QC3: the two types in ATX-4-XS with no cross-column reuse kernel, at the shapes they
-        // actually occupy in the file, decode widths 1..5. Q5_0 carries ffn_down/up/gate, ssm_out,
-        // attn_output, attn_q, eh_proj and attn_gate; Q6_K carries the output head and attn_k/attn_v.
-        for (int64_t n : {1, 2, 3, 4, 5}) {
-            for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 8>{{
-                    {17408, 5120}, {5120, 17408}, {6144, 5120}, {5120, 6144},
-                    {10240, 5120}, {12288, 5120}, {5120, 12288}, {1024, 5120}}}) {
-                test_cases.emplace_back(new test_mul_mat(
-                    GGML_TYPE_Q5_0, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
-            }
-            // Q6_K: attn_k / attn_v projections, then the output head at every decode width
-            // (the ungated head case below is n=1 only, which is the drafter's read, not the verify read).
-            test_cases.emplace_back(new test_mul_mat(
-                GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
-            test_cases.emplace_back(new test_mul_mat(
-                GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
-        }
-    }
-
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
@@ -16270,11 +16095,8 @@ int main(int argc, char ** argv) {
     }
 
     if (getenv("GGML_TEST_BACKEND_REPLAY") != nullptr) {
-        // Per-case replay counters are global, so do not share them between test workers.
+        // replay cases run one at a time
         parallel_workers = 1;
-        ggml_ledger_set_enabled(true);
-    } else if (getenv("GGML_TEST_BACKEND_LEDGER") != nullptr) {
-        ggml_ledger_set_enabled(true);
     }
 
     // load and enumerate backends
