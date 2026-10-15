@@ -225,13 +225,30 @@ static void test_index_version(const std::string & root) {
         server_eval_cache ec;
         CHECK(ec.open(dir, KEY_A, true, err));
     }
+    server_eval_cache ec;
+    for (int version : {1, 99}) {
+        {
+            std::ofstream f(dir + "/eval-cache.json", std::ios::trunc);
+            f << "{\"format\": \"llamampere-eval-cache\", \"format_version\": " << version << ", \"key\": \"" << KEY_A << "\", \"entries\": []}\n";
+        }
+        CHECK(ec.open(dir, KEY_A, false, err));
+        CHECK(err.empty());
+        CHECK(!ec.enabled());
+        CHECK(!ec.writable);
+        CHECK(ec.entries.empty());
+        CHECK(ec.find(seq(1, 100), 0) == -1);
+        std::string id;
+        CHECK(!ec.add(seq(1, 100), {}, {}, false, id, err));
+        CHECK(!ec.open(dir, KEY_A, true, err));
+        CHECK(err.find("version " + std::to_string(version)) != std::string::npos);
+        CHECK(!ec.enabled());
+    }
+
     {
         std::ofstream f(dir + "/eval-cache.json", std::ios::trunc);
-        f << "{\"format\": \"llamampere-eval-cache\", \"format_version\": 99, \"key\": \"" << KEY_A << "\", \"entries\": []}\n";
+        f << "{\"format\": \"another-cache\", \"format_version\": 1}\n";
     }
-    server_eval_cache ec;
     CHECK(!ec.open(dir, KEY_A, false, err));
-    CHECK(err.find("version 99") != std::string::npos);
 
     {
         std::ofstream f(dir + "/eval-cache.json", std::ios::trunc);

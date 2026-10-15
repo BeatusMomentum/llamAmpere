@@ -59,7 +59,7 @@ struct server_eval_cache {
     size_t n_skipped = 0; // entries ignored at open (bad header, key mismatch)
 
     // open the folder. Read-only mode requires an existing index whose key equals `key`; build mode creates the
-    // folder and index when missing and still refuses a folder built for another key. `err` says why on failure.
+    // folder and index when missing and still refuses a folder built for another key. An unsupported version disables the read-only cache with a warning; build mode refuses it. `err` says why on failure.
     bool open(const std::string & dir, const std::string & key, bool writable, std::string & err);
 
     bool enabled() const { return !dir.empty(); }

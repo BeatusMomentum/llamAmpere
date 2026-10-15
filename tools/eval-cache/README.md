@@ -70,7 +70,15 @@ eval cache: refusing to start: ./evc-mybench was built for another model or KV c
 (this server has 'ctk=q8_0', the folder was built with 'ctk=tq5_0'); ...
 ```
 
-Folders written with cache format 1 must be rebuilt. Format 2 also saves the MTP carry row, deferred catch-up rows and adaptive-depth state. The adaptive depth range and chain settings must match when building and loading a folder.
+Folders written with cache format 1 must be rebuilt to reuse their state. Read-only mode warns, skips an unsupported cache version and serves with fresh prefill without changing the folder. Build mode refuses an incompatible folder; build into a new folder instead. Format 2 also saves the MTP carry row, deferred catch-up rows and adaptive-depth state. The adaptive depth range and chain settings must match when building and loading a folder.
+
+The CPU HTTP compatibility regression uses a generated model and a CPU-only server build:
+
+```sh
+build-cpu/bin/test-mtp-state --save-model /tmp/eval-cache-fixture.gguf
+LLAMA_SERVER_BIN_PATH="$PWD/build-cpu/bin/llama-server" LLAMA_TEST_MTP_MODEL_FILE=/tmp/eval-cache-fixture.gguf \
+    python3 tools/eval-cache/test_eval_cache.py -v
+```
 
 Not part of the key, so free to change: `--ctx-size`, `--parallel`, `--kv-unified`, the number of GPU layers, threads, sampling.
 

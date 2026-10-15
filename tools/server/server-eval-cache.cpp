@@ -301,6 +301,11 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
     if (j.value("format", std::string()) != "llamampere-eval-cache" || ver != EVAL_CACHE_FORMAT_VERSION) {
         err = index + string_format(" has format version %d, this server reads version %d; rebuild the folder", ver, EVAL_CACHE_FORMAT_VERSION);
         dir.clear();
+        if (!writable && j.value("format", std::string()) == "llamampere-eval-cache" && ver != EVAL_CACHE_FORMAT_VERSION) {
+            LOG_WRN("eval cache: %s; skipping read-only cache, using fresh prefill\n", err.c_str());
+            err.clear();
+            return true;
+        }
         return false;
     }
 
