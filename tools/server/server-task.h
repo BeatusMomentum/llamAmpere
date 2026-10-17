@@ -622,9 +622,13 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // scale of each --lora adapter when this KV state was computed
+    std::vector<float> lora_scales;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        lora_scales.clear();
     }
 
     int n_tokens() const {
@@ -635,6 +639,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            lora_scales,
         };
     }
 };
