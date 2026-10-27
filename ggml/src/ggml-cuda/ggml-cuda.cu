@@ -11933,6 +11933,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "frows") == 0) {
         return ggml_cuda_frows_count;
     }
+    if (strcmp(name, "frows_bf16_f32_order") == 0) {
+        return ggml_cuda_frows_bf16_f32_order_count;
+    }
     if (strcmp(name, "kqrows") == 0) {
         extern int64_t ggml_cuda_kqrows_count; // mmvq-kqrows.cu
         return ggml_cuda_kqrows_count;

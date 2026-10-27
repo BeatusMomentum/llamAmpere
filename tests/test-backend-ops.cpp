@@ -7403,7 +7403,80 @@ struct test_mul_mat_frows : public test_mul_mat {
     }
 };
 
+// Compare the same exactly representable weights through both GPU storage types.
+// CPU agreement alone cannot establish identical GPU reduction order.
+struct test_frows_bf16_f32_order : public test_case {
+    int64_t m, n, k;
+    bool request_f32;
+    ggml_tensor * bf16_result = nullptr;
+    ggml_tensor * f32_result = nullptr;
+
+    test_frows_bf16_f32_order(int64_t m, int64_t n, int64_t k, bool request_f32)
+        : m(m), n(n), k(k), request_f32(request_f32) {}
+
+    std::string vars() override {
+        return "m=" + std::to_string(m) + ",n=" + std::to_string(n) + ",k=" + std::to_string(k) +
+               ",frows_bf16_f32_order=1,prec=" + (request_f32 ? "f32" : "default");
+    }
+
+    static bool enabled() {
+        const char * e = getenv("GGML_CUDA_FROWS_BF16_F32_ORDER");
+        return e != nullptr && atoi(e) != 0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, k, m);
+        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        f32_result = ggml_mul_mat(ctx, ggml_cast(ctx, weights, GGML_TYPE_F32), input);
+        bf16_result = ggml_mul_mat(ctx, weights, input);
+        ggml_mul_mat_set_prec(f32_result, GGML_PREC_F32);
+        if (request_f32) {
+            ggml_mul_mat_set_prec(bf16_result, GGML_PREC_F32);
+        }
+        ggml_set_output(f32_result);
+        ggml_set_output(bf16_result);
+        ggml_build_forward_expand(gf, f32_result);
+        return bf16_result;
+    }
+
+    bool run_whole_graph() override { return true; }
+    int graph_replays() override { return 2; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { f32_result, bf16_result }; }
+    const char * required_fusion() override {
+        return enabled() && request_f32 ? "frows_bf16_f32_order" : "frows";
+    }
+    const char * forbidden_fusion() override {
+        return enabled() && request_f32 ? nullptr : "frows_bf16_f32_order";
+    }
+    bool verify_backend_result(ggml_backend_t backend) override {
+        if (!enabled() || !request_f32) {
+            return true;
+        }
+        auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count")) {
+            return true;
+        }
+        std::vector<uint32_t> a(ggml_nelements(f32_result)), b(a.size());
+        ggml_backend_tensor_get(f32_result, a.data(), 0, a.size()*sizeof(uint32_t));
+        ggml_backend_tensor_get(bf16_result, b.data(), 0, b.size()*sizeof(uint32_t));
+        if (a != b) {
+            fprintf(stderr, "FROWS BF16/F32 GPU output bytes differ\n");
+            return false;
+        }
+        return true;
+    }
+};
+
 static void add_frows_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (!perf && getenv("GGML_TEST_FROWS_BF16_F32_ORDER") != nullptr) {
+        for (const auto & mk : { std::pair<int64_t, int64_t>{512, 2560}, {513, 2560}, {100, 264}, {7, 8} }) {
+            for (int64_t n = 2; n <= 8; ++n) {
+                for (bool precise : { false, true }) {
+                    cases.emplace_back(new test_frows_bf16_f32_order(mk.first, n, mk.second, precise));
+                }
+            }
+        }
+    }
     if (getenv("GGML_TEST_FROWS") == nullptr) {
         return;
     }
