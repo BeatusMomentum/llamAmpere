@@ -7414,6 +7414,9 @@ struct test_frows_bf16_f32_order : public test_case {
     test_frows_bf16_f32_order(int64_t m, int64_t n, int64_t k, bool request_f32)
         : m(m), n(n), k(k), request_f32(request_f32) {}
 
+    // The CPU BF16 dot product also rounds activations, as in test_mul_mat.
+    double max_nmse_err() override { return 5e-4; }
+
     std::string vars() override {
         return "m=" + std::to_string(m) + ",n=" + std::to_string(n) + ",k=" + std::to_string(k) +
                ",frows_bf16_f32_order=1,prec=" + (request_f32 ? "f32" : "default");
