@@ -2370,7 +2370,14 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
             ggml_backend_dev_memory(dev, &free, &total);
             const size_t card_limit = (size_t) 23552 << 20;
             const size_t headroom = std::max<size_t>(256u << 20, total > card_limit ? total - card_limit + (64u << 20) : 0);
-            const size_t need = required[i] + headroom;
+            size_t handoff_growth = 0;
+            if (mtp_hidden.ring && ubatch_rows_cb && dev == model.dev_output()) {
+                // Handoff storage is allocated after this reserve, outside the compute graph.
+                const size_t handoff_bytes = GGML_PAD(((size_t) n_tokens + 1) * model.hparams.n_embd_out() * sizeof(float), 2u << 20);
+                const size_t current_bytes = mtp_hidden.buf ? ggml_backend_buffer_get_size(mtp_hidden.buf.get()) : 0;
+                handoff_growth = handoff_bytes > current_bytes ? handoff_bytes - current_bytes : 0;
+            }
+            const size_t need = required[i] + handoff_growth + headroom;
             trim += need > free ? need - free : 0;
         }
         if (trim > 0) {
