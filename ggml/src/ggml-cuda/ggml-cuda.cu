@@ -8840,6 +8840,79 @@ static int ggml_cuda_try_moe_combine(ggml_backend_cuda_context & ctx, ggml_cgrap
     return m.add_idx - i;
 }
 
+// [GATEDNORM] RMS_NORM(x) -> MUL(weight) -> UNARY SIGMOID(gate) -> MUL as one kernel (the GDN output norm of Flash-Next:
+// build_norm_gated). Bit-identical to the four ops (see rms_norm_rows_f32). GGML_CUDA_NO_GATED_NORM_FUSE=1 turns it
+// off; GGML_CUDA_GATED_NORM_CHECK=1 also runs the four ops and traps on any bit difference.
+// returns the number of nodes to skip after node i, or -1
+static int ggml_cuda_try_gated_norm(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_NO_GATED_NORM_FUSE"); return e && atoi(e) != 0; }();
+    if (off || i + 3 >= cgraph->n_nodes || !ctx.stream_context().concurrent_events.empty()) {
+        return -1;
+    }
+    ggml_tensor * norm = cgraph->nodes[i];
+    ggml_tensor * mul  = cgraph->nodes[i + 1];
+    ggml_tensor * sig  = cgraph->nodes[i + 2];
+    ggml_tensor * out  = cgraph->nodes[i + 3];
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || sig->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || out->op != GGML_OP_MUL) {
+        return -1;
+    }
+    const ggml_tensor * x    = norm->src[0];
+    const ggml_tensor * w    = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * gate = sig->src[0];
+    if ((mul->src[0] != norm && mul->src[1] != norm) ||
+            !((out->src[0] == mul && out->src[1] == sig) || (out->src[0] == sig && out->src[1] == mul))) {
+        return -1;
+    }
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+            sig->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
+            x->nb[0] != sizeof(float) || gate->nb[0] != sizeof(float) || !ggml_is_contiguous(w) ||
+            w->ne[0] != x->ne[0] || ggml_nrows(w) != 1 || !ggml_are_same_shape(x, gate) ||
+            !ggml_are_same_shape(x, mul) || !ggml_are_same_shape(x, out) || !ggml_is_contiguous(out) ||
+            !ggml_is_contiguous(sig) || !ggml_cuda_rms_norm_mul_gate_supported(norm)) {
+        return -1;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 })) {
+        return -1;
+    }
+    const auto local = [&](const ggml_tensor * t) {
+        return t->buffer && ggml_backend_buffer_is_cuda(t->buffer) &&
+            static_cast<ggml_backend_cuda_buffer_context *>(t->buffer->context)->device == ctx.device;
+    };
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * ap = (const char *) a->data, * bp = (const char *) b->data;
+        return ap < bp + ggml_nbytes(b) && bp < ap + ggml_nbytes(a);
+    };
+    // each output element is written by the lane that read x and gate at that element; anything else must not overlap
+    const auto alias_ok = [&](const ggml_tensor * src) {
+        return !overlaps(out, src) || (out->data == src->data && ggml_is_contiguous(src));
+    };
+    if (!local(x) || !local(w) || !local(gate) || !local(out) || overlaps(out, w) || !alias_ok(x) || !alias_ok(gate)) {
+        return -1;
+    }
+
+    static const bool check = [] { const char * e = getenv("GGML_CUDA_GATED_NORM_CHECK"); return e && atoi(e) != 0; }();
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: gated RMS norm fusion on (%s)\n", __func__, check ? "bit check" : "no check");
+    }
+    if (!check) {
+        ggml_cuda_op_rms_norm_mul_gate(ctx, norm, w, gate, (float *) out->data);
+        return 3;
+    }
+    // the fused kernel into a copy first (the unfused ops may write over x or gate in place), then the four ops
+    ggml_cuda_pool_alloc<float> ref(ctx.pool(), ggml_nelements(out));
+    ggml_cuda_op_rms_norm_mul_gate(ctx, norm, w, gate, ref.get());
+    for (int k = 0; k < 4; ++k) {
+        GGML_ASSERT(ggml_cuda_compute_forward(ctx, cgraph->nodes[i + k]));
+    }
+    const int64_t n = ggml_nelements(out);
+    moe_combine_check<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const float *) out->data, ref.get(), n);
+    CUDA_CHECK(cudaGetLastError());
+    return 3;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -8886,6 +8959,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_hpd = ggml_cuda_try_fuse_hc_post_down(*cuda_ctx, cgraph, i);
         if (n_hpd >= 0) {
             return n_hpd;
+        }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_gn = ggml_cuda_try_gated_norm(*cuda_ctx, cgraph, i);
+        if (n_gn >= 0) {
+            return n_gn;
         }
     }
 

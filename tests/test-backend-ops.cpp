@@ -4603,6 +4603,63 @@ struct test_rms_norm_mul_cast : public test_case {
     }
 };
 
+// RMS_NORM rows of <= 256 columns (CUDA [NORMROWS] / [GATEDNORM]): mode 0 = RMS_NORM -> MUL(w) -> MUL(sigmoid(z)),
+// 1 = RMS_NORM -> SCALE (the GDN l2 norm), 2 = RMS_NORM -> MUL(w); strided = x is a view with a wider row stride
+struct test_rms_norm_gate : public test_case {
+    const std::array<int64_t, 3> ne;
+    const int mode;
+    const bool strided;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, mode, strided, eps);
+    }
+
+    test_rms_norm_gate(std::array<int64_t, 3> ne = {128, 48, 64}, int mode = 0, bool strided = false, float eps = 1e-6f)
+        : ne(ne), mode(mode), strided(strided), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (strided) {
+            ggml_tensor * p = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0]*3, ne[1], ne[2]);
+            ggml_set_name(p, "x_parent");
+            x = ggml_view_3d(ctx, p, ne[0], ne[1], ne[2], p->nb[1], p->nb[2], ne[0]*sizeof(float));
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        }
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out;
+        if (mode == 1) {
+            out = ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/ne[0]), 1.0f/sqrtf((float) ne[0]));
+        } else if (mode == 2) {
+            out = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        } else {
+            ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+            ggml_set_name(z, "z");
+            ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+            out = ggml_mul(ctx, n, ggml_sigmoid(ctx, z));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -16014,6 +16071,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_cast({2560, 4, 64}));
     test_cases.emplace_back(new test_rms_norm_mul_cast({2560, 4, 37}));
     test_cases.emplace_back(new test_rms_norm_mul_cast({1000, 3, 5}));
+    for (int mode : {0, 1, 2}) {
+        for (bool strided : {false, true}) {
+            for (auto ne : std::vector<std::array<int64_t, 3>>{{128, 48, 64}, {128, 16, 37}, {64, 7, 5}, {33, 5, 3},
+                                                                {256, 4, 9}, {200, 3, 2}, {257, 3, 2}, {1, 4, 3}}) {
+                test_cases.emplace_back(new test_rms_norm_gate(ne, mode, strided));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
@@ -18547,6 +18612,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [GATEDNORM] Flash-Next GDN norms at a 12288-token ubatch: GGML_TEST_GDN_NORM_PERF=1 runs only these
+    if (getenv("GGML_TEST_GDN_NORM_PERF") != nullptr) {
+        test_cases.emplace_back(new test_rms_norm_gate({128, 48, 12288}, 0, false));
+        test_cases.emplace_back(new test_rms_norm_gate({128, 16, 12288}, 1, true));
+        test_cases.emplace_back(new test_rms_norm_gate({128, 48, 12288}, 2, false));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_BF16, {2560, 12288, 1, 1}));
+        return test_cases;
+    }
     // [AIV2] GGML_TEST_AIV2_PERF=1: only the AI+ gate-2 rival list (IQ2_XXS..IQ4_XS, today's AI+, EXL3 2/3/4 with and
     // without the Hadamard glue) at the 27B FFN shapes 17408 x 5120 and 5120 x 17408, widths 1 / 4 / 5 / 8
     if (getenv("GGML_TEST_AIV2_PERF") != nullptr) {

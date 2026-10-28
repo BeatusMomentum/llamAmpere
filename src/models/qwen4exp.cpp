@@ -2122,6 +2122,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+
+    // [GDNBF16] ssm_beta and ssm_alpha are BF16, so at 32+ tokens the CUDA cuBLAS path rounds cur to BF16 once per
+    // matmul; cast it once and feed both: the same rounding (round to nearest even) and the same GEMM. Plain matmuls on
+    // cur only (no LoRA or precision policy); small batches take the vector / mmf kernels, which read cur in f32.
+    // LLAMA_NO_GDN_BF16_ONCE=1 keeps the two conversions.
+    {
+        static const bool no_once = [] { const char * e = getenv("LLAMA_NO_GDN_BF16_ONCE"); return e && atoi(e) != 0; }();
+        const auto plain_bf16_mm = [&](const ggml_tensor * t, const ggml_tensor * w) {
+            if (t->op != GGML_OP_MUL_MAT || t->src[0] != w || t->src[1] != cur || w->type != GGML_TYPE_BF16) {
+                return false;
+            }
+            for (int i = 0; i < 4; ++i) {
+                if (t->op_params[i] != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        ggml_tensor * beta_mm = beta->src[0]; // beta = sigmoid(reshape(mm))
+        while (beta_mm != nullptr && beta_mm->op == GGML_OP_RESHAPE) {
+            beta_mm = beta_mm->src[0];
+        }
+        if (!no_once && ubatch.n_tokens >= 32 && cur->type == GGML_TYPE_F32 && ggml_is_contiguous(cur) &&
+                beta_mm != nullptr && plain_bf16_mm(beta_mm, model.layers[il].ssm_beta) &&
+                plain_bf16_mm(alpha, model.layers[il].ssm_alpha)) {
+            ggml_tensor * xb = ggml_cast(ctx0, cur, GGML_TYPE_BF16);
+            cb(xb, "gdn_in_bf16", il);
+            beta_mm->src[1] = xb;
+            alpha->src[1]   = xb;
+        }
+    }
+
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -2210,6 +2242,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+
+    // [GATEDNORM] z ahead of the norm, so RMS_NORM, MUL, SIGMOID, MUL are adjacent nodes the CUDA backend runs as one
+    // kernel (z used to be computed between the norm and the sigmoid)
+    ggml_build_forward_expand(gf, output);
+    ggml_build_forward_expand(gf, z_2d);
 
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
