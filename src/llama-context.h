@@ -650,6 +650,10 @@ private:
     // [PLEPF] PLE page prefetch (LLAMA_PLE_PREFETCH=<threads>, opt-in; see llama-ple-prefetch.h)
     std::unique_ptr<llama_ple_prefetch> ple_pf;
     bool ple_pf_tried = false;
+    void ple_pf_init();
+public:
+    void ple_pf_hint(const llama_token * tokens, size_t n, llama_pos pos0);
+private:
     // [RTPORT] early PLE page reads for the next check (LLAMA_PLE_HINT=1, opt-in; see llama_ple_hint)
     std::unique_ptr<llama_ple_hinter> ple_hint;
     bool ple_hint_tried = false;
