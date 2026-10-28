@@ -9,6 +9,7 @@ A crash-fix release on top of v0.6. There are no new features and no new flags, 
   mask is built for that smaller part. The check now compares the mask against the part that is actually read. Plain
   (non-SJ-KVaRN) caches keep an equivalent check. Without `LLAMA_KQ_MASK_PACKED=1` the crash never happened, so
   `LLAMA_KQ_MASK_PACKED=0` was a workaround on v0.6.
+- **`--gdn-replay` on Flash-Next produced wrong text after rejected drafts; fixed.**
 
 What stays the same:
 - At temperature 0, the 24 GB README command (Swift 1.5 IQ4_XS-M, SJ-KVaRN 4/4) writes the same text as v0.6, byte
