@@ -19,6 +19,9 @@
 #include <unistd.h>
 #endif
 
+static constexpr int64_t PLE_PF_DEFAULT_THREADS = 16;
+static constexpr int64_t PLE_PF_DEFAULT_MIN     = 4096;
+
 static int64_t ple_pf_env(const char * name, int64_t def) {
     const char * v = getenv(name);
     return v && *v ? (int64_t) atoll(v) : def;
@@ -60,14 +63,20 @@ static bool ple_pf_resolve(const void * addr, std::string & path, uint64_t & off
 #endif
 
 std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model & model, uint32_t n_ubatch) {
-    const int64_t n_thr = ple_pf_env("LLAMA_PLE_PREFETCH", 0);
+    // [PFGAP] on by default for long prompt calls: the prompt's rows (~2 GiB at 100K tokens) are otherwise read by
+    // page faults one at a time inside the first layers, a multi-second card stall when the table is not cached.
+    // LLAMA_PLE_PREFETCH=0 turns it off, =N sets the reader threads.
+    const bool    user  = getenv("LLAMA_PLE_PREFETCH") != nullptr;
+    const int64_t n_thr = ple_pf_env("LLAMA_PLE_PREFETCH", PLE_PF_DEFAULT_THREADS);
     if (n_thr <= 0) {
         return nullptr;
     }
     const ggml_tensor * t = model.per_layer_tok_embd;
     if (model.arch != LLM_ARCH_QWEN4EXP || !t || !model.can_prefetch.count(t) || !t->data || !t->buffer ||
             !ggml_backend_buffer_is_host(t->buffer) || model.hparams.ple_n_heads == 0 || model.hparams.ple_ngram_size < 2) {
-        LLAMA_LOG_WARN("%s: [PLEPF] LLAMA_PLE_PREFETCH is set but this model has no lazily mapped qwen4exp PLE table, off\n", __func__);
+        if (user) {
+            LLAMA_LOG_WARN("%s: [PLEPF] LLAMA_PLE_PREFETCH is set but this model has no lazily mapped qwen4exp PLE table, off\n", __func__);
+        }
         return nullptr;
     }
 
@@ -75,8 +84,9 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->model     = &model;
     pf->ple       = t;
     pf->n_threads = (int) std::min<int64_t>(n_thr, 512);
-    pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", 256));
-    pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", 2*(int64_t) n_ubatch));
+    // by default only long calls (a short check or catch-up batch is cheaper to fault in) and the whole call ahead
+    pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN));
+    pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", user ? 2*(int64_t) n_ubatch : INT64_MAX/2));
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
     pf->n_rows    = (uint64_t) t->ne[1];
