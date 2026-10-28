@@ -63,8 +63,27 @@ static void dense_tc_detect_impl(int device) {
                 device, (long long) dense_tc_min());
         return;
     }
-    // auto: compare bf16 in / FP32 accumulate against fp16 in / fp16 accumulate at 2048^3 (32 MiB of scratch)
+    // auto: compare bf16 in / FP32 accumulate against fp16 in / fp16 accumulate at 2048^3 (32 MiB of scratch).
+    // The probe runs in a throwaway context so the library code it loads is unloaded with it; otherwise that code
+    // stays resident and shrinks the memory left for other buffers planned after backend start.
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    CUcontext prev_ctx = nullptr, probe_ctx = nullptr;
+    CUdevice  cu_dev;
+    cuCtxGetCurrent(&prev_ctx);
+    bool own_ctx = cuDeviceGet(&cu_dev, device) == CUDA_SUCCESS;
+#if CUDA_VERSION >= 13000
+    own_ctx = own_ctx && cuCtxCreate(&probe_ctx, nullptr, 0, cu_dev) == CUDA_SUCCESS;
+#else
+    own_ctx = own_ctx && cuCtxCreate(&probe_ctx, 0, cu_dev) == CUDA_SUCCESS;
+#endif
+    if (!own_ctx) {
+        probe_ctx = nullptr;
+        cuCtxSetCurrent(prev_ctx);
+        ggml_cuda_set_device(device);
+    }
+#else
     ggml_cuda_set_device(device);
+#endif
     const int n = 2048;
     void * a = nullptr, * b = nullptr, * c = nullptr;
     cublasHandle_t h = nullptr;
@@ -86,6 +105,15 @@ static void dense_tc_detect_impl(int device) {
     if (b) { cudaFree(b); }
     if (c) { cudaFree(c); }
     cudaGetLastError(); // a failed allocation leaves the path off, not an error
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (probe_ctx) {
+        cuCtxDestroy(probe_ctx);
+        cuCtxSetCurrent(prev_ctx);
+        if (!prev_ctx) {
+            cudaSetDevice(device);
+        }
+    }
+#endif
     const float ratio = (t32 > 0.0f && t16 > 0.0f) ? t32/t16 : -1.0f;
     const bool  on    = ratio > 0.0f && ratio < 1.4f;
     g_dense_tc[device] = on ? 1 : 0;
