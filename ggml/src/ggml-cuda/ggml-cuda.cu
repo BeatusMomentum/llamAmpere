@@ -39,6 +39,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/dense-tc.cuh"
 #include "ggml-cuda/mmq-prefill.cuh"
 #include "ggml-cuda/mmv-cr.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -2922,6 +2923,10 @@ static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_backend_cuda_c
     ggml_type compute_type = src0->type;
     if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        // [PFGAP-U3] the dense tensor-core path: bf16 data, FP32 accumulate (unless the op asks for F32)
+        if (prec != GGML_PREC_F32 && src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_cuda_dense_tc_wants(src0->type, src1->ne[1])) {
+            return GGML_TYPE_BF16;
+        }
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
         compute_type = GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_BF16 && !fast_bf16_hardware_available(cc)) {
@@ -12693,6 +12698,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         return nullptr;
     }
     ggml_cuda_apply_stack_limit(device);
+    ggml_cuda_dense_tc_detect(device);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (ggml_cuda_moe_table_prefetch_enabled()) {
         // Precreate only the main stream. The existing accessor retains it for

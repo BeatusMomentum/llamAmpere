@@ -14857,8 +14857,28 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 }
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// [PFGAP-U3] Flash-Next dense prompt matmul shapes {output, input} at 1024 / 12288 tokens
+static void add_fn_dense_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {12288, 2560}, {2560, 6144}, {640, 2560}, {2560, 640}}) {
+        for (int64_t n : {1024, 12288}) {
+            // 640-wide inputs (shared-expert down) are IQ4_NL / Q2_0 in the model; 256-block types cannot hold them
+            const std::vector<ggml_type> types = mk.second % 256 == 0
+                ? std::vector<ggml_type>{GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}
+                : std::vector<ggml_type>{GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0};
+            for (ggml_type t : types) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [PFGAP-U3] GGML_TEST_FN_DENSE_PERF=1 also limits the eval list to the Flash-Next dense shapes
+    if (getenv("GGML_TEST_FN_DENSE_PERF") != nullptr) {
+        add_fn_dense_cases(test_cases);
+        return test_cases;
+    }
     // MMQ_PAIR: native IQ expert formats, dense/ID, broadcast/nonbroadcast,
     // mixed compatible formats, partial column tile, parallel-ID threshold,
     // and explicit fallback guards. CUDA mode 2 proves exactness separately
@@ -18614,18 +18634,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     // [PFGAP-U3] Flash-Next non-routed prompt matmuls (attention, GDN output, shared expert): GGML_TEST_FN_DENSE_PERF=1
     if (getenv("GGML_TEST_FN_DENSE_PERF") != nullptr) {
-        // {output, input}: qkv, attn gate, attn q, ssm_out/attn_output, shexp gate/up, shexp down
-        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {12288, 2560}, {2560, 6144}, {640, 2560}, {2560, 640}}) {
-            for (int64_t n : {1024, 12288}) {
-                // 640-wide inputs (shared-expert down) are IQ4_NL / Q2_0 in the model; 256-block types cannot hold them
-                const std::vector<ggml_type> types = mk.second % 256 == 0
-                    ? std::vector<ggml_type>{GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}
-                    : std::vector<ggml_type>{GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0};
-                for (ggml_type t : types) {
-                    test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
-                }
-            }
-        }
+        add_fn_dense_cases(test_cases);
         return test_cases;
     }
     // [GATEDNORM] Flash-Next GDN norms at a 12288-token ubatch: GGML_TEST_GDN_NORM_PERF=1 runs only these

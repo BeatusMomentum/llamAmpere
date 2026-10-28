@@ -3,6 +3,7 @@
 #include "mmq.cuh"
 #include "mmq-prefill.cuh"
 #include "quantize.cuh"
+#include "dense-tc.cuh"
 #include "mmid.cuh"
 
 #include <cstdint>
@@ -497,13 +498,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
-    // [PFGAP-U3] prototype: GGML_CUDA_DENSE_CUBLAS_MIN=N sends non-routed (dense) quantized matmuls with >= N tokens to
-    // the dequant + cuBLAS path instead of MMQ (pair with GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16 for FP32 accumulate)
-    static const int64_t dense_cublas_min = [] {
-        const char * e = getenv("GGML_CUDA_DENSE_CUBLAS_MIN");
-        return e ? (int64_t) atoll(e) : (int64_t) 0;
-    }();
-    if (dense_cublas_min > 0 && n_experts == 0 && ne11 >= dense_cublas_min) {
+    // [PFGAP-U3] dense quantized prompt matmuls take dequant + bf16 cuBLAS (FP32 accumulate) where detected faster
+    if (n_experts == 0 && ggml_cuda_dense_tc_wants(type, ne11)) {
         return false;
     }
 
