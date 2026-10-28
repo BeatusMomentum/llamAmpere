@@ -1494,13 +1494,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
-    // fork: keep CUDA routers compact without changing their GGUF file layout or CPU mappings.
+    // fork: keep CUDA routers compact (BF16, half the bytes) without changing their GGUF file layout or CPU mappings.
+    // On by default for Flash-Next (the defaults table sets LLAMA_QWEN_ROUTER_BF16=1); LLAMA_QWEN_ROUTER_BF16=0 keeps F32.
+    // Lossless rule: only when every value of the tensor is exactly BF16-representable, and only when the matching
+    // F32-order narrow-width kernel is on (so the sums stay in the F32 order); otherwise the tensor stays F32.
     const char * router_bf16 = getenv("LLAMA_QWEN_ROUTER_BF16");
     auto * dev = ggml_backend_buft_get_device(buft);
-    if (router_bf16 && strcmp(router_bf16, "1") == 0 && get_arch() == LLM_ARCH_QWEN4EXP &&
+    auto env_on = [](const char * name) { const char * v = getenv(name); return v && atoi(v) != 0; };
+    if (router_bf16 && strcmp(router_bf16, "0") != 0 && get_arch() == LLM_ARCH_QWEN4EXP &&
             tn.tensor == LLM_TENSOR_FFN_GATE_INP && // shared gates need F32 for CUDA fusion
             t_meta.type == GGML_TYPE_F32 && !is_lazy && dev && !ggml_backend_buft_is_host(buft) &&
-            strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0) {
+            strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0 &&
+            env_on("GGML_CUDA_FROWS") && env_on("GGML_CUDA_FROWS_BF16_F32_ORDER") &&
+            router_bf16_exact_check(tn.str().c_str())) {
         t_meta.type = GGML_TYPE_BF16;
         t_meta.nb[0] = ggml_type_size(t_meta.type);
         for (size_t dim = 1; dim < GGML_MAX_DIMS; ++dim) {
@@ -1530,6 +1536,35 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     return tensor;
+}
+
+bool llama_model_loader::router_bf16_exact_check(const char * name) const {
+    auto it = router_bf16_exact.find(name);
+    if (it != router_bf16_exact.end()) {
+        return it->second;
+    }
+    bool exact = false;
+    const auto * weight = get_weight(name);
+    if (weight && weight->tensor->type == GGML_TYPE_F32 && !files.empty() && !use_direct_io) {
+        exact = true;
+        auto & file = files.at(weight->idx);
+        const size_t total = ggml_nbytes(weight->tensor);
+        std::vector<uint32_t> buf(1u << 18); // 1 MiB reads
+        file->seek(weight->offs, SEEK_SET);
+        for (size_t done = 0; done < total && exact; ) {
+            const size_t n = std::min(total - done, buf.size() * sizeof(uint32_t));
+            file->read_raw(buf.data(), n);
+            for (size_t i = 0; i < n / sizeof(uint32_t); ++i) {
+                if (buf[i] & 0xFFFFu) { exact = false; break; }
+            }
+            done += n;
+        }
+    }
+    if (!exact) {
+        LLAMA_LOG_WARN("%s: router '%s' is not exactly BF16-representable, keeping F32\n", __func__, name);
+    }
+    router_bf16_exact.emplace(name, exact);
+    return exact;
 }
 
 bool llama_model_loader::try_borrow_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, ggml_tensor * donor) {
@@ -2005,7 +2040,7 @@ bool llama_model_loader::load_all_data(
     }
 
     if (router_bf16_count) {
-        LLAMA_LOG_WARN("%s: experimental BF16 router storage: %zu CUDA tensors, %.2f MiB less weight storage; arithmetic/replay qualification pending\n",
+        LLAMA_LOG_INFO("%s: BF16 router storage (exact, F32 sum order): %zu CUDA tensors, %.2f MiB less weight storage\n",
                 __func__, router_bf16_count, router_bf16_bytes / 1048576.0);
     }
 
