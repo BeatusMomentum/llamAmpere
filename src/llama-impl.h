@@ -3,6 +3,7 @@
 #include "ggml.h" // for ggml_log_level
 
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -98,6 +99,11 @@ struct buffer_view {
 };
 
 void llama_clear_tensor_data(ggml_tensor * t, size_t offset, size_t size);
+
+// [PFGAP] helper threads created from a thread pinned to one CPU inherit that single CPU, so they compete with it for
+// time. When the calling thread is pinned to exactly one CPU, give t every CPU except that one (Linux only; a no-op
+// otherwise or when LLAMA_NO_THREAD_UNPIN=1). Only where threads run changes, never what they compute.
+void llama_thread_off_caller_cpu(std::thread & t);
 
 void replace_all(std::string & s, const std::string & search, const std::string & replace);
 

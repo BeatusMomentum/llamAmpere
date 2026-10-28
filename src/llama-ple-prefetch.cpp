@@ -226,6 +226,7 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     running    = true;
 
     coord = std::thread([this]() { build(); });
+    llama_thread_off_caller_cpu(coord); // the readers it starts inherit its CPU set
 }
 
 size_t llama_ple_prefetch::chunks_for(uint64_t n_tok) const {
