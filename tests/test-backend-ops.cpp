@@ -18612,6 +18612,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [PFGAP-U3] Flash-Next non-routed prompt matmuls (attention, GDN output, shared expert): GGML_TEST_FN_DENSE_PERF=1
+    if (getenv("GGML_TEST_FN_DENSE_PERF") != nullptr) {
+        // {output, input}: qkv, attn gate, attn q, ssm_out/attn_output, shexp gate/up, shexp down
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {12288, 2560}, {2560, 6144}, {640, 2560}, {2560, 640}}) {
+            for (int64_t n : {1024, 12288}) {
+                for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+                    test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                }
+            }
+        }
+        return test_cases;
+    }
     // [GATEDNORM] Flash-Next GDN norms at a 12288-token ubatch: GGML_TEST_GDN_NORM_PERF=1 runs only these
     if (getenv("GGML_TEST_GDN_NORM_PERF") != nullptr) {
         test_cases.emplace_back(new test_rms_norm_gate({128, 48, 12288}, 0, false));
