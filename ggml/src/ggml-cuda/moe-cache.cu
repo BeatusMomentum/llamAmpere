@@ -872,6 +872,7 @@ static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
 static void moe_cache_device_release(moe_cache_session & session, bool retain_sources = false);
 static void moe_cache_swap_step(moe_cache_session & session);
+static void moe_cache_swap_commit(moe_cache_session & session, bool ok, bool publish);
 static void moe_cache_swap_note_stream(moe_cache_session & session, ggml_backend_cuda_context & ctx);
 static void moe_cache_device_adapt(moe_cache_session & session);
 
@@ -3253,6 +3254,15 @@ static void moe_cache_session_destroy(void * opaque) {
         }
     }
 
+    // The last swap batch is usually still copying at shutdown; its slots count as missing until they are marked
+    // valid. Wait for the copies and mark them (host state only, no table publish) so the final census counts every
+    // expert the run actually held. Device release does the same commit right after; nothing runs in between.
+    if (!session->swap_inflight.empty() && !session->devices.empty()) {
+        ggml_cuda_set_device(session->devices[0]->logical);
+        const bool landed = cudaDeviceSynchronize() == cudaSuccess;
+        (void) cudaGetLastError();
+        moe_cache_swap_commit(*session, landed, false);
+    }
     for (auto & device_ptr : session->devices) {
         if (device_ptr->nodes > 0 || device_ptr->dispatch_failures > 0 ||
             device_ptr->collect_failures > 0) {
