@@ -11401,16 +11401,19 @@ struct test_moe_reduce : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const int  shexp_gate; // 0: none; 1: + shexp * sigmoid(w . y), routed sum first; 2: gated term first
 
     test_moe_reduce(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            int shexp_gate = 0) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), shexp_gate(shexp_gate) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        return VARS_TO_STR7(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds,
+            shexp_gate);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -11463,6 +11466,24 @@ struct test_moe_reduce : public test_case {
             }
         }
         ggml_set_name(out, "moe_reduce");
+        if (shexp_gate == 0) {
+            return out;
+        }
+        // the shared-expert gate of the Qwen3-Next style FFN ([MOECOMBINE] on CUDA)
+        // the routed sum is ordered first in either operand order, as in the model graph
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, out);
+        }
+        const int64_t K = 96;
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);
+        ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(w, "shexp_gate_w");
+        ggml_set_name(y, "shexp_gate_y");
+        ggml_set_name(x, "shexp");
+        ggml_tensor * gated = ggml_mul(ctx, x, ggml_sigmoid(ctx, ggml_mul_mat(ctx, w, y)));
+        out = shexp_gate == 1 ? ggml_add(ctx, out, gated) : ggml_add(ctx, gated, out);
+        ggml_set_name(out, "moe_combine");
         return out;
     }
 };
@@ -18206,6 +18227,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_reduce(2560, 10, 64, false, false, false, 1));
+    test_cases.emplace_back(new test_moe_reduce(2560, 10, 64, false, false, false, 2));
+    test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true,  true,  1));
+    test_cases.emplace_back(new test_moe_reduce(2048, 8,  4,  false, true,  false, 1)); // too few tokens: not fused
 
     add_gated_delta_net_range_cases(test_cases, false);
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 65, 1, 3, false, true));
