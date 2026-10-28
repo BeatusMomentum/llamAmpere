@@ -115,6 +115,8 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    list(APPEND GGML_SOURCES_CUDA "moe-table-model.cpp")
+    list(APPEND GGML_SOURCES_CUDA "moe-cpu-split.cpp")   # fork MOEGAP: host expert pool (uses ggml-cpu kernels)
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -131,6 +133,19 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    # Keep hashing's include path local to its source. Linking vendor::hash adds
+    # a target-wide include path and needlessly rebuilds every CUDA kernel.
+    set(GGML_MOE_TABLE_HASH_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../vendor/hash")
+    if (EXISTS "${GGML_MOE_TABLE_HASH_DIR}/sha256/sha256.c" AND
+        EXISTS "${GGML_MOE_TABLE_HASH_DIR}/sha256/sha256.h")
+        target_sources(ggml-cuda PRIVATE "${GGML_MOE_TABLE_HASH_DIR}/sha256/sha256.c")
+        set_property(SOURCE "${GGML_MOE_TABLE_HASH_DIR}/sha256/sha256.c" APPEND
+                     PROPERTY INCLUDE_DIRECTORIES "${GGML_MOE_TABLE_HASH_DIR}")
+    else()
+        set_property(SOURCE "moe-table-model.cpp" APPEND
+                     PROPERTY COMPILE_DEFINITIONS GGML_MOE_TABLE_NO_HASH)
+    endif()
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
@@ -265,4 +280,9 @@ if (CUDAToolkit_FOUND)
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
+endif()
+
+# fork MOEGAP: moe-cpu-split.cpp calls the ggml-cpu dot kernels (the CPU backend is linked in when not loaded dynamically)
+if (TARGET ggml-cuda AND TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
+    target_link_libraries(ggml-cuda PRIVATE ggml-cpu)
 endif()

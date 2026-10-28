@@ -101,6 +101,11 @@ public:
     // LLAMA_RS_RING_ROWS=1: write ring snapshots with set_rows even when the ubatch fills the ring
     // (the first v0.4 form; A/B only, see get_n_written)
     bool rs_ring_rows_all = false;
+    // [VSHIFT] LLAMA_RS_SHIFT_SKIP=1 (shift layout only, default off): a ubatch of n < K tokens does not move the
+    // older snapshot groups back by n (snapshot_shift_gather/_write, one 3 MiB state copy per GDN layer and check).
+    // Groups n..K-1 then hold stale history, so rs_valid is set to n - 1 (the groups this ubatch wrote) and a
+    // deeper seq_rm is refused. A speculative check never rolls back its first row, so it never needs them.
+    bool rs_shift_skip = false;
 
     // per data cell (index = cell whose planes hold the data, i.e. cells[i].src0): plane of
     // rollback group 0. Set when a ubatch writes the cell, 0 for rs_z, restored or cleared cells.
@@ -279,6 +284,13 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // [B1] layer-major prefill: find_slot()'s metadata (head, n, used, rs_z, cells) and the pending rollback groups
+    // (rs_idx) per ubatch. Not with the rollback ring or gdn_replay, whose inputs have other side effects per ubatch.
+    bool b1_supported() const override;
+    void b1_save() override;
+    bool b1_seek(size_t i) override;
+    bool b1_has_views() const { return !b1_views.empty(); }
+
     //
     // llama_memory_recurrent_context specific API
     //
@@ -360,4 +372,14 @@ private:
     //
 
     const bool is_full = false;
+
+    struct b1_view {
+        uint32_t head = 0;
+        uint32_t n    = 0;
+        uint32_t used = 0;
+        int32_t  rs_z = -1;
+        std::vector<llama_memory_recurrent::mem_cell> cells;
+        std::vector<uint32_t> rs_idx; // pending rollback group per sequence, as the normal order's ubatch sees it
+    };
+    std::vector<b1_view> b1_views;
 };

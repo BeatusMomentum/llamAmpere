@@ -376,6 +376,22 @@ static void test(void) {
     assert(spec_defaults.speculative.draft.n_max == 3);
     assert(spec_defaults.speculative.draft.n_min_adaptive == 3);
 
+    for (const std::string type : {"draft-mtp", "draft-mtp-adaptive"}) {
+        for (const std::string mode : {"default", "--spec-mb-mtp", "--no-spec-mb-mtp"}) {
+            argv = {"binary_name", "--spec-type", type};
+            if (mode != "default") { argv.push_back(mode); }
+            common_params mb;
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), mb, LLAMA_EXAMPLE_SERVER));
+            const bool enabled = mode != "--no-spec-mb-mtp";
+            assert(mb.sampling.spec_lossy == enabled);
+            assert(mb.speculative.draft.n_max == (enabled ? 6 : 3));
+            argv.insert(argv.end(), {"--spec-draft-n-max", "4"});
+            common_params explicit_depth;
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), explicit_depth, LLAMA_EXAMPLE_SERVER));
+            assert(explicit_depth.speculative.draft.n_max == 4);
+        }
+    }
+
     // MTP drafter attention window: off by default, the default context params carry no window,
     // and the cparams helper leaves them untouched when the flags are absent
     assert(spec_defaults.speculative.draft.attn_window == 0);
@@ -502,7 +518,7 @@ static void test(void) {
         assert(draft.cache_type_k == GGML_TYPE_Q8_0);
         assert(draft.cache_type_v == COMMON_SJKVARN_MTP_DRAFT_KV[1]);
     }
-    // a separate draft model keeps the plain cache the SJ-KVaRN trunk flags leave behind
+    // a separate draft model with no MTP type keeps the plain cache the SJ-KVaRN trunk flags leave behind
     argv = {"binary_name", "-m", "model_file.gguf", "-md", "draft.gguf", "-ctk", "sjkvarn4", "-ctv", "sjkvarn4"};
     common_params dkv_sj_kvarn_md;
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_sj_kvarn_md, LLAMA_EXAMPLE_SPECULATIVE));
@@ -510,6 +526,52 @@ static void test(void) {
         const auto draft = common_base_params_to_speculative(dkv_sj_kvarn_md);
         assert(draft.cache_type_k == dkv_sj_kvarn_md.cache_type_k);
         assert(draft.cache_type_v == dkv_sj_kvarn_md.cache_type_v);
+        assert(!draft.speculative.draft.cache_type_sj_kvarn_default);
+    }
+    // a separate-file MTP head (ctx_type MTP) is an MTP drafter: unset types take tq5_0/turbo4
+    argv = {"binary_name", "-m", "model_file.gguf", "-md", "draft.gguf", "--spec-type", "draft-mtp-adaptive",
+            "-ctk", "sjkvarn4", "-ctv", "sjkvarn4"};
+    common_params dkv_sj_kvarn_md_mtp;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_sj_kvarn_md_mtp, LLAMA_EXAMPLE_SERVER));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_sj_kvarn_md_mtp);
+        assert(draft.cache_type_k == COMMON_SJKVARN_MTP_DRAFT_KV[0]);
+        assert(draft.cache_type_v == COMMON_SJKVARN_MTP_DRAFT_KV[1]);
+        assert(draft.speculative.draft.cache_type_sj_kvarn_default);
+        assert(draft.sj_kvarn_bits_k == 0 && draft.sj_kvarn_bits_v == 0);
+    }
+    // explicit f16 still wins on that separate MTP file
+    argv = {"binary_name", "-m", "model_file.gguf", "-md", "draft.gguf", "--spec-type", "draft-mtp-adaptive",
+            "-ctk", "sjkvarn4", "-ctv", "sjkvarn4", "-ctkd", "f16", "-ctvd", "f16"};
+    common_params dkv_sj_kvarn_md_mtp_f16;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_sj_kvarn_md_mtp_f16, LLAMA_EXAMPLE_SERVER));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_sj_kvarn_md_mtp_f16);
+        assert(draft.cache_type_k == GGML_TYPE_F16);
+        assert(draft.cache_type_v == GGML_TYPE_F16);
+        assert(!draft.speculative.draft.cache_type_sj_kvarn_default);
+    }
+    // EAGLE3 is a separate draft but not MTP, so it keeps the plain SJ-KVaRN cache
+    argv = {"binary_name", "-m", "model_file.gguf", "-md", "draft.gguf", "--spec-type", "draft-eagle3",
+            "-ctk", "sjkvarn4", "-ctv", "sjkvarn4"};
+    common_params dkv_sj_kvarn_eagle;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_sj_kvarn_eagle, LLAMA_EXAMPLE_SERVER));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_sj_kvarn_eagle);
+        assert(draft.cache_type_k == dkv_sj_kvarn_eagle.cache_type_k);
+        assert(draft.cache_type_v == dkv_sj_kvarn_eagle.cache_type_v);
+        assert(draft.cache_type_k == GGML_TYPE_F16);
+        assert(!draft.speculative.draft.cache_type_sj_kvarn_default);
+    }
+    // a quantized trunk stays quantized for a separate MTP file; it is not left at f16
+    argv = {"binary_name", "-m", "model_file.gguf", "-md", "draft.gguf", "--spec-type", "draft-mtp",
+            "-ctk", "q8_0", "-ctv", "q8_0"};
+    common_params dkv_q8_md_mtp;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_q8_md_mtp, LLAMA_EXAMPLE_SERVER));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_q8_md_mtp);
+        assert(draft.cache_type_k == GGML_TYPE_Q8_0);
+        assert(draft.cache_type_v == GGML_TYPE_Q8_0);
         assert(!draft.speculative.draft.cache_type_sj_kvarn_default);
     }
 

@@ -1,11 +1,13 @@
 #pragma once
 
 #include "common.cuh"
+#include "qsa-resident.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "turbo-quant.cuh"
 #include "fattn-query-layout.cuh"
 #include "fattn-sjkvarn-rot.cuh"
+#include "fattn-sjkvarn-fill.h"
 
 #include <cstdint>
 
@@ -68,10 +70,26 @@ struct fattn_sj_kvarn_ctx {
     int sink_type, sink_stride;
     int64_t sink_head_delta_k, sink_head_delta_v;
     int body_type;
+    const char * resident = nullptr;
+    const int32_t * resident_tags = nullptr;
+    const ggml_cuda_qsa_clock_map * resident_map = nullptr;
+    int resident_head = 0;
+    uint32_t resident_slots = 0;
     int rec_stride;      // n_head_kv * rec_bytes
     const int32_t * table; // paged pool (multi-sequence cache): group g sits at record table[g]; nullptr = identity
     int k_scale, k_zero, k_tok, v_payload, v_ch, v_scale, v_zero;
 };
+
+static __device__ __forceinline__ const char * fattn_sj_kvarn_rec(const fattn_sj_kvarn_ctx & kv, const int g) {
+    const int record = kv.table ? kv.table[g] : g;
+    if (kv.resident_tags) {
+        const uint32_t slot = record % kv.resident_slots;
+        if (kv.resident_tags[slot] == record) {
+            return kv.resident + (size_t) slot*kv.rec_stride;
+        }
+    }
+    return kv.body + (size_t) record*kv.rec_stride;
+}
 
 // record of group g of this stream: g itself, or the paged-pool slot of a multi-sequence cache (desc[GGML_SJKVARN_DESC_TABLE])
 #ifndef FATTN_SJKVARN_REC_DEFINED
@@ -100,6 +118,19 @@ static __device__ __forceinline__ fattn_sj_kvarn_ctx fattn_sj_kvarn_make_ctx(
     c.sink_head_delta_v = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) v_head_stride);
     c.rec_stride = desc[GGML_SJKVARN_DESC_HKV] * rec_bytes;
     c.table      = desc[GGML_SJKVARN_DESC_TABLE] ? desc + GGML_SJKVARN_DESC_N_ENTRIES : nullptr;
+    if ((reinterpret_cast<uintptr_t>(body) & 3) == 3) {
+        const auto * map = reinterpret_cast<const ggml_cuda_qsa_clock_map *>(reinterpret_cast<uintptr_t>(body) & ~uintptr_t(3));
+        c.resident_map = map;
+        c.resident_head = z_KV;
+        c.resident_slots = map->slots;
+        body = map->host;
+    } else if (reinterpret_cast<uintptr_t>(body) & 1) {
+        const auto * map = reinterpret_cast<const ggml_cuda_qsa_resident_map *>(reinterpret_cast<uintptr_t>(body) & ~uintptr_t(1));
+        c.resident = map->card + (size_t) z_KV*rec_bytes;
+        c.resident_tags = map->tags;
+        c.resident_slots = map->slots;
+        body = map->host;
+    }
     c.body       = body + (size_t) z_KV * rec_bytes;
     const int k_row = D*bits_k/8;
     const int v_row = D*bits_v/8;
@@ -1361,7 +1392,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int n_queries, const int64_t s31, const int64_t s33, const int mask_kind) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -1370,7 +1401,7 @@ static __global__ void flash_attn_mask_to_KV_max(
     const int sequence = blockIdx.y;
     const int jt       = blockIdx.x;
 
-    mask += sequence*s33 + jt*ncols1*s31;
+    mask += sequence*s33 + (mask_kind == 2 ? 0 : jt*ncols1*s31);
 
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
@@ -1384,8 +1415,20 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            if (mask_kind == 2) {
+                const int row = jt*ncols1 + j;
+                if (row < n_queries) {
+                    const int64_t limit = *(const int64_t *) (mask + row*s31);
+                    all_inf = all_inf && KV_max_sj + 2*tid >= limit;
+                }
+            } else if (mask_kind == 1) {
+                const uint32_t * row = (const uint32_t *) (mask + j*s31);
+                const int k = KV_max_sj + 2*tid;
+                all_inf = all_inf && ((row[k >> 5] >> (k & 31)) & 3u) == 0;
+            } else {
+                const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            }
         }
 
         all_inf = warp_reduce_all(all_inf);
@@ -1412,6 +1455,58 @@ static __global__ void flash_attn_mask_to_KV_max(
     }
 
     KV_max[sequence*ne31 + jt] = KV_max_sj;
+}
+
+// [ROUNDFIX] one bit per KV tile of nbatch_fa keys: 1 if any mask row of the query tile sees a key in it.
+// Grid (words, query tiles, mask sequences); one warp per tile, 32 warps per block = one 32-bit word.
+// The rows mirror flash_attn_ext_f16_load_mask: row = (jt*token_step + r) mod n_queries.
+static __global__ void flash_attn_mask_to_live_tiles(
+        const half * __restrict__ mask, uint32_t * __restrict__ bits, const int n_kv, const int nbatch_fa,
+        const int n_words, const int mask_rows, const int token_step, const int n_queries,
+        const int64_t s31, const int64_t s33, const int mask_kind) {
+    const int word = blockIdx.x;
+    const int jt   = blockIdx.y;
+    const int seq  = blockIdx.z;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int kb   = word*32 + warp;
+    __shared__ uint32_t word_bits;
+    if (threadIdx.x == 0) {
+        word_bits = 0;
+    }
+    __syncthreads();
+    bool live = false;
+    if ((int64_t) kb*nbatch_fa < n_kv) {
+        const half * m = mask + seq*s33;
+        for (int r = 0; r < mask_rows; ++r) {
+            const int row = (jt*token_step + r) % n_queries;
+            for (int i = lane; i < nbatch_fa; i += WARP_SIZE) {
+                const int k = kb*nbatch_fa + i;
+                const half * mr = m + row*s31;
+                if (k < n_kv && (mask_kind == 2 ? k < *(const int64_t *) mr :
+                        mask_kind == 1 ? ((((const uint32_t *) mr)[k >> 5] >> (k & 31)) & 1u) != 0 :
+                        __half2float(mr[k]) != -INFINITY)) {
+                    live = true;
+                }
+            }
+        }
+    }
+    live = __any_sync(0xFFFFFFFF, live);
+    if (lane == 0 && live) {
+        atomicOr(&word_bits, 1u << warp);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        bits[(int64_t(seq)*gridDim.y + jt)*n_words + word] = word_bits;
+    }
+}
+
+static bool ggml_cuda_fattn_skip_dead_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FA_SKIP_DEAD");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
 }
 
 void ggml_cuda_flash_attn_ext_compact_mask(
@@ -1668,13 +1763,18 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// fork: device pointer to one KV bound (multiple of FATTN_KQ_STRIDE) for a single-query-tile, single-sequence launch
+// that neither scans its mask nor uses sparse indices; set by the SJ compact path around its f16 attention call.
+inline thread_local const int * ggml_cuda_fattn_kv_max_override = nullptr;
+
 template <int DV, int ncols1, int ncols2, bool compact_q5g6 = false>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE,
     float * partial_dst = nullptr, float2 * partial_meta = nullptr,
-    const int parallel_blocks_override = 0, const bool async_kv_preload = false
+    const int parallel_blocks_override = 0, const bool async_kv_preload = false, const int sj_fill_kv_splits = 0,
+    const bool skip_dead_tiles = false
 ) {
     if constexpr (compact_q5g6) {
         GGML_ASSERT(stream_k && !use_sparse && dst->src[0]->ne[1] == 5 && dst->src[0]->ne[3] == 1);
@@ -1707,7 +1807,9 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64);
+    GGML_ASSERT(!mask || mask->type != GGML_TYPE_I64 || (!use_sparse && mask->nb[1] == sizeof(int64_t)));
+    GGML_ASSERT(!mask || mask->type != GGML_TYPE_I32 || (!use_sparse && (mask->nb[1] & 3) == 0));
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1723,6 +1825,7 @@ void launch_fattn(
     ggml_cuda_pool_alloc<half>   V_f16(pool);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<uint32_t> live_bits(pool); // before dst_tmp: the pool frees in reverse order
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1855,7 +1958,29 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask->data, KV_max.ptr, iter_k, (int) Q->ne[1], s31, s33, mask->type == GGML_TYPE_I64 ? 2 : mask->type == GGML_TYPE_I32);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int * kv_max_ptr = KV_max.ptr;
+    if (ggml_cuda_fattn_kv_max_override != nullptr) {
+        GGML_ASSERT(!use_sparse && !scan_mask && !is_sj_kvarn && ntiles_x == 1 && Q->ne[3] == 1 && mask && mask->ne[3] == 1);
+        GGML_ASSERT(K->ne[1] % FATTN_KQ_STRIDE == 0 && FATTN_KQ_STRIDE % nbatch_fa == 0);
+        kv_max_ptr = ggml_cuda_fattn_kv_max_override;
+    }
+
+    // [ROUNDFIX] dead-tile bits for the compressed-KV MMA kernel (passed in the SJ-KVaRN descriptor slot).
+    if (skip_dead_tiles && mask && !use_sparse && !is_sj_kvarn && stream_k && !need_f16_K && !need_f16_V &&
+            K->type != GGML_TYPE_F16 && warp_size == 32) {
+        const int n_kv_tiles = (int) ((K->ne[1] + nbatch_fa - 1) / nbatch_fa);
+        const int n_words    = (n_kv_tiles + 31) / 32;
+        live_bits.alloc(size_t(n_words) * ntiles_x * mask->ne[3]);
+        const dim3 grid_bits(n_words, ntiles_x, mask->ne[3]);
+        ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_bits, dim3(32*WARP_SIZE, 1, 1), 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_mask_to_live_tiles, lp,
+            (const half *) mask->data, live_bits.ptr, (int) K->ne[1], nbatch_fa, n_words,
+            query_layout::mask_rows, query_layout::token_step, (int) Q->ne[1],
+            (int64_t) (mask->nb[1] / sizeof(half)), (int64_t) (mask->nb[3] / sizeof(half)), mask->type == GGML_TYPE_I64 ? 2 : mask->type == GGML_TYPE_I32);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1948,6 +2073,15 @@ void launch_fattn(
             parallel_blocks = std::min(parallel_blocks_override, ntiles_KV);
         }
 
+        // fork: only the scalar 4/4 stream launcher supplies its intra-block KV split count.
+        static const bool sj_fill = [] { const char * e = getenv("GGML_CUDA_SJ_FILL"); return e && strcmp(e, "1") == 0; }();
+        if (sj_fill && sj_fill_kv_splits > 0 && !output_partial && parallel_blocks_override == 0 &&
+            (cc == 800 || cc == 860) && is_sj_kvarn && ggml_get_op_params_i32(KQV, 5) == ((4 << 8) | 4) &&
+            ggml_get_op_params_i32(KQV, 7) == GGML_TYPE_F32 && K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ6_0) {
+            parallel_blocks = ggml_cuda_sj_fill_split(nsm, max_blocks_per_sm, ntiles_dst, ntiles_KV,
+                                                     n_kv, sj_fill_kv_splits, ggml_nrows(KQV));
+        }
+
         if (output_partial) {
             // MMA kernels flatten Q tiles, GQA groups, KV heads, and sequences
             // into blockIdx.x. A multidimensional grid would duplicate every
@@ -1998,7 +2132,7 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        kv_max_ptr,
         output_partial ? partial_dst : (!stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data),
         output_partial ? partial_meta : dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -2006,9 +2140,9 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        is_sj_kvarn ? (const char    *) KQV->src[5]->data : nullptr,
-        is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : nullptr
+        mask ? (mask->type == GGML_TYPE_I64 ? INT_MIN : mask->type == GGML_TYPE_I32 ? mask->nb[1] | 1 : mask->nb[1]) : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        is_sj_kvarn ? ggml_cuda_qsa_resident_body(KQV->src[5]) : nullptr,
+        is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : (const int32_t *) live_bits.ptr
     );
     CUDA_CHECK(cudaGetLastError());
 

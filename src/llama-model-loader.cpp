@@ -1,18 +1,31 @@
 #include "llama-model-loader.h"
+#include "llama-ait-format.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 #include "llama-hparams.h"
 #include "llama.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <thread>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
+#include <fstream>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -51,6 +64,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q5_CR:     name = LLAMA_FTYPE_PREFIX "Q5_CR (ConvRot)"; break;
         case LLAMA_FTYPE_MOSTLY_Q6_CR:     name = LLAMA_FTYPE_PREFIX "Q6_CR (ConvRot)"; break;
         case LLAMA_FTYPE_MOSTLY_EXL3:      name = LLAMA_FTYPE_PREFIX "EXL3 (exllamav3 trellis)"; break;
+        case LLAMA_FTYPE_MOSTLY_AI4:       name = LLAMA_FTYPE_PREFIX "AI+ trellis"; break;
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: name = LLAMA_FTYPE_PREFIX "MXFP4 MoE"; break;
         case LLAMA_FTYPE_MOSTLY_NVFP4:     name = LLAMA_FTYPE_PREFIX "NVFP4"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_K:      name = LLAMA_FTYPE_PREFIX "Q2_K - Medium"; break;
@@ -586,6 +600,7 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
         }
 
+        if (const char * error = llama_ait_format_error(metadata)) { throw std::runtime_error(error); }
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
@@ -645,6 +660,7 @@ llama_model_loader::llama_model_loader(
                     throw std::runtime_error(format("%s: failed to load GGUF split from %s", __func__, fname_split));
                 }
 
+                if (const char * error = llama_ait_format_error(ctx_gguf.get())) { throw std::runtime_error(error); }
                 // check idx
                 {
                     const int kid = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str());
@@ -705,6 +721,7 @@ llama_model_loader::llama_model_loader(
                 __func__, gguf_get_data_offset(metadata), tensor_align));
         }
 
+        if (const char * error = llama_ait_format_error(metadata)) { throw std::runtime_error(error); }
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
@@ -723,6 +740,7 @@ llama_model_loader::llama_model_loader(
             weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
         }
     } else {
+        if (const char * error = llama_ait_format_error(metadata)) { throw std::runtime_error(error); }
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
@@ -776,6 +794,15 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q8_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q8_CR;   break;
             case GGML_TYPE_Q5_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q5_CR;   break;
             case GGML_TYPE_Q6_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q6_CR;   break;
+            case GGML_TYPE_AIT5_U:
+            case GGML_TYPE_AIT2_U:
+            case GGML_TYPE_AIT3_U:
+            case GGML_TYPE_AIT4_U:
+            case GGML_TYPE_AIT2:
+            case GGML_TYPE_AIT3:
+            case GGML_TYPE_AIT4:
+            case GGML_TYPE_AIT2P:
+                ftype = LLAMA_FTYPE_MOSTLY_AI4; break;
             case GGML_TYPE_EXL3_2:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
             case GGML_TYPE_EXL3_3:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
             case GGML_TYPE_EXL3_4:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
@@ -861,6 +888,53 @@ llama_model_loader::llama_model_loader(
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
     this->load_mtp = load_mtp;
+    // fork: reserve host headroom before changing expert placement, including fit-only loads.
+    const char * arena = getenv("LLAMA_MOE_ARENA");
+    if (!files.empty() && (!arena || strcmp(arena, "off") != 0)) {
+        size_t bytes = 0;
+        bool supported = true;
+        std::map<int, int> roles;
+        uint32_t n_layers = 0, n_nextn = 0;
+        get_key(LLM_KV_BLOCK_COUNT, n_layers, false);
+        get_key(LLM_KV_NEXTN_PREDICT_LAYERS, n_nextn, false);
+        moe_arena_layers = n_nextn <= n_layers ? n_layers - n_nextn : 0;
+        const char * shared_mtp = getenv("GGML_MOE_CACHE_MTP_SHARED");
+        if (load_mtp && shared_mtp && strcmp(shared_mtp, "1") == 0 && n_nextn <= n_layers) {
+            // fork: give the shared drafter the same pinned expert storage as the target.
+            moe_arena_layers = n_layers;
+        }
+        for (const auto & entry : weights_map) {
+            const auto * t = entry.second.tensor;
+            if (!llama_moe_arena::is_expert(t->name)) { continue; }
+            int layer = -1;
+            if (sscanf(t->name, "blk.%d.", &layer) != 1 || layer < 0 || n_nextn > n_layers) { supported = false; break; }
+            if (!llama_moe_arena::is_trunk_expert(t->name, moe_arena_layers)) { continue; }
+            roles[layer]++;
+            if (!ggml_moe_cache_wtype_supported(t->type)) { supported = false; break; }
+            if (t->ne[2] <= 1 || t->ne[3] != 1 || ggml_nbytes(t) > SIZE_MAX - bytes) {
+                supported = false;
+                break;
+            }
+            bytes += ggml_nbytes(t);
+        }
+        for (const auto & role : roles) { supported = supported && role.second == 3; }
+        const size_t available = llama_moe_arena::available_memory();
+        // Owner floor is 7 GiB.
+        const size_t reserve = 7ull << 30;
+        // Keep host placement and defaults when pinning is unsafe. The existing mmap
+        // loader can supply the unchanged experts as reclaimable, unpinned file pages.
+        use_moe_arena = supported && bytes && llama_mmap::SUPPORTED;
+        const bool can_pin = use_moe_arena && available > reserve && bytes <= available - reserve &&
+            llama_moe_arena::pin_supported();
+        if (use_moe_arena && !no_alloc) {
+            use_mmap = true; // also permits a late fallback after other startup allocations
+        }
+        LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, 7 GiB startup headroom\n",
+                __func__, can_pin ? "enabled" : "unpinned mmap fallback", bytes / double(GiB), available / double(GiB));
+        if (use_moe_arena && llm_kv.arch == LLM_ARCH_QWEN4EXP) {
+            llama_moe_arena_apply_flashnext_defaults();
+        }
+    }
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1266,7 +1340,31 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        // (#201) ... unless this layer otherwise lives on a GPU: the scheduler then op-offloads large
+                        // batches of this weight to the GPU, which needs a host-layout buffer. A repacked (non-host)
+                        // buffer silently pins those matmuls to the CPU, so skip the extra types there.
+                        // LLAMA_OFFLOAD_KEEP_REPACK=1 restores the old choice.
+                        const bool layer_on_gpu = buft_list != buft_list_cpu && !buft_list->empty() &&
+                            ggml_backend_dev_type(buft_list->front().first) != GGML_BACKEND_DEVICE_TYPE_CPU;
+                        static const bool keep_repack = [] {
+                            const char * e = getenv("LLAMA_OFFLOAD_KEEP_REPACK");
+                            return e != nullptr && atoi(e) != 0;
+                        }();
+                        if (layer_on_gpu && !keep_repack) {
+                            buft_list_t host_only;
+                            for (const auto & cur : *buft_list_cpu) {
+                                if (ggml_backend_buft_is_host(cur.second)) {
+                                    host_only.push_back(cur);
+                                }
+                            }
+                            buft = host_only.empty() ? nullptr : select_weight_buft(hparams, t_meta, op, &host_only);
+                            if (buft != nullptr && buft != select_weight_buft(hparams, t_meta, op, buft_list_cpu)) {
+                                n_offload_repack_skipped++;
+                            }
+                        }
+                        if (buft == nullptr) {
+                            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        }
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1291,6 +1389,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
+        }
+
+        if (use_moe_arena && llama_moe_arena::is_trunk_expert(t_meta->name, moe_arena_layers)) {
+            buft = lazy_read::buft();
         }
 
         // avoid using a host buffer when using mmap
@@ -1392,6 +1494,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
+    // fork: keep CUDA routers compact without changing their GGUF file layout or CPU mappings.
+    const char * router_bf16 = getenv("LLAMA_QWEN_ROUTER_BF16");
+    auto * dev = ggml_backend_buft_get_device(buft);
+    if (router_bf16 && strcmp(router_bf16, "1") == 0 && get_arch() == LLM_ARCH_QWEN4EXP &&
+            tn.tensor == LLM_TENSOR_FFN_GATE_INP && // shared gates need F32 for CUDA fusion
+            t_meta.type == GGML_TYPE_F32 && !is_lazy && dev && !ggml_backend_buft_is_host(buft) &&
+            strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0) {
+        t_meta.type = GGML_TYPE_BF16;
+        t_meta.nb[0] = ggml_type_size(t_meta.type);
+        for (size_t dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+            t_meta.nb[dim] = t_meta.nb[dim - 1] * t_meta.ne[dim - 1];
+        }
+    }
+
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -1416,6 +1532,39 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+bool llama_model_loader::try_borrow_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, ggml_tensor * donor) {
+    const auto * meta = get_tensor_meta(tn.str().c_str());
+    if (no_alloc || files.empty() || !meta || !donor || !donor->buffer || !donor->data || strcmp(meta->name, donor->name) != 0 ||
+            meta->type != donor->type || !ggml_are_same_shape(meta, donor) || !ggml_is_contiguous(donor) ||
+            ggml_exl3_bits(donor->type) || donor->type == GGML_TYPE_NVFP4 ||
+            ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(donor->buffer), donor) != ggml_nbytes(donor)) {
+        return false;
+    }
+    check_tensor_dims(tn.str(), std::vector<int64_t>(ne), true, false);
+    const auto & weight = require_weight(tn.str().c_str());
+    if (files.at(weight.idx)->read_alignment() != 1) { return false; }
+    const size_t bytes = ggml_nbytes(meta);
+    // Compare before mapping/loading the helper; keep host scratch bounded to two MiB.
+    std::vector<uint8_t> file_bytes(1 << 20), donor_bytes(1 << 20);
+    for (size_t offset = 0; offset < bytes; ) {
+        const size_t count = std::min(file_bytes.size(), bytes - offset);
+        auto & file = files.at(weight.idx);
+        file->seek(weight.offs + offset, SEEK_SET);
+        file->read_raw(file_bytes.data(), count);
+        ggml_backend_tensor_get(donor, donor_bytes.data(), offset, count);
+        if (memcmp(file_bytes.data(), donor_bytes.data(), count) != 0) {
+            LLAMA_LOG_INFO("%s: %s differs from target; loading its own storage\n", __func__, meta->name);
+            return false;
+        }
+        offset += count;
+    }
+    ++n_created;
+    size_data -= bytes;
+    LLAMA_LOG_INFO("%s: borrowing target %s (%s, %.2f MiB); no second weight allocation\n", __func__,
+            donor->name, ggml_type_name(donor->type), bytes / 1048576.0);
+    return true;
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
@@ -1427,6 +1576,10 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
     }
+    if (n_offload_repack_skipped > 0) {
+        LLAMA_LOG_INFO("%s: %zu CPU-overridden weights on GPU layers kept unrepacked so the GPU can offload their large batches (LLAMA_OFFLOAD_KEEP_REPACK=1 to repack)\n",
+            __func__, n_offload_repack_skipped);
+    }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
@@ -1434,7 +1587,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool private_dense) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1453,10 +1606,20 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+            const size_t prefetch_size = prefetch && use_mmap && !use_moe_arena ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
+            if (private_dense) {
+                for (const char * name : { "token_embd.weight", "output.weight" }) {
+                    auto found = weights_map.find(name);
+                    if (found != weights_map.end() && found->second.idx == idx) {
+                        const auto & weight = found->second;
+                        mapping->remap_private_writable(file.get(), weight.offs, weight.offs + ggml_nbytes(weight.tensor));
+                        LLAMA_LOG_INFO("%s: private dense mapping %s for borrowed CUDA host residency; file unchanged\n", __func__, name);
+                    }
+                }
+            }
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1482,7 +1645,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     *addr = mapping->addr();
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
-        if (!weight || weight->idx != idx) {
+        if (!weight || weight->idx != idx || arena_tensors.count(tensor)) {
             continue;
         }
         *first = std::min(*first, weight->offs);
@@ -1635,6 +1798,50 @@ bool llama_model_loader::load_all_data(
         tensors.push_back(cur);
     }
 
+    const auto load_start = std::chrono::steady_clock::now();
+    double preread_seconds = 0;
+    size_t preread_bytes = 0, upload_bytes = 0;
+#ifdef __linux__
+    // LOADFAST (opt-in LLAMA_LOAD_PREREAD=1): tensors copied from the mapping into device buffers
+    // are read single-threaded through page faults below. Read their file ranges into the page
+    // cache first with parallel reads so the copies below find the bytes in RAM. Bytes unchanged.
+    if (const char * pre = getenv("LLAMA_LOAD_PREREAD"); pre && atoi(pre) != 0 && use_mmap) {
+        const auto pre_start = std::chrono::steady_clock::now();
+        struct range { int fd; size_t first, last; };
+        std::vector<range> ranges;
+        for (auto * cur : tensors) {
+            const auto * weight = get_weight(ggml_get_name(cur));
+            if (!weight || arena_tensors.count(cur) || lazy.has(cur) || !cur->buffer || ggml_backend_buffer_is_host(cur->buffer)) { continue; }
+            const int fd = files.at(weight->idx)->file_id();
+            const size_t chunk = (size_t) 8 << 20;
+            for (size_t a = weight->offs; a < weight->offs + ggml_nbytes(cur); a += chunk) {
+                ranges.push_back({ fd, a, std::min(weight->offs + ggml_nbytes(cur), a + chunk) });
+            }
+        }
+        std::atomic<size_t> next{0}, got_total{0};
+        auto worker = [&]() {
+            std::vector<char> scratch((size_t) 8 << 20);
+            for (size_t k = next++; k < ranges.size(); k = next++) {
+                const auto & r = ranges[k];
+                size_t got = 0;
+                while (got < r.last - r.first) {
+                    const ssize_t n = pread(r.fd, scratch.data(), std::min(scratch.size(), r.last - r.first - got), (off_t) (r.first + got));
+                    if (n < 0 && errno == EINTR) { continue; }
+                    if (n <= 0) { break; }
+                    got += (size_t) n;
+                }
+                got_total += got;
+            }
+        };
+        std::vector<std::thread> pool;
+        const int n_threads = ranges.size() > 1 ? 8 : 0;
+        for (int i = 0; i < n_threads; ++i) { pool.emplace_back(worker); }
+        for (auto & t : pool) { t.join(); }
+        preread_bytes = got_total.load();
+        preread_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pre_start).count();
+    }
+#endif
+
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
     if (!use_mmap) {
@@ -1648,6 +1855,8 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    size_t router_bf16_bytes = 0;
+    size_t router_bf16_count = 0;
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1661,7 +1870,25 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        if (arena_tensors.count(cur)) { continue; }
         size_t n_size = ggml_nbytes(cur);
+
+        if (cur->type == GGML_TYPE_BF16 && weight->tensor->type == GGML_TYPE_F32) {
+            if (!cur->data || !cur->buffer || ggml_backend_buffer_is_host(cur->buffer) ||
+                    ggml_nelements(cur) != ggml_nelements(weight->tensor)) {
+                throw std::runtime_error(format("invalid BF16 router allocation for '%s'", cur->name));
+            }
+            const size_t source_size = ggml_nbytes(weight->tensor);
+            std::vector<float> staging(use_mmap ? 0 : ggml_nelements(cur));
+            const auto * source = static_cast<const float *>(load_data_range(*weight, 0, source_size, staging.data()));
+            std::vector<ggml_bf16_t> converted(ggml_nelements(cur));
+            ggml_fp32_to_bf16_row(source, converted.data(), ggml_nelements(cur));
+            ggml_backend_tensor_set(cur, converted.data(), 0, n_size);
+            size_done += source_size;
+            router_bf16_bytes += source_size - n_size;
+            ++router_bf16_count;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -1694,6 +1921,7 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                upload_bytes += n_size;
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1776,10 +2004,20 @@ bool llama_model_loader::load_all_data(
         size_done += n_size;
     }
 
+    if (router_bf16_count) {
+        LLAMA_LOG_WARN("%s: experimental BF16 router storage: %zu CUDA tensors, %.2f MiB less weight storage; arithmetic/replay qualification pending\n",
+                __func__, router_bf16_count, router_bf16_bytes / 1048576.0);
+    }
+
     // free temporary resources used for async uploads
     for (auto * event : events) {
         ggml_backend_event_synchronize(event);
         ggml_backend_event_free(event);
+    }
+    if (upload_bytes || preread_bytes) {
+        LLAMA_LOG_INFO("%s: [LOADFAST] copied %.2f MiB from the mapping into device buffers in %.2f s (parallel pre-read %.2f MiB in %.2f s)\n",
+                __func__, upload_bytes / 1048576.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - load_start).count(),
+                preread_bytes / 1048576.0, preread_seconds);
     }
     for (auto * buf : host_buffers) {
         ggml_backend_buffer_free(buf);
@@ -1834,4 +2072,249 @@ void llama_model_loader::print_info() const {
     } else {
         LLAMA_LOG_INFO("%s: file size   = %.2f GiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0/1024.0, n_bytes*8.0/n_elements);
     }
+}
+
+std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progress_callback callback, void * user_data) {
+    if (!use_moe_arena || no_alloc) { return nullptr; }
+    std::map<int, std::vector<ggml_tensor *>> layers;
+    for (const auto & entry : ctx_map) {
+        for (auto * t = ggml_get_first_tensor(entry.second.get()); t; t = ggml_get_next_tensor(entry.second.get(), t)) {
+            int layer = -1;
+            if (llama_moe_arena::is_trunk_expert(t->name, moe_arena_layers) && sscanf(t->name, "blk.%d.", &layer) == 1) {
+                layers[layer].push_back(t);
+            }
+        }
+    }
+    size_t total = 0;
+    size_t largest_layer = 0;
+    for (auto & entry : layers) {
+        auto & ts = entry.second;
+        if (ts.size() != 3) { throw std::runtime_error("expert arena requires gate/up/down triples"); }
+        std::sort(ts.begin(), ts.end(), [](const auto * a, const auto * b) {
+            auto role = [](const char * n) { return strstr(n, "gate") ? 0 : strstr(n, "up") ? 1 : 2; };
+            return role(a->name) < role(b->name);
+        });
+        size_t layer_bytes = 0;
+        for (auto * t : ts) {
+            if (!ggml_is_contiguous(t) || t->ne[2] != ts[0]->ne[2] || ggml_nbytes(t) > SIZE_MAX - total) {
+                throw std::runtime_error("unsupported expert arena layout");
+            }
+            total += ggml_nbytes(t);
+            layer_bytes += ggml_nbytes(t);
+        }
+        largest_layer = std::max(largest_layer, layer_bytes);
+    }
+    size_t reserve = 7ull << 30;
+    const char * shared_mtp = getenv("GGML_MOE_CACHE_MTP_SHARED");
+    if (shared_mtp && strcmp(shared_mtp, "1") == 0) {
+        // fork: Keep one expert layer and the device mapper's 2 GiB margin available after full-arena pinning.
+        const size_t mapping_margin = 2ull << 30;
+        if (largest_layer > SIZE_MAX - reserve - mapping_margin) { return nullptr; }
+        reserve += largest_layer + mapping_margin;
+    }
+    const size_t available = llama_moe_arena::available_memory();
+    if (available < reserve || total > available - reserve || !llama_moe_arena::pin_supported()) {
+        LLAMA_LOG_WARN("%s: %.2f GiB experts use unpinned mmap storage; %.2f GiB available, %.2f GiB pinning headroom required\n",
+                __func__, total / double(GiB), available / double(GiB), reserve / double(GiB));
+#ifdef __linux__
+        const char * device_cache = getenv("GGML_MOE_CACHE_DEVICE");
+        if (device_cache && strcmp(device_cache, "1") == 0) {
+            // fork: CUDA can register cold expert pages in place without changing the weight file.
+            for (const auto & entry : layers) {
+                for (const auto * t : entry.second) {
+                    const auto & w = require_weight(t->name);
+                    auto & mapping = mappings.at(w.idx);
+                    const size_t bytes = ggml_nbytes(t);
+                    if (w.offs > mapping->size() || bytes > mapping->size() - w.offs) {
+                        throw std::runtime_error("expert mapping exceeds weight file");
+                    }
+                    mapping->remap_private_writable(files.at(w.idx).get(), w.offs, w.offs + bytes);
+                }
+            }
+            LLAMA_LOG_INFO("%s: fallback expert mappings are private writable; weight files unchanged\n", __func__);
+        }
+#endif
+        // No arena tensor has been allocated or reshaped yet. Normal buffer creation
+        // and load_all_data bind the original file views without faulting them all in.
+        return nullptr;
+    }
+    auto arena = std::make_unique<llama_moe_arena>(total);
+#ifdef __linux__
+    // LOADFAST: parallel direct reads (opt-in). Same arena layout and bytes as the loop below.
+    if (const char * fast = getenv("LLAMA_MOE_ARENA_FASTLOAD"); fast && atoi(fast) != 0) {
+        struct placed { ggml_tensor * t; const llama_tensor_weight * w; size_t offset, stride; };
+        std::vector<placed> order;
+        std::vector<llama_moe_arena_copy> copies;
+        size_t fast_base = 0;
+        for (const auto & entry : layers) {
+            const auto & ts = entry.second;
+            size_t stride = 0;
+            for (auto * t : ts) { stride += t->nb[2]; }
+            size_t role_offset = 0;
+            for (auto * t : ts) {
+                const auto & w = require_weight(t->name);
+                llama_moe_arena_copy c;
+                c.fd = files.at(w.idx)->file_id();
+                c.src_offset = w.offs;
+                c.expert_bytes = t->nb[2];
+                c.n_expert = t->ne[2];
+                c.dst = (char *) arena->data + fast_base + role_offset;
+                c.dst_stride = stride;
+                copies.push_back(c);
+                order.push_back({ t, &w, fast_base + role_offset, stride });
+                role_offset += t->nb[2];
+            }
+            fast_base += stride * (size_t) ts[0]->ne[2];
+        }
+        struct progress_state { llama_progress_callback cb; void * ud; size_t done0, size_data; } ps{ callback, user_data, size_done, size_data };
+        llama_moe_arena_load_stats stats;
+        // The one whole-arena CUDA registration runs beside the reads (it faults in and locks the
+        // pages; the readers then fill the same pages), so its cost hides under the disk time.
+        const char * pin_early_env = getenv("LLAMA_MOE_ARENA_PIN_EARLY");
+        const bool pin_early = !pin_early_env || atoi(pin_early_env) != 0;
+        std::atomic<int> pin_result{0};
+        double pin_seconds = 0;
+        struct pin_thread {
+            std::thread t;
+            ~pin_thread() { if (t.joinable()) { t.join(); } }
+        } pinner;
+        const auto pin_start = std::chrono::steady_clock::now();
+        if (pin_early) {
+            pinner.t = std::thread([&]() {
+                try { arena->pin(); pin_result = 1; } catch (...) { pin_result = -1; }
+                pin_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_start).count();
+            });
+        }
+        llama_moe_arena_parallel_load(copies, [](size_t done, void * u) {
+            auto * p = (progress_state *) u;
+            return !p->cb || p->cb(float(p->done0 + done) / p->size_data, p->ud);
+        }, &ps, 5ull << 30, stats);
+        for (const auto & p : order) {
+            auto * t = p.t;
+            const size_t bytes = t->nb[2];
+            if (check_tensors) {
+                for (int64_t e = 0; e < t->ne[2]; ++e) {
+                    if (!ggml_validate_row_data(t->type, (char *) arena->data + p.offset + (size_t) e * p.stride, bytes)) {
+                        throw std::runtime_error(format("expert arena tensor '%s' has invalid data", t->name));
+                    }
+                }
+            }
+            // the file pages were never touched; drop the mapped range like the copy loop does
+            if (use_mmap) { mappings.at(p.w->idx)->unmap_fragment(p.w->offs, p.w->offs + ggml_nbytes(t)); }
+            const size_t original_size = ggml_nbytes(t);
+            t->nb[2] = p.stride;
+            t->nb[3] = p.stride * (size_t) t->ne[2];
+            if (ggml_backend_tensor_alloc(arena->buffer.get(), t, (char *) arena->data + p.offset) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("expert arena tensor allocation failed");
+            }
+            arena_tensors.insert(t);
+            size_done += original_size;
+        }
+        LLAMA_LOG_INFO("%s: [LOADFAST] copied %.2f GiB in %.2f s (%.2f GiB/s), %d threads, %zu MiB reads, %s, read %.2f GiB, %.2f GiB MemAvailable\n",
+                __func__, total / double(GiB), stats.seconds, total / double(GiB) / std::max(stats.seconds, 1e-9), stats.threads,
+                stats.chunk >> 20, stats.direct ? "direct (page cache bypassed)" : "buffered (pages dropped after use)",
+                stats.bytes_read / double(GiB), llama_moe_arena::available_memory() / double(GiB));
+        if (pin_early) {
+            pinner.t.join();
+            if (pin_result.load() != 1) { throw std::runtime_error("expert arena CUDA host registration failed"); }
+        } else {
+            const auto late_start = std::chrono::steady_clock::now();
+            arena->pin();
+            pin_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - late_start).count();
+        }
+        if (llama_moe_arena::available_memory() < (5ull << 30)) {
+            throw std::runtime_error("expert arena pinning left less than 5 GiB MemAvailable");
+        }
+        if (llama_moe_arena::available_memory() < (7ull << 30)) {
+            LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
+                    llama_moe_arena::available_memory() / double(GiB));
+        }
+        LLAMA_LOG_INFO("%s: %.2f GiB pinned (%s, registration took %.2f s), load+pin %.2f s, gate/up/down grouped by expert, original weight blocks preserved\n",
+                __func__, total / double(GiB), pin_early ? "registered beside the reads" : "registered after the reads", pin_seconds,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_start).count());
+        return arena;
+    }
+#endif
+    size_t base = 0;
+    for (const auto & entry : layers) {
+        const auto & ts = entry.second;
+        size_t stride = 0;
+        for (auto * t : ts) { stride += t->nb[2]; }
+        size_t role_offset = 0;
+        for (auto * t : ts) {
+            const auto & w = require_weight(t->name);
+            const size_t bytes = t->nb[2];
+            const size_t original_size = ggml_nbytes(t);
+            // Startup speed: the copy below is single-threaded and reads the file through page
+            // faults, and the loop drops each finished group from the page cache. Ask the kernel
+            // to read the next groups ahead of the copy so the disk and the copy overlap.
+            // Pure hint: it never changes which bytes are copied. v0.6/all: opt-in (unmeasured), e.g.
+            // LLAMA_MOE_ARENA_READAHEAD=24; unset or 0 = off.
+            constexpr int64_t arena_group = 16;
+            static const int64_t arena_ahead = [] {
+                const char * v = getenv("LLAMA_MOE_ARENA_READAHEAD");
+                return v ? (int64_t) atoll(v) : (int64_t) 0;
+            }();
+            int64_t arena_hinted = 0;
+            for (int64_t e = 0; e < t->ne[2]; ++e) {
+#if defined(__linux__)
+                if (arena_ahead > 0 && e % arena_group == 0) {
+                    const int64_t want = std::min<int64_t>(t->ne[2], e + arena_group * arena_ahead);
+                    if (want > arena_hinted) {
+                        posix_fadvise(files.at(w.idx)->file_id(), w.offs + (size_t) arena_hinted * bytes,
+                                (size_t) (want - arena_hinted) * bytes, POSIX_FADV_WILLNEED);
+                        arena_hinted = want;
+                    }
+                }
+#endif
+                if (callback && !callback(float(size_done + (size_t)e * bytes) / size_data, user_data)) {
+                    throw std::runtime_error("expert arena loading canceled");
+                }
+                void * dst = (char *) arena->data + base + role_offset + (size_t) e * stride;
+                const void * src = load_data_range(w, (size_t) e * bytes, bytes, dst);
+                if (src != dst) { memcpy(dst, src, bytes); }
+                if (check_tensors && !ggml_validate_row_data(t->type, dst, bytes)) {
+                    throw std::runtime_error(format("expert arena tensor '%s' has invalid data", t->name));
+                }
+                // Bound live file pages without leaving one mapped boundary
+                // page per expert or repeatedly scanning a fragmented mapping.
+                constexpr int64_t release_group = 16;
+                if ((e + 1) % release_group == 0 || e + 1 == t->ne[2]) {
+#ifndef _WIN32
+                    const int64_t first_expert = e - e % release_group;
+                    const size_t first = w.offs + (size_t)first_expert * bytes;
+                    const size_t count = (size_t)(e - first_expert + 1) * bytes;
+                    if (use_mmap) { mappings.at(w.idx)->unmap_fragment(first, first + count); }
+#ifdef __linux__
+                    posix_fadvise(files.at(w.idx)->file_id(), first, count, POSIX_FADV_DONTNEED);
+#endif
+#endif
+                    if (llama_moe_arena::available_memory() < (5ull << 30)) {
+                        throw std::runtime_error("expert arena stopped: less than 5 GiB MemAvailable");
+                    }
+                }
+            }
+            t->nb[2] = stride;
+            t->nb[3] = stride * (size_t) t->ne[2];
+            if (ggml_backend_tensor_alloc(arena->buffer.get(), t, (char *) arena->data + base + role_offset) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("expert arena tensor allocation failed");
+            }
+            arena_tensors.insert(t);
+            size_done += original_size;
+            role_offset += bytes;
+        }
+        base += stride * (size_t) ts[0]->ne[2];
+        LLAMA_LOG_INFO("%s: layer %d copied, %.2f GiB MemAvailable\n", __func__, entry.first,
+                llama_moe_arena::available_memory() / double(GiB));
+    }
+    arena->pin();
+    if (llama_moe_arena::available_memory() < (5ull << 30)) {
+        throw std::runtime_error("expert arena pinning left less than 5 GiB MemAvailable");
+    }
+    if (llama_moe_arena::available_memory() < (7ull << 30)) {
+        LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
+                llama_moe_arena::available_memory() / double(GiB));
+    }
+    LLAMA_LOG_INFO("%s: %.2f GiB pinned, gate/up/down grouped by expert, original weight blocks preserved\n", __func__, total / double(GiB));
+    return arena;
 }

@@ -44,6 +44,10 @@ ggml_type llama_kv_cache_turbo_layer_adaptive_type_v(
 // llama_kv_cache
 //
 
+// [#240] SJ-KVaRN exact checkpoint section (llama_kv_cache::state_write_sj_ckpt): header magic, trailer magic
+static constexpr uint32_t LLAMA_SJ_KVARN_CKPT_MAGIC     = 0x4b434a53u; // "SJCK"
+static constexpr uint32_t LLAMA_SJ_KVARN_CKPT_END_MAGIC = 0x45434a53u; // "SJCE"
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -147,7 +151,7 @@ public:
                           size_t kv_stream_maximum_pool_bytes = 0,
            llama_sj_kvarn_config   sj_kvarn = llama_sj_kvarn_config());
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache() { scratch_cancel(); }
 
     //
     // llama_memory_i
@@ -159,6 +163,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_single_seq() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -196,6 +201,15 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
     bool get_v_transposed() const;
+    // Caller synchronizes and releases these views before the next layer or any cache mutation.
+    std::vector<ggml_backend_buffer_ptr> b1_scratch_views(ggml_backend_buffer_type_t buft, int32_t first_unused_layer, uint32_t prompt_cells) const;
+
+
+    // Borrow unused cache bytes until the consumer is synchronized and releases them.
+    std::vector<ggml_backend_buffer_ptr> scratch_borrow(ggml_backend_buffer_type_t buft, size_t chunk_bytes, size_t max_chunks, size_t min_free_bytes, uint32_t guard_tokens, void (*cancel)(void *), void * user);
+    bool scratch_safe(uint32_t n_tokens) const;
+    void scratch_release();
+    void scratch_cancel();
 
     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
     bool kv_stream_resize_pool(
@@ -225,6 +239,9 @@ public:
       llama_state_seq_flags   flags,
           slot_info_vec_t *   sinfos_out,
      const slot_info_vec_t *   sinfos_in);
+
+    // Restore metadata omitted by a raw-key mirror from its owning attention cache.
+    void state_mirror_cell_ext(const llama_kv_cache & source, const slot_info_vec_t & slots);
 
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
@@ -269,6 +286,15 @@ public:
     int  sj_kvarn_rot_group() const { return sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? 128 : 256; }
     ggml_tensor * get_sj_kvarn_body(int32_t il) const;
     bool maintain_sj_kvarn(llama_context * lctx);
+    // [B1] layer-major prefill: every ubatch of the call is applied up front, so the seal bookkeeping of each one is
+    // saved after its apply (b1_sj_save, which also advances B and takes the paged records the way maintenance
+    // would), restored before each of its layer slices (b1_sj_seek), and each slice seals its own layers only
+    // (b1_sj_seal). One sequence per call.
+    void b1_sj_begin(llama_seq_id seq_id); // before the call's first apply: snapshot the bookkeeping for b1_sj_rewind
+    void b1_sj_save(size_t i);
+    bool b1_sj_seek(size_t i);
+    bool b1_sj_seal(llama_context * lctx, int32_t il0, int32_t il1);
+    void b1_sj_rewind(); // undo the bookkeeping of a call whose ubatches were applied but never computed
     int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
     // sealed end: of the sequence's stream (seq_id >= 0), or the largest over all streams (seq_id < 0)
     uint32_t get_sj_kvarn_sealed_end(llama_seq_id seq_id = -1) const;
@@ -410,6 +436,11 @@ private:
     uint64_t sj_wush_hash = 0;                 // FNV-1a 64 of the transform file (0 = off)
     size_t   sj_kvarn_rec_bytes[2]  = {0, 0}; // per tier (0 interior, 1 edge)
     uint32_t sj_kvarn_n_layers_edge = 0;      // cache layers on tier 1 (first + last edge_layers)
+    // [NOSEAL] investigation switch LLAMA_SJKVARN_NOSEAL=<model layers>: those layers never seal (tier 1 with the
+    // interior codec; their descriptor keeps the sealed end at the sink, so every position past the sink is read from the
+    // ring), and the ring is sized to the whole context so no ring row is ever overwritten. Off (unset) by default.
+    std::vector<int32_t> sj_kvarn_noseal_il;
+    bool sj_kvarn_noseal = false;              // the switch is set (ring sized to the context), possibly with no layer
     // per-stream bookkeeping (one stream per sequence; a single-sequence cache has exactly one)
     struct sj_kvarn_stream {
         uint32_t B         = 0;     // sealed end
@@ -420,11 +451,14 @@ private:
         // positions [ring_lo, N) still hold their ring rows (lower ones were overwritten by p + cap or never
         // restored); a body truncation may reopen sealed groups there
         uint32_t ring_lo   = 0;
+        // [#240] an exact checkpoint restored the stream at this position: the next prefill_cut there keeps it as is
+        int64_t  exact_at  = -1;
         // paged pool only: logical group g of this stream lives in pool record table[g] (-1: not allocated).
         // Groups [0, (B - sink)/group) are allocated, the rest are not.
         std::vector<int32_t> table;
     };
     std::vector<sj_kvarn_stream> sj_kvarn_st;
+    sj_kvarn_stream b1_sj_pre; // [B1] the bookkeeping before the current layer-major call (for b1_sj_rewind)
     // Paged record pool (n_stream > 1): records are handed out per group at seal time from a free list and
     // reference counted (seq_cp shares sealed records, which are immutable). Phase 1 (per-stream contexts) sizes
     // the pool for every stream at full length, so it never runs out; with --kv-unified the pool holds
@@ -435,6 +469,17 @@ private:
     uint32_t sj_kvarn_kv_rows      = 0;     // rows per stream of the K/V tensors (sink + ring + f16 sink rows)
     std::vector<int32_t>  sj_kvarn_free;    // free pool records (stack)
     std::vector<uint16_t> sj_kvarn_ref;     // per pool record reference count
+    struct {
+        void (*cancel)(void *) = nullptr;
+        void * user = nullptr;
+        std::vector<uint32_t> limits;
+        std::vector<int32_t> records;
+        uint32_t first_group = UINT32_MAX;
+        uint32_t guard_tokens = 0;
+        size_t min_free_bytes = 0;
+        size_t record_bytes = 0;
+        ggml_backend_buffer_type_t buft = nullptr;
+    } scratch;
     void     sj_kvarn_reset_stream(uint32_t strm);              // drop all records and state of one stream
     void     sj_kvarn_release_groups(uint32_t strm, uint32_t g0); // drop the stream's records of groups >= g0
     bool     sj_kvarn_alloc_groups(uint32_t strm, uint32_t g0, uint32_t g1); // allocate records for groups [g0, g1)
@@ -477,6 +522,15 @@ private:
         ggml_tensor * desc[2] = {nullptr, nullptr}; // per tier
     };
     std::vector<std::vector<sj_kvarn_maintenance_graph>> sj_kvarn_maintenance_graphs; // [stream][backend]
+    // [B1] per ubatch of the current layer-major call: the stream bookkeeping its graph sees (B_old = sealed end
+    // before it, B = after its seal)
+    struct b1_sj_view { uint32_t B_old, B, N, ring_lo; bool draining; };
+    std::vector<b1_sj_view> b1_sj;
+    size_t   b1_sj_cur  = 0;
+    uint32_t b1_sj_strm = 0;     // the call's stream
+    bool     b1_sj_bad  = false; // a save failed (paged pool exhausted): every seek fails, the call falls back
+    std::vector<uint32_t> b1_sj_new; // paged: groups whose records this call took (for b1_sj_rewind)
+    std::vector<std::vector<sj_kvarn_maintenance_graph>> b1_sj_graphs; // [stream][cache layer]: one seal node each
     bool maintain_sj_kvarn_stream(llama_context * lctx, uint32_t strm);
 
     // pre-computed hadamard martrices
@@ -615,6 +669,11 @@ private:
     // SJ-KVaRN sequence state (format: see the comment above state_write_sj_kvarn in llama-kv-cache.cpp)
     void state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id seq_id) const;
     uint32_t state_read_sj_kvarn (llama_io_read_i  & io, llama_seq_id seq_id); // returns the cells restored
+public:
+    // [#240] exact checkpoint section (LLAMA_STATE_SEQ_FLAGS_SJ_EXACT): seal state + open ring rows of one sequence
+    void state_write_sj_ckpt(llama_io_write_i & io, llama_seq_id seq_id) const;
+    void state_read_sj_ckpt (llama_io_read_i  & io, llama_seq_id seq_id);
+private:
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -628,7 +687,7 @@ public:
 
     // used to create a full-cache context
     llama_kv_cache_context(
-            llama_kv_cache * kv);
+            llama_kv_cache * kv, bool single_seq = false);
 
     // used to create an update context
     llama_kv_cache_context(
@@ -657,6 +716,11 @@ public:
 
     bool has_kv_stream_targets() const override;
     std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const override;
+
+    // [B1] layer-major prefill: the per-ubatch view is i_cur + n_kv (the slot infos are kept anyway)
+    bool b1_supported() const override;
+    void b1_save() override;
+    bool b1_seek(size_t i) override;
 
     //
     // llama_kv_cache_context specific API
@@ -759,4 +823,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // [B1] n_kv of each ubatch, recorded right after its apply()
+    std::vector<int32_t> b1_n_kv;
 };

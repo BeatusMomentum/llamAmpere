@@ -56,6 +56,12 @@ struct task_params {
     bool return_tokens   = false;
     bool return_progress = false;
 
+    // warm prefill (--warm-prefill): a background prompt-only task that fills the
+    // slot's cache with the next turn's known prefix and then releases the slot
+    // without sampling or sending a result
+    bool    warm          = false;
+    int32_t warm_src_task = -1; // id of the completed task whose reply this warms
+
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
@@ -67,7 +73,7 @@ struct task_params {
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
     // eval-cache builder (--eval-cache-build): snapshot the prompt state at the start of the prompt batch that
-    // contains this token count (a batch boundary the same prompt also has without a cache), 0 = off
+    // contains this token count; if it fits in the first batch, use a physical batch boundary before the logits tail, 0 = off
     int32_t eval_cache_save_at = 0;
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement

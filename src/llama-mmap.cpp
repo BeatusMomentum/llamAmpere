@@ -10,6 +10,10 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -685,6 +689,26 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
+void llama_mmap::remap_private_writable(llama_file * file, size_t first, size_t last) {
+#ifdef _POSIX_MAPPED_FILES
+    const size_t page = sysconf(_SC_PAGESIZE);
+    if (first >= last || last > size() || last > SIZE_MAX - (page - 1)) {
+        throw std::runtime_error("invalid private tensor mapping range");
+    }
+    first &= ~(page - 1);
+    last = (last + page - 1) & ~(page - 1);
+    void * target = (char *) addr() + first;
+    if (mmap(target, last - first, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, file->file_id(), first) == MAP_FAILED) {
+        throw std::runtime_error(format("private tensor remap failed: %s", strerror(errno)));
+    }
+#else
+    GGML_UNUSED(file);
+    GGML_UNUSED(first);
+    GGML_UNUSED(last);
+    throw std::runtime_error("private tensor remap unsupported on this platform");
+#endif
+}
+
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
 #else
@@ -806,6 +830,11 @@ struct llama_mlock::impl {
             return;
         }
         size_t granularity = lock_granularity();
+        if (granularity == 0 || target_size > SIZE_MAX - (granularity - 1)) {
+            LLAMA_LOG_WARN("warning: mlock size alignment overflows\n");
+            failed_already = true;
+            return;
+        }
         target_size = (target_size + granularity - 1) & ~(granularity - 1);
         if (target_size > size) {
             if (raw_lock((uint8_t *) addr + size, target_size - size)) {
@@ -827,6 +856,7 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+size_t llama_mlock::locked_size() const { return pimpl->size; }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;
@@ -873,7 +903,23 @@ void llama_prefetch(llama_memory_ranges mr) {
         return true;
     };
 #else
+    // [PLEMT] opt-in: LLAMA_PREFETCH_THREADS=N issues the merged ranges from N threads. One thread calling
+    // madvise(MADV_WILLNEED) one range at a time keeps few reads in flight, and a 12,288-token Flash-Next ubatch
+    // touches ~130K scattered pages of the PLE table; N threads keep the SSD queue full. Reads only.
+    static const int n_threads = [] {
+        const char * v = getenv("LLAMA_PREFETCH_THREADS");
+        const int n = v ? std::max(1, std::min(64, atoi(v))) : 1;
+        if (n > 1) {
+            LLAMA_LOG_INFO("llama_prefetch: [PLEMT] %d threads (LLAMA_PREFETCH_THREADS)\n", n);
+        }
+        return n;
+    }();
+    std::vector<std::pair<uintptr_t, uintptr_t>> merged;
     auto prefetch = [&]() {
+        if (n_threads > 1) {
+            merged.emplace_back(begin, end);
+            return true;
+        }
         if (madvise((void *) begin, end - begin, MADV_WILLNEED) != 0) {
             LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
             return false;
@@ -902,6 +948,33 @@ void llama_prefetch(llama_memory_ranges mr) {
     if (end) {
         prefetch();
     }
+#if !defined(_WIN32)
+    if (!merged.empty()) {
+        // [PLEMT] at least ~1K ranges per thread, so small calls (decode) stay on this thread
+        const size_t n_t = std::min<size_t>((size_t) n_threads, (merged.size() + 1023) / 1024);
+        std::atomic<bool> failed{false};
+        auto work = [&](size_t t) {
+            const size_t a = merged.size() * t / n_t;
+            const size_t b = merged.size() * (t + 1) / n_t;
+            for (size_t k = a; k < b && !failed.load(std::memory_order_relaxed); ++k) {
+                if (madvise((void *) merged[k].first, merged[k].second - merged[k].first, MADV_WILLNEED) != 0) {
+                    failed = true;
+                }
+            }
+        };
+        std::vector<std::thread> workers;
+        for (size_t t = 1; t < n_t; ++t) {
+            workers.emplace_back(work, t);
+        }
+        work(0);
+        for (auto & w : workers) {
+            w.join();
+        }
+        if (failed) {
+            LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed\n");
+        }
+    }
+#endif
 #if defined(_WIN32)
     if (!entries.empty() && !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
         LLAMA_LOG_WARN("llama_prefetch: PrefetchVirtualMemory failed: %s\n",

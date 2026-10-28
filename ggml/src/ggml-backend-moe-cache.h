@@ -42,11 +42,19 @@ struct ggml_moe_cache_shape_caps {
 struct ggml_moe_cache_tensor_desc {
     const char * name;
     const void * data;
+    // Host byte stride between experts; device storage uses the compact row bytes.
     size_t expert_size;
     int64_t n_in;
     int64_t n_out;
     int64_t n_expert;
     int32_t type;
+};
+
+// fork: immutable model-owned original expert copies, independent of scheduler sessions.
+struct ggml_moe_resident_span {
+    const void * host;
+    const void * device;
+    size_t size;
 };
 
 enum ggml_moe_cache_mode {
@@ -58,6 +66,21 @@ enum ggml_moe_cache_mode {
 
 struct ggml_moe_cache_api {
     const void * owner;
+
+    // fork: startup-only permanent residency. Creation requires a valid saved profile.
+    void * (*resident_create)(void * device, const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors, size_t budget);
+    void (*resident_destroy)(void * resident);
+    size_t (*resident_spans)(void * resident, struct ggml_moe_resident_span * spans, size_t capacity);
+    // Mark only after an idle caller has safely discarded covered anonymous host pages.
+    void (*resident_dropped)(void * resident, int (*on_restore)(void *), void * user_data);
+    // Restore all missing host bytes that overlap a read, from the permanent GPU copy.
+    int (*host_restore)(const void * data, size_t size);
+    // Exact original bytes, on this device, or NULL. The model owns the result's lifetime.
+    int (*resident_copy)(void * backend, struct ggml_tensor * dst, size_t offset, const void * host, size_t size);
+    const void * (*resident_lookup)(const void * data, size_t size, void * device);
+
+    // Read-only startup status; returns 1 for an active session, 0 for dormant.
+    int (*session_status)(void * session, size_t * allocated_bytes);
 
     int (*query_config)(int automatic, size_t budget_mib, struct ggml_moe_cache_config * config);
     int (*query_device)(void * device, const struct ggml_moe_cache_config * config, struct ggml_moe_cache_device_caps * caps);
@@ -103,7 +126,57 @@ struct ggml_moe_cache_api {
 
     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);
+
+    // Fill free slots from ranked prompt usage without adding synthetic decode observations. NULL counts loads an optional provider profile.
+    int (*warm)(void * session, const struct ggml_moe_cache_tensor_desc * tensors,
+                const uint64_t * const * counts, int n_tensors);
+
+    // Explicit idle-boundary diagnostic only; optional and disabled by the caller.
+    void (*print_stats)(void * session);
+
+    // fork: optional fixed device tables; preparation maps only nonresident experts.
+    int (*device_prepare)(void * session, const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors);
+    int (*device_supports)(void * session, void * backend, const struct ggml_tensor * op);
+
+    // Planned decode limit, including before deferred device preparation.
+    int (*decode_capacity)(void * session, int64_t n_expert_used, const int32_t * types, int n_types);
+
+    // Idle-turn lending only: release low-use slots, then restore capacity after prompt scratch is freed.
+    size_t (*trim)(void * session, size_t bytes);
+    size_t (*restore)(void * session);
+
+    // Experimental decode prefetch. IDs arrive in GPU score order. No math is skipped.
+    void (*prefetch)(void * session, const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors,
+                     const int32_t * ids, int n_ids, int source_layer, int target_layer, int automatic);
+    // Called at layer entry and after real routing; ids == NULL marks layer entry.
+    void (*prefetch_observe)(void * session, int layer, const int32_t * ids, int n_ids);
+    void (*prefetch_configure)(void * session, int mode);
+
+    // A prompt returned a suspended pool; the replacement session is past startup.
+    void (*prompt_resume)(void * session);
+
+    // Optional residency probe for the expert keep policy (#215/#217). For each ids[i], sets resident[i] to 1 when that
+    // expert of the tensor is valid in the active session's device pool right now, else 0. No side effects: no fills,
+    // no demand counts, no LRU or pin changes. Returns the number of resident ids. NULL means nothing is resident.
+    int (*resident)(const struct ggml_moe_cache_tensor_desc * tensor, const int32_t * ids, int n_ids, uint8_t * resident);
 };
+
+GGML_API void ggml_backend_sched_moe_cache_prefetch_configure(ggml_backend_sched_t sched, int mode);
+GGML_API int ggml_backend_sched_moe_cache_warm(ggml_backend_sched_t sched,
+        const struct ggml_moe_cache_tensor_desc * tensors,
+        const uint64_t * const * counts, int n_tensors);
+
+GGML_API void ggml_backend_sched_moe_cache_print_stats(ggml_backend_sched_t sched);
+GGML_API int ggml_backend_sched_moe_cache_decode_capacity(ggml_backend_sched_t sched, int64_t n_expert_used,
+        const int32_t * types, int n_types);
+
+GGML_API int ggml_backend_sched_moe_cache_device_prepare(ggml_backend_sched_t sched,
+        const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors);
+
+// The caller must discard graph results and captured backend graphs before resetting compute storage.
+GGML_API bool ggml_backend_sched_reset_compute(ggml_backend_sched_t sched);
+GGML_API size_t ggml_backend_sched_moe_cache_trim(ggml_backend_sched_t sched, size_t bytes);
+GGML_API size_t ggml_backend_sched_moe_cache_restore(ggml_backend_sched_t sched);
 
 // Canonical expert weight type set for the MoE cache. Every provider
 // (CUDA/HIP, Vulkan, Metal) must accept exactly this set in query_shape and
@@ -157,6 +230,14 @@ static inline int ggml_moe_cache_wtype_supported(int wtype) {
     return 0;
 }
 
+GGML_API bool ggml_moe_cache_has_residents(void);
+GGML_API void ggml_moe_cache_resident_notify(bool created);
+
+// Read barriers are independent of thread-local cache suspension.
+GGML_API void ggml_moe_cache_host_restore(const void * data, size_t size);
+GGML_API bool ggml_moe_cache_resident_copy(ggml_backend_t backend, struct ggml_tensor * dst, size_t offset, const void * host, size_t size);
+GGML_API const void * ggml_moe_cache_resident_lookup(const void * data, size_t size, ggml_backend_dev_t device);
+
 GGML_API void ggml_moe_cache_register(const struct ggml_moe_cache_api * api);
 GGML_API void ggml_moe_cache_unregister(const void * owner);
 // Returns a copy of the provider table registered for owner, zeroed if absent.
@@ -167,8 +248,26 @@ GGML_API struct ggml_moe_cache_api ggml_moe_cache_get(const void * owner);
 // executes a graph with a cache session; falls back to the first registered
 // provider for direct CPU users.
 GGML_API struct ggml_moe_cache_api ggml_moe_cache_active(void);
+GGML_API int ggml_backend_sched_moe_cache_status(ggml_backend_sched_t sched, size_t * allocated_bytes);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib);
+// The donor must outlive the borrower. Clear the donor before replacing its scheduler.
+GGML_API bool ggml_backend_sched_set_moe_cache_donor(ggml_backend_sched_t sched, ggml_backend_sched_t donor);
+// Frees the session and its VRAM pool until resume; false when there is none (or it is already suspended).
+// Resume makes it again the way it was made; the new pool fills from the experts decode asks for.
+GGML_API bool ggml_backend_sched_moe_cache_suspend(ggml_backend_sched_t sched);
+GGML_API void ggml_backend_sched_moe_cache_resume(ggml_backend_sched_t sched);
+
+// Expert keep policy (#215 lossless MTP draft, #217 lossy trunk map). For each CPU MUL_MAT_ID node of a weight named
+// "blk.<L>...", routed rows at route rank >= keep(L) whose expert is not resident on the device (see `resident`) are
+// left out: the row is not computed and its output is zero, so the expert contributes nothing. keep(L) is
+// keep_per_layer[L] when L < n_layer, else keep_default; a negative keep keeps every expert. keep_default < 0 with
+// n_layer == 0 turns the policy off (the default). Only nodes of at most 64 routed rows (decode, draft and verify
+// widths) are affected. The scheduler copies the table and makes it active on the computing thread.
+GGML_API void ggml_backend_sched_set_moe_expert_keep(
+        ggml_backend_sched_t sched, int32_t keep_default, const int32_t * keep_per_layer, int32_t n_layer);
+// keep(L) for the weight tensor name under the policy active on this thread; -1 = keep every expert.
+GGML_API int32_t ggml_moe_cache_expert_keep(const char * tensor_name);
 
 #ifdef __cplusplus
 }

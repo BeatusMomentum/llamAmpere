@@ -58,6 +58,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_single_seq() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -91,6 +92,10 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // [#240] SJ-KVaRN exact checkpoint suffix of a PARTIAL_ONLY state (LLAMA_STATE_SEQ_FLAGS_SJ_EXACT)
+    void state_write_sj_exact(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const;
+    void state_read_sj_exact (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+
 private:
     const llama_hparams & hparams;
 
@@ -106,7 +111,7 @@ public:
     explicit llama_memory_hybrid_context(llama_memory_status status);
 
     // init full
-    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
+    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem, bool single_seq = false);
 
     // init update
     explicit llama_memory_hybrid_context(
@@ -135,6 +140,12 @@ public:
 
     bool has_kv_stream_targets() const override;
     std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const override;
+
+    // [B1] layer-major prefill: both children
+    bool b1_supported() const override;
+    void b1_save() override;
+    bool b1_seek(size_t i) override;
+    std::vector<uint32_t> b1_ubatch_sizes() const override;
 
     //
     // llama_memory_hybrid_context

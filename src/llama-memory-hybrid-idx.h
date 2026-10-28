@@ -56,6 +56,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_single_seq() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -79,6 +80,10 @@ public:
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+
+    bool has_compact_pool() const { return compact_pool; }
+    bool has_host_raw() const { return host_raw; }
+    ggml_tensor * get_pool_storage(int32_t il) const;
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -114,6 +119,12 @@ private:
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
+    // fork: raw rows remain available for arbitrary sequence edits and rollback.
+    bool compact_pool = false;
+    bool host_raw = false;
+    std::vector<ggml_tensor *> pool_storage;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> pool_buffers;
+
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
@@ -139,11 +150,15 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+        int64_t get_n_cells() const { return pooled->ne[1]; }
+        ggml_backend_buffer_type_t get_pool_buffer_type() const {
+            return ggml_backend_buffer_get_type(pooled->buffer);
+        }
 
     private:
         friend class llama_memory_hybrid_idx_context;
 
-        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
+        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd, ggml_tensor * compact = nullptr);
 
         ggml_context * ctx;
         ggml_tensor  * key_gate;
@@ -156,7 +171,7 @@ public:
     explicit llama_memory_hybrid_idx_context(llama_memory_status status);
 
     // used to create a full-cache context
-    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
+    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, bool single_seq = false);
 
     // used to create an update context
     llama_memory_hybrid_idx_context(
@@ -180,12 +195,20 @@ public:
     bool next()  override;
     bool apply() override;
 
+    // [B1] layer-major prefill: the base views plus the indexer cache, and a copy of the k-pool state and layout per
+    // ubatch (the memory's own layout is already the last ubatch's, so a seek only points at the copies)
+    bool b1_supported() const override;
+    void b1_save() override;
+    bool b1_seek(size_t i) override;
+
     //
     // llama_memory_hybrid_idx_context specific API
     //
 
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
+    bool has_compact_pool() const { return mem && mem->has_compact_pool(); }
+    bool has_host_raw() const { return mem && mem->has_host_raw(); }
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
@@ -200,7 +223,18 @@ public:
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
 
+    // fork: no-output Qwen4exp MTP graphs need only the fresh pool writes. Requires the incremental layout.
+    bool use_kpool_store_only() const;
+    void set_input_kpool_store(ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+                               const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const;
+
 private:
+    void compact_pool_inputs(ggml_tensor * pool_cells, ggml_tensor * new_pool_rep) const;
+
+    void set_input_kpool_impl(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
+                             ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+                             const llama_ubatch * ubatch, ggml_tensor * new_pool_pos, bool incremental) const;
+
     llama_memory_hybrid_idx * mem = nullptr;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
@@ -234,4 +268,11 @@ private:
 
     // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
+
+    // [B1] per-ubatch copies, and the ones the current seek points at (null: the live state)
+    std::vector<std::shared_ptr<kpool_state>> b1_st;
+    std::vector<std::shared_ptr<llama_memory_hybrid_idx::kpool_layout>> b1_lay;
+    const kpool_state * b1_st_cur = nullptr;
+    const llama_memory_hybrid_idx::kpool_layout * b1_lay_cur = nullptr;
+    const llama_memory_hybrid_idx::kpool_layout & kpool_lay_cur() const;
 };

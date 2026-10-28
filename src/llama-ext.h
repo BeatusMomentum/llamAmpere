@@ -8,6 +8,64 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
+
+// Borrowed outputs for one row, valid until the next decode, reserve, reorder, or state restore.
+// Missing sampled arrays have zero counts. Candidates keep the full-vocabulary fallback.
+struct llama_sampler_output {
+    llama_token token = LLAMA_TOKEN_NULL;
+    const float * probs = nullptr;
+    const float * logits = nullptr;
+    const llama_token * candidates = nullptr;
+    const float * raw_logits = nullptr;
+    uint32_t probs_count = 0;
+    uint32_t logits_count = 0;
+    uint32_t candidates_count = 0;
+    uint32_t raw_logits_count = 0;
+};
+
+// Synchronizes this context once. Raw logits are returned only when CPU sampling needs them.
+LLAMA_API llama_sampler_output llama_get_sampler_output_ith(struct llama_context * ctx, int32_t idx);
+
+// fork: Opt-in logical-batch MTP hidden staging. Returns -4 when the ordinary input path is required.
+LLAMA_API bool llama_mtp_prefill_init(struct llama_context * target);
+LLAMA_API void llama_mtp_prefill_reset(struct llama_context * target, llama_seq_id seq);
+LLAMA_API int llama_mtp_prefill_decode(struct llama_context * draft, struct llama_context * target,
+        struct llama_batch batch, const float * const * carry, uint32_t n_seq);
+
+// [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: the target stages each ubatch's hidden rows on its device and calls
+// cb(user, first, count) after the ubatch (batch indices), so the helper can consume them before the next one.
+// While a callback is set, rows of a staged ubatch other than its last are not copied to the host, except in the
+// call's final ubatch; the callback must consume every staged range (llama_mtp_handoff_decode).
+LLAMA_API bool llama_mtp_handoff_init(struct llama_context * target);
+LLAMA_API void llama_set_ubatch_rows_callback(struct llama_context * target,
+        void (*cb)(void * user, int32_t first, int32_t count), void * user);
+LLAMA_API bool llama_mtp_handoff_ready(struct llama_context * target, int32_t first, int32_t count);
+// copy one host row of the staged ubatch without reordering outputs (safe inside the target's decode call)
+LLAMA_API bool llama_mtp_handoff_row(struct llama_context * target, float * dst, int32_t row);
+// One sequence; token i reads the target row first + i - 1, token 0 reads carry when carry != NULL. -4 = use the host path.
+LLAMA_API int llama_mtp_handoff_decode(struct llama_context * draft, struct llama_context * target,
+        struct llama_batch batch, int32_t first, const float * carry);
+// fork: Sequential MTP feedback. Start each draft round with use_previous=false and the accepted target hidden row.
+// These calls keep helper hidden rows on device; get_embeddings_nextn does not return their output.
+LLAMA_API bool llama_mtp_device_feedback_init(struct llama_context * draft);
+LLAMA_API int llama_mtp_device_feedback_decode(struct llama_context * draft, struct llama_batch batch, bool use_previous);
+// [RTPORT] LLAMA_MTP_PIPELINE=1 (needs feedback): queue a 1-row helper step whose token is published later, so the
+// next guess step is already on the card while the host samples the current one.
+// pipe_decode with defer=false publishes batch.token[0] itself; with defer=true the step waits on the card for
+// pipe_supply (or pipe_cancel). While a step waits, llama_synchronize and the output getters wait only for the step
+// before it. pipe_step_ok synchronizes and returns false when the last step timed out (its outputs are garbage).
+LLAMA_API bool llama_mtp_pipe_init(struct llama_context * draft);
+LLAMA_API int  llama_mtp_pipe_decode(struct llama_context * draft, struct llama_batch batch, bool use_previous, bool defer);
+LLAMA_API bool llama_mtp_pipe_supply(struct llama_context * draft, llama_token token);
+LLAMA_API void llama_mtp_pipe_cancel(struct llama_context * draft);
+LLAMA_API bool llama_mtp_pipe_step_ok(struct llama_context * draft);
+// [RTPORT] LLAMA_PLE_HINT=1 (opt-in, qwen4exp lazily mapped PLE table only, else a no-op): the next decode on this
+// target context will hold window[n_window - 1], preceded by window[0 .. n_window - 2] (newest last). Starts the page
+// reads of that token's n-gram rows on a worker thread and returns at once.
+LLAMA_API void llama_ple_hint(struct llama_context * target, const llama_token * window, int32_t n_window);
+// steps run, steps queued ahead of their token, queued steps released unused; false if off or stopped by a timeout
+LLAMA_API bool llama_mtp_pipe_stats(struct llama_context * draft, uint64_t * n_steps, uint64_t * n_deferred, uint64_t * n_cancel);
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -163,6 +221,12 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Release completed file-backed rows from RAM; later getters retain the original bytes.
+extern "C" LLAMA_API bool llama_release_embeddings_nextn(struct llama_context * ctx, int32_t first, int32_t count);
+
+// Copy unmasked rows without exposing the backing storage to the MTP driver.
+extern "C" LLAMA_API bool llama_copy_embeddings_nextn(struct llama_context * ctx, float * dst, int32_t first, int32_t count);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
@@ -201,3 +265,21 @@ LLAMA_API bool llama_sampler_backend_supports_rows(const struct llama_sampler * 
 LLAMA_API bool llama_sampler_chain_is_backend(const struct llama_sampler * sampler);
 // supports_rows, and (for a chain) every sampler was offloaded by backend_init: safe for multi-row sampling
 LLAMA_API bool llama_sampler_backend_rows_ready(const struct llama_sampler * sampler);
+
+// One-shot tag for the next llama_decode() on ctx. The call reads it on entry and
+// resets it to LLAMA_DECODE_PHASE_UNKNOWN when it returns, including on error.
+// UNKNOWN (0, same value as LLAMA_DECODE_PHASE_AUTOMATIC) means no tag. Encoder
+// entry points ignore it. This does not change llama_set_decode_phase().
+// The #217 trunk keep map is applied only when the tag is GENERATION.
+LLAMA_API void llama_set_next_decode_phase(struct llama_context * ctx, enum llama_decode_phase phase);
+
+// Expert keep map parser (#217, --moe-keep-map): "N" (every layer) or a comma list of "L:N", "A-B:N", "*:N".
+// keep_layer is empty when no explicit layer is listed; otherwise it has n_layer entries (-1 = keep every expert).
+// Returns false and sets error on bad input.
+#include <string>
+#include <vector>
+LLAMA_API bool llama_parse_moe_keep_map(const char * text, int32_t n_layer, int32_t & keep_default,
+                                        std::vector<int32_t> & keep_layer, std::string & error);
+
+// Planned cached verify limit, available before deferred tables are initialized; zero without a provider.
+LLAMA_API int32_t llama_moe_cache_decode_capacity(const struct llama_context * ctx);

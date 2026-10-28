@@ -1,0 +1,24 @@
+# Completed MTP output pages
+
+`LLAMA_MOE_OUTPUT_RECLAIM=1` opts into releasing completed unmasked MTP output batches when `LLAMA_MOE_ARENA_OUTPUT_DIR` selects file-backed activation storage. It does not change weights, quantization, output floats, or the expert arena.
+
+After each batch's device-to-host copy, the scheduler is synchronized before any pages are released. The completed byte range is flushed synchronously, unmapped from the process working set with `MADV_DONTNEED`, and dropped from the owned file's page cache with `POSIX_FADV_DONTNEED` on Linux. The mapping and its unlinked file remain alive. Later helper reads refault the original activation bytes from this temporary file. This adds activation I/O and a synchronization boundary; speed must be measured separately. Activation reads are not model-weight reads and must be identified separately by request I/O instrumentation.
+
+Partial pages can overlap adjacent output rows. All scheduled writes finish before the page-aligned flush and release, so neighboring bytes are preserved. The usual final output flush remains in place. The opt-in is off by default, and allocations smaller than the existing file-backed threshold are unchanged.
+
+The MTP driver's `process_range` releases each consumed source slice immediately after copying it into the independently owned helper batch, before decoding that batch. Refaulted target output therefore does not accumulate across the entire prompt. The slice contains at most `batch_capacity` rows (80 MiB for 2,048 rows of 10,240 floats); the first batch omits its carry row, and each later batch starts with the previous batch's final target row. Deferred staging copies and releases its bounded slice together. Each sequence's final carry row is also released after copying. A final whole-range release covers remaining boundary rows and the shared-KV path.
+
+No helper head or decode is skipped or reordered. Later heads and verification may refault the released rows from the retained file mapping, preserving the original floats and verification indices. The device-prefill path reads its separate captured device rows and carry storage. Release is still opt-in and remains a no-op for ordinary output buffers. These bounds describe the source slices requested by the helper, not a measured process-RSS ceiling; page alignment, readahead, and other allocations still affect the peak.
+
+`test-moe-arena` covers exact arbitrary float bits after unaligned release, empty and invalid ranges, subsequent writes, and absence of resident file pages before refault. `test-moe-arena --cuda-output` additionally covers asynchronous CUDA output copying and completion before release. These operator checks do not establish full-model quality, saved-cache reload, memory fit, or speed.
+
+The generated-model `test-mtp-state` suite covers helper batch boundaries, deferred staging, per-sequence carries, acceptance, and saved-state restoration. Its QWEN35 model supports one MTP head and ordinary output buffers; it does not exercise multihead refaults or establish the file-backed helper's memory peak.
+
+For request I/O accounting, `llama_copy_embeddings_nextn` synchronizes the context before staging. Its entire duration must **not** be attributed to activation reads. Only the separate exported `llama_copy_moe_output` function performs the pure `memcpy`, after synchronization, output reordering, flushing, and source-range validation. The optional preload tracer verifies the entire source span in `/proc/self/maps` against the canonical owned output directory and deleted activation filename before sampling per-thread `read_bytes`. The parser requires that same directory and rejects unknown sources, malformed/overlapping intervals, boundary crossings, and nonconserving counts. The cold-file fixture proves reads performed before this narrow boundary remain unattributed. This does not retroactively identify any old request's unknown bytes.
+
+The separate metadata parser counts successful `mkstemp` calls only for a new
+empty activation file in the canonical owned output directory, and successful
+`posix_fallocate` calls only for its deleted-file name. Creation cannot read model
+tensor payload. Both scopes expose their thread intervals so a combined harness
+can reject overlap with tensor or activation-copy attribution. Unknown request
+bytes still reject acceptance; a parser fix is not a new model measurement.

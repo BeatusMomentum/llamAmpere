@@ -1349,10 +1349,41 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // --n-cpu-moe auto (#224): let the fit place the layers (whole layers on the GPU front to back, the routed experts
+    // of the remaining layers in the CPU) instead of the user's -ngl, and without the MoE-cache placement candidate,
+    // so spare VRAM holds resident expert layers rather than a hot-expert cache
+    bool ncmoe_auto = params.n_cpu_moe_auto;
+    auto ncmoe_all_cpu = [&]() {
+        // fallback = --cpu-moe with the user's -ngl
+        params.tensor_buft_overrides[0] = llm_ffn_exps_cpu_override();
+        params.tensor_buft_overrides[1] = {nullptr, nullptr};
+        mparams.n_gpu_layers          = params.n_gpu_layers;
+        mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+    };
+    if (ncmoe_auto) {
+        if (!params.tensor_buft_overrides.empty() && params.tensor_buft_overrides[0].pattern != nullptr) {
+            throw std::invalid_argument("--n-cpu-moe auto cannot be combined with -ot/--cpu-moe/--n-cpu-moe N");
+        }
+        if (params.tensor_buft_overrides.size() < 2) {
+            params.tensor_buft_overrides.resize(llama_max_tensor_buft_overrides(), {nullptr, nullptr});
+            mparams.tensor_buft_overrides = nullptr;
+        }
+        if (params.kv_stream_arena_mib != 0) {
+            COM_WRN("%s", "--n-cpu-moe auto needs the device-memory fit, which a shared KV/compute arena disables: keeping all experts in the CPU\n");
+            ncmoe_all_cpu();
+            ncmoe_auto = false;
+        } else {
+            if (params.n_gpu_layers != -1) {
+                COM_INF("--n-cpu-moe auto: -ngl %d is replaced by the fitted layer count\n", params.n_gpu_layers);
+            }
+            mparams.n_gpu_layers = -1;
+        }
+    }
+
     if (params.fit_params && !common_params_should_fit_device_memory(params)) {
         COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is explicitly configured\n");
     }
-    if (common_params_should_fit_device_memory(params)) {
+    if (common_params_should_fit_device_memory(params) || ncmoe_auto) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         // Snapshot the pre-fit state so a failed fit can be rolled back to a
@@ -1375,6 +1406,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         common_params params_dft = common_base_params_to_speculative(params);
 
+        // Match common_speculative_init_result's separate-file MTP expert placement.
+        const char * shared_experts = std::getenv("GGML_MOE_CACHE_MTP_SHARED");
+        if (has_draft && spec_mtp && shared_experts && strcmp(shared_experts, "1") == 0) {
+            if (!params_dft.tensor_buft_overrides.empty() && params_dft.tensor_buft_overrides.back().pattern == nullptr) {
+                params_dft.tensor_buft_overrides.pop_back();
+            }
+            params_dft.tensor_buft_overrides.insert(params_dft.tensor_buft_overrides.begin(), llm_ffn_exps_cpu_override());
+            params_dft.tensor_buft_overrides.push_back({nullptr, nullptr});
+        }
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
@@ -1395,14 +1435,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.mparams        =*/ &mparams_dft,
             /*.cparams        =*/ &cparams_dft,
             /*.shares_model   =*/ !has_draft, // an MTP context runs on the weights of the main model
-            /*.shares_compute =*/ !has_draft && spec_mtp && shared_compute,
+            /*.shares_compute =*/ spec_mtp && shared_compute,
         };
 
         const common_params_fit_status fit_status = common_fit_params(
             params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
-            &params.moe_cache,
+            ncmoe_auto ? nullptr : &params.moe_cache,
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
@@ -1426,6 +1466,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             mparams.tensor_split = params.tensor_split;
             mparams.tensor_buft_overrides = params.tensor_buft_overrides.empty()
                 ? nullptr : params.tensor_buft_overrides.data();
+            if (ncmoe_auto) {
+                COM_WRN("%s", "--n-cpu-moe auto: no fitted placement, keeping all experts in the CPU (as --cpu-moe)\n");
+                ncmoe_all_cpu();
+            }
+        } else if (ncmoe_auto) {
+            int n_cpu_layers = 0;
+            for (const auto & tbo : params.tensor_buft_overrides) {
+                if (tbo.pattern == nullptr) {
+                    break;
+                }
+                n_cpu_layers++;
+            }
+            COM_INF("--n-cpu-moe auto: fitted -ngl %d (-1 = all layers), %d of those layers keep (part of) their FFN/experts in the CPU\n",
+                mparams.n_gpu_layers, n_cpu_layers);
         }
     }
 
@@ -1449,6 +1503,58 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->model.reset(model);
+
+    if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
+        // Flash-Next (qwen4exp) keeps 1024 MiB free (VRAMFIT: its scratch is trimmed, peak 23,397 MiB on a 24 GB card);
+        // other arena models keep the older 2560 MiB.
+        char arch[64] = {0};
+        const bool flashnext = llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0 &&
+            std::string(arch) == "qwen4exp";
+        common_set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", flashnext ? "1024" : "2560");
+    }
+    // Two or more server slots: every extra slot needs card memory after the
+    // expert cache has filled the card (prompt scratch, handoff staging and
+    // temporary pools sized per sequence). With reserve 1024 the two-user smoke
+    // peaked at 23,682 MiB whole-card, 130 MiB over the 23,552 cap, while one
+    // user peaks at 23,397. So the reserve grows by LLAMA_MOE_CACHE_SLOT_RESERVE_MB
+    // (default 256, 0 = off) for each slot past the first. One slot: unchanged.
+    static bool slot_reserve_applied = false;
+    if (llama_model_moe_arena_size(model) && params.n_parallel > 1 && !slot_reserve_applied) {
+        slot_reserve_applied = true;
+        long long slot_mb = 256;
+        if (const char * text = std::getenv("LLAMA_MOE_CACHE_SLOT_RESERVE_MB")) {
+            char * end = nullptr;
+            const long long parsed = std::strtoll(text, &end, 10);
+            if (end != text && *end == '\0' && parsed >= 0 && parsed <= 8192) {
+                slot_mb = parsed;
+            }
+        }
+        const char * reserve_text = std::getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB");
+        char * end = nullptr;
+        const long long reserve_mb = reserve_text ? std::strtoll(reserve_text, &end, 10) : -1;
+        if (slot_mb > 0 && reserve_text && end != reserve_text && *end == '\0' && reserve_mb >= 0) {
+            const long long total_mb = reserve_mb + slot_mb * (long long) (params.n_parallel - 1);
+            common_set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", std::to_string(total_mb));
+            COM_INF("MoE cache: %d slots, reserve %lld MiB + %lld MiB per extra slot = %lld MiB\n",
+                params.n_parallel, reserve_mb, slot_mb, total_mb);
+        }
+    }
+    if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) {
+        common_set_env("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB", "1");
+    }
+    if (llama_model_moe_arena_size(model) && !std::getenv("GGML_MOE_CACHE_PROFILE_LOAD")) {
+#ifdef LLAMA_MOE_PROFILE_SOURCE
+        const char * profiles[] = { LLAMA_MOE_PROFILE_SOURCE, LLAMA_MOE_PROFILE_INSTALL };
+        for (const char * profile : profiles) {
+            std::error_code error;
+            if (std::filesystem::is_regular_file(profile, error)) {
+                common_set_env("GGML_MOE_CACHE_PROFILE_LOAD", profile);
+                COM_INF("MoE arena: startup usage profile %s\n", profile);
+                break;
+            }
+        }
+#endif
+    }
 
     if (model_only) {
         return;
@@ -1952,6 +2058,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.sj_kvarn_edge_bits_k = params.sj_kvarn_edge_bits_k;
     cparams.sj_kvarn_edge_bits_v = params.sj_kvarn_edge_bits_v;
     cparams.sj_kvarn_flush_chunk = params.sj_kvarn_flush_chunk;
+    cparams.kv_gpu_tokens = params.kv_gpu_tokens;
     cparams.sj_kvarn_transform = params.sj_kvarn_transform.empty() ? nullptr : params.sj_kvarn_transform.c_str();
     cparams.type_s = params.cache_type_s;
 
@@ -1970,8 +2077,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         }
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
+    cparams.moe_prefetch = params.moe_prefetch;
 
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_draft_keep = params.moe_draft_keep;
+    cparams.moe_keep_map   = params.moe_keep_map.empty() ? nullptr : params.moe_keep_map.c_str();
 
     return cparams;
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "autofuse.cuh"
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
@@ -1334,6 +1336,7 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    uint64_t moe_cache_generation = 0;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1536,6 +1539,8 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
+    bool scratch_borrowed = false;
+    void * borrowed_blas_workspace = nullptr;
 
     int curr_stream_no = 0;
 
@@ -1573,6 +1578,23 @@ struct ggml_backend_cuda_context {
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } q8_cache;
 
+    // fork: one-shot MMQ activation handoff from a producer to its next graph node.
+    struct {
+        char *              ptr = nullptr;
+        size_t              cap = 0;
+        int                 dev = -1;
+        const ggml_tensor * src1 = nullptr;
+        const ggml_tensor * consumer = nullptr;
+        const void *        data = nullptr;
+        uint64_t            epoch = 0;
+        int64_t             ne[GGML_MAX_DIMS] = {};
+        size_t              nb[GGML_MAX_DIMS] = {};
+        int64_t             ne10_padded = 0;
+        int                 layout = 0;
+        cudaStream_t        stream = nullptr;
+        std::vector<retired_buf> retired;
+    } mmq_prefill_cache;
+
     // Same idea for the TQ activation pre-rotation (forward block WHT + q8_1 quantize): the MoE
     // gate and up projections consume the same normed activation, so the rotation ran twice per
     // layer. Keyed by tensor identity, data pointer, size and graph-eval epoch; main-stream only.
@@ -1605,24 +1627,39 @@ struct ggml_backend_cuda_context {
     // captured graph can keep referencing it.
     const void ** moe_expert_table_get(const ggml_tensor * src0, int64_t nb_expert, cudaStream_t stream);
 
+    std::vector<ggml_cuda_autofuse_plan> autofuse_plans;
+
     uint64_t graph_epoch = 1;
 
     // Fusion hit counters. Read through ggml_backend_cuda_fusion_count(); test-backend-ops uses
     // them to check that a fusion actually fired, not only that the fused result is right.
     struct {
+        int64_t autofuse      = 0;
         int64_t elem_chain    = 0;   // elementwise chains launched (ggml_cuda_fuse_elem_chain)
         int64_t q8_cache_hits = 0;   // mmvq shared-quantize cache hits
+        int64_t mmq_prefill = 0;
+        int64_t mmq_prefill_q8 = 0;
+        int64_t mmq_prefill_q8_hits = 0;
         int64_t fused_add     = 0;   // tuned multi-ADD runs (ggml_cuda_op_fused_add)
         int64_t fused_mul     = 0;   // tuned multi-MUL runs (ggml_cuda_op_fused_mul)
         int64_t mul_mat_bias  = 0;   // ADD epilogues folded into mul_mat_vec (bias or a full
                                      // same-shape residual: both arrive as fusion x_bias)
         int64_t mul_mat_glu   = 0;   // GLU epilogues folded into mul_mat_vec
+        int64_t mmq_pair      = 0;   // prompt products reusing one activation/route preparation
+        int64_t sj_compact    = 0;   // SJ compact-gather attention dispatches
+        int64_t sj_mask_kq    = 0;   // SJ masked-KQ enabled kernel dispatches
+        int64_t mmf_split     = 0;   // narrow MMF split-warp dispatches
         int64_t norm_pair_concat = 0; // RMS_NORM+MUL pairs written straight into a CONCAT (ggml_cuda_fuse_norm_pair_concat)
         int64_t gdn_state_read = 0;  // gated_delta_net launches that read the state through s_copy (#87)
         int64_t add_rms       = 0;   // fused ADD + RMS_NORM + MUL runs (ggml_cuda_op_add_rms_norm_mul) [#46]
         int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
         int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
+        int64_t exl3_fold_norm = 0;  // RMS_NORM+MUL that also wrote the EXL3 consumer's glued input [#136]
+        int64_t exl3_fold_add  = 0;  // EXL3 glue_outs that added the residual ADD [#136]
+        int64_t exl3_fold_gu   = 0;  // fused [gate | up] EXL3 FFNs through the bridge [#136]
         int64_t conv_ring     = 0;   // ssm_conv launches that read the CONCAT operands and wrote the windows [#110]
+        int64_t nemotron_ssm  = 0;
+        int64_t nemotron_moe  = 0;
     } fusion_stats;
     // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
     // address table is pointed at a slot instead of at the expert's home address once it is copied.
@@ -1659,6 +1696,18 @@ struct ggml_backend_cuda_context {
         bool                used       = false;
     };
     std::vector<gdn_state_read_entry> gdn_state_reads;
+
+    // [ROUNDFIX] lightning_indexer nodes whose pooled-key GET_ROWS gather is skipped (GGML_CUDA_LID_GATHER=1):
+    // the vec launch reads key i from base + rows[i] * row_stride (F16 rows) instead of src[1].
+    // Filled by ggml_cuda_lid_gather_plan at the start of each evaluation, cleared at its end.
+    struct lid_gather_entry {
+        const ggml_tensor * lid        = nullptr;
+        const char *        base       = nullptr;
+        const int32_t *     rows       = nullptr;
+        size_t              row_stride = 0;       // bytes
+        bool                used       = false;
+    };
+    std::vector<lid_gather_entry> lid_gathers;
 
     // [#110 SF fold 2] ssm_conv nodes of the graph being evaluated that run the conv-ring kernel. Filled by
     // ggml_cuda_conv_ring_plan at the start of each evaluation, cleared at its end.
@@ -1746,6 +1795,8 @@ struct ggml_backend_cuda_context {
 
     ~ggml_backend_cuda_context();
 
+    void release_scratch(bool preserve_blas = false);
+
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
@@ -1760,6 +1811,7 @@ struct ggml_backend_cuda_context {
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
+            GGML_ASSERT(!scratch_borrowed);
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
@@ -1792,6 +1844,9 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+char * ggml_cuda_mmq_prefill_q8_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+                                       const ggml_tensor * consumer, int64_t ne10_padded);
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;

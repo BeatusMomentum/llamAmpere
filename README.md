@@ -1,4 +1,37 @@
-> **llamAmpere v0.5.5**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
+> **llamAmpere v0.6**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head, and Qwen3.8 Flash-Next with experts split between the card and RAM.
+
+## What's new in v0.6
+
+- **mb-MTP, on by default with the MTP drafter.** Keeps a drafted token when the model rates it at least as likely as
+  its replacement, so more drafted tokens survive and deeper drafts pay off (adaptive draft depth 3-5 by default). The output leans slightly toward the
+  model's most likely tokens (0.009 KL per token at depth 6 on Swift 1.5); `--no-spec-mb-mtp` gives exact sampling.
+- **Faster prompt reading on Swift 1.5 27B** (+5.3% at 100K) from a new GDN-layer kernel, same output.
+- **AI+ model files** (our weight format for Ampere and newer) run in v0.6.
+- **Qwen3.8 Flash-Next:** expert cache on the card with the rest of the experts in RAM, a fast whole-prompt read, and
+  `--kv-gpu-tokens N` to keep only part of the KV cache on the card. Launch command and numbers: coming soon in the
+  release notes.
+- Nemotron 3.5 Bolt / Super, EXL3 speed-ups with the same output, and a fix for SJ-KVaRN with image prompts.
+- Swift 1.5 v0.6 vs v0.5 speed table and gates: [release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
+
+**Build and run (v0.6, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
+CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
+
+```bash
+git clone -b v0.6 https://github.com/JakeATX/llamAmpere.git
+cd llamAmpere
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DLLAMA_BUILD_BORINGSSL=ON
+cmake --build build-sm86 -j8 --target llama-server
+./build-sm86/bin/llama-server \
+  --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
+  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1 \
+  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 5 --spec-draft-p-min 0
+```
+
+The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
+
+---
 
 ## What's new in v0.5
 
@@ -34,7 +67,7 @@
 
 Release notes, including what we tried and did not ship: [docs/llamampere-v0.5/RELEASE_NOTES.md](docs/llamampere-v0.5/RELEASE_NOTES.md). Recommended settings for every card size: [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
 
-**Build and run (v0.5.4, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
+**Build and run (v0.5 commands, still valid in v0.6, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
 CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
 
 ```bash
@@ -78,7 +111,7 @@ For a smaller cache, use `-ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type auto` 
 directory; the model download is 9.0 GB.
 
 ```bash
-LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
+LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
   -hf jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP-GGUF \
   -hff ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP.gguf \
   -c 204800 --parallel 1 -ngl 99 -fa on -fit off -b 4096 -ub 512 \
@@ -146,6 +179,8 @@ What each part buys:
 Start with [QWEN_AMPERE.md](QWEN_AMPERE.md) and the write-up in [docs/llamampere-v0.3/ARTICLE.md](docs/llamampere-v0.3/ARTICLE.md) (v0.2: [docs/llamampere-v0.2/ARTICLE.md](docs/llamampere-v0.2/ARTICLE.md)); the flags are documented in [docs/speculative.md](docs/speculative.md) and [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md). Successor of [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere) (v0.1). The rest of this README is upstream llama.cpp's.
 
 # llama.cpp
+
+Experimental Qwen3.8-Next CUDA router storage: `LLAMA_QWEN_ROUTER_BF16=1` converts F32 routed and shared-expert gates to BF16 while loading, using existing CUDA BF16 operations. The default remains F32; CPU mappings and model files stay unchanged. Weight representability does not establish identical arithmetic or prompt-cache replay; qualify quality and speed before deployment. Drafter expert sharing stays off.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
@@ -271,3 +306,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+
+For v0.6 recommended configurations on cards with 12 GB or less, set `LLAMA_KQ_MASK_PACKED=1`; the global default remains off. On the frozen R10 Swift 1.5 SJ-KVaRN 3/2t recipe at 204,800 context and microbatch 512, packing saved 188 MiB with identical output and prompt-cache state. Six paired Taichi timing brackets measured generation +0.12% and prompt processing -1.59%; these historical measurements are the tradeoff, not a new speed result for the integrated build. See [v0.6 packed-mask notes](docs/llamampere-v0.6/CHANGELOG.md).
+
+Packed attention masks are opt-in with `LLAMA_KQ_MASK_PACKED=1` (default off, CPU/CUDA flash attention only). Native MMA and int8-QK mask readers use one bit per entry instead of F16. Unsupported readers, including sparse gather, resident-body fetch, and direct decode readers, expand to F16 scratch and may give back the memory saving. ALiBi, training, KV streaming, and architectures with custom mask layouts keep their existing masks.

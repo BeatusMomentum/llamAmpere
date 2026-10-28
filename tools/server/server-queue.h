@@ -3,6 +3,7 @@
 #include "server-task.h"
 
 #include <condition_variable>
+#include <functional>
 #include <deque>
 #include <exception>
 #include <mutex>
@@ -16,6 +17,7 @@ struct server_queue {
 private:
     int id = 0;
     bool running  = false;
+    bool stopped  = false; // set by terminate(); unlike running, never false before start_loop()
     bool sleeping = false;
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
@@ -48,6 +50,10 @@ private:
 
 public:
     ~server_queue() { worker_stop(); }
+
+    // true once terminate() was called: readers waiting on results return an error instead of waiting for
+    // their client to disconnect (otherwise a shutdown with a request in flight hangs in ctx_http.join())
+    bool is_terminated();
 
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
@@ -211,6 +217,10 @@ struct server_response_reader {
     // tracking generation state and partial tool calls
     // only used by streaming completions
     std::vector<task_result_state> states;
+
+    // optional hook, called in the reading thread for every stop (final) result
+    // after its state update (used by --warm-prefill)
+    std::function<void(server_task_result &)> on_stop;
 
     // should_stop function will be called each polling_interval_seconds
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)

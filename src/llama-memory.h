@@ -53,6 +53,7 @@ struct llama_sj_kvarn_config {
     uint32_t edge_bits_v = 4;
     ggml_type edge_body_type = GGML_TYPE_F32;
     uint32_t flush_chunk = 0; // tail_max > 0: groups sealed per decode-sized ubatch while draining; 0 = all at once
+    uint32_t resident_cells = 0; // fork: QSA resident KV cells; 0 = keep the full body on device
     // multi-sequence (--kv-unified): one record pool shared by all sequences (each sequence still gets its own
     // sink/ring stream), so one sequence can use nearly the whole budget; false: a full-length pool per sequence
     bool shared_pool = false;
@@ -138,6 +139,16 @@ struct llama_memory_context_i {
     virtual bool has_kv_stream_targets() const { return false; }
 
     virtual std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const { return {}; }
+
+    // [B1] layer-major prefill (LLAMA_B1): the driver applies every ubatch up front, saving the memory view right
+    // after each apply(), then runs each layer over all ubatches, seeking back to a ubatch's saved view before each
+    // of its graphs. b1_supported() says whether this context can do that; b1_save() records the view of the
+    // current ubatch (call right after apply()); b1_seek(i) makes ubatch i current with its saved view.
+    virtual bool b1_supported() const { return false; }
+    virtual void b1_save() {}
+    virtual bool b1_seek(size_t i) { GGML_UNUSED(i); return false; }
+    // the token count of every ubatch of this context, readable before any apply(); empty when unknown
+    virtual std::vector<uint32_t> b1_ubatch_sizes() const { return {}; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -163,6 +174,10 @@ struct llama_memory_i {
 
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
+
+    // fork: reserve a single-sequence graph while retaining full attended length.
+    // Memory types without per-sequence streams keep their ordinary full view.
+    virtual llama_memory_context_ptr init_full_single_seq() { return init_full(); }
 
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update

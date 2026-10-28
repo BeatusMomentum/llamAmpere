@@ -309,6 +309,10 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    // Keep a rejected non-ending draft if its target probability is at least the non-ending replacement's probability.
+    bool spec_lossy = false;
+    bool spec_lossy_explicit = false; // --spec-mb-mtp / --no-spec-mb-mtp (or LLAMA_ARG_SPEC_MB_MTP) was given; otherwise MTP drafting turns it on
+
     // print the parameters into a string
     std::string print() const;
 };
@@ -340,6 +344,12 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
     int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (also the starting depth)
+
+    // CDEPTH (draft-mtp-adaptive only): "streak" = the streak controller (default); "cdepth" = per-token confidence
+    // rule inside each round between n_min_adaptive and n_max (see common/speculative-cdepth.h)
+    std::string depth_policy = "streak";
+    std::string depth_model;       // CDEPTH coefficient file ("" = built-in table)
+    float       depth_theta = 1.0f; // multiplier on the CDEPTH stop thresholds (>1 stops earlier)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -377,6 +387,7 @@ struct common_params_speculative_draft {
     bool    dflash                = false; // use DFlash speculative decoding
     bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
     int32_t n_ctx                 = 0;     // draft context size
+    int32_t n_ubatch              = -1;    // MTP draft physical microbatch: -1 = auto (2048 for an MTP draft file loaded with -md), 0 = main's -ub, N > 0 = at most N
 
     // MTP drafter attention window (default off)
     int32_t attn_window = 0;     // > 0: the MTP drafter attends only to its last attn_window positions (+ sinks)
@@ -584,6 +595,7 @@ struct common_params {
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
+    bool    n_cpu_moe_auto     = false; // --n-cpu-moe auto: fit resident expert layers into free VRAM (#224)
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
@@ -692,6 +704,7 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     common_moe_cache_params moe_cache;
+    int moe_prefetch = 0; // 0 off, -1 auto, 1..3 future layers
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
 
@@ -717,9 +730,13 @@ struct common_params {
     uint32_t sj_kvarn_edge_bits_v = 4;
     std::string sj_kvarn_transform;  // EXPERIMENTAL WUSH-KV transform file (--sjkvarn-transform)
     uint32_t sj_kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
+    uint32_t kv_gpu_tokens = 32768; // fork: QSA layers keep this many KV cells on the GPU; 0 = keep all of them there
     ggml_type cache_type_s = GGML_TYPE_F32; // recurrent (gated delta-net) state cache data type
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU
+
+    int32_t     moe_draft_keep = -1; // --spec-moe-keep: MTP draft leaves out non-resident experts at route rank >= N (lossless)
+    std::string moe_keep_map;        // --moe-keep-map: LOSSY per-layer expert keep map for the main model (empty = off)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -763,6 +780,7 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
+    bool    warm_prefill        = false; // after a chat reply, prefill the next turn's shared prefix in the background (opt-in)
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints

@@ -14,12 +14,17 @@
 // A generated qwen2vl (M-RoPE) model checks image prompts, whose tokens share a position (run_mrope).
 //
 //   test-sjkvarn-state          all cases
+//   test-sjkvarn-state --scalar-only [tmp_dir]   native scalar 4/4 state and multi-sequence checks
+//   test-sjkvarn-state --resident [tmp_dir]   CUDA split-body state round trips
+//   test-sjkvarn-state --device-bytes   CPU device-snapshot packed-byte regression
+//   test-sjkvarn-state --compact [tmp_dir]   CUDA compact attention on saved and truncated SJ state
 
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-sjkvarn.h"
 #include "ggml-backend.h"
 #include "llama.h"
+#include "llama-cpp.h"
 
 #include "gguf.h"
 
@@ -27,6 +32,7 @@
 #include "../src/llama-context.h"
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 
 #include <cmath>
 #include <cstdio>
@@ -56,7 +62,7 @@ static void tensor_data(ggml_tensor * tensor, void * /*userdata*/) {
     ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
 }
 
-static llama_model * make_model(llm_arch arch = LLM_ARCH_LLAMA) {
+static llama_model * make_model(bool resident = false, llm_arch arch = LLM_ARCH_LLAMA) {
     gguf_context * meta = gguf_init_empty();
     {
         llama_model_saver ms(arch, meta);
@@ -81,11 +87,19 @@ static llama_model * make_model(llm_arch arch = LLM_ARCH_LLAMA) {
     }
     llama_model_params mp = llama_model_default_params();
     ggml_backend_dev_t no_devices[] = { nullptr };
-    if (!getenv("SJ_TEST_GPU")) {
+    if (resident) {
+        mp.n_gpu_layers = 99;
+    } else if (!getenv("SJ_TEST_GPU")) {
         mp.devices = no_devices; // CPU only, also in a CUDA build (SJ_TEST_GPU=1: default devices, all layers offloaded)
     }
     llama_model * model = llama_model_init_from_user(meta, tensor_data, nullptr, mp);
     gguf_free(meta);
+    if (model && resident) {
+        // The cache reads QSA eligibility from these per-layer values; the LLAMA graph ignores them.
+        model->hparams.dsv4_compress_ratios.fill(0);
+        model->hparams.dsv4_compress_ratios[0] = 16;
+        model->hparams.dsv4_compress_ratios[2] = 16;
+    }
     return model;
 }
 
@@ -100,12 +114,13 @@ struct sj_cfg {
     ggml_type edge_body = GGML_TYPE_F32;
     bool      plain = false;        // plain f16 cache (no SJ-KVaRN)
     const char * transform = nullptr; // EXPERIMENTAL WUSH-KV transform file (--sjkvarn-transform)
+    uint32_t resident = 0;
 };
 
-static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t n_seq = 1, bool unified = false) {
+static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t n_seq = 1, bool unified = false, uint32_t n_ctx = 4096) {
     llama_context_params cp = llama_context_default_params();
-    // several sequences: every sequence gets the same 4096-position stream a single-sequence context has
-    cp.n_ctx = unified ? 4096 : 4096*n_seq;
+    // Several sequences each get the same position budget as a single-sequence context.
+    cp.n_ctx = unified ? n_ctx : n_ctx*n_seq;
     cp.kv_unified = unified;
     cp.n_batch = 128;
     cp.n_ubatch = 128;
@@ -128,8 +143,36 @@ static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t 
         cp.sj_kvarn_edge_bits_v = c.edge_bits_v;
         cp.sj_kvarn_edge_body_type = c.edge_body;
         cp.sj_kvarn_transform = c.transform;
+        cp.kv_gpu_tokens = c.resident;
     }
-    return llama_init_from_model(model, cp);
+    llama_context * ctx = llama_init_from_model(model, cp);
+    if (ctx && c.resident && !c.plain) {
+        try {
+            auto * cache = dynamic_cast<llama_kv_cache *>(llama_get_memory(ctx));
+            require(cache != nullptr, "resident test uses llama_kv_cache");
+            uint32_t n_split = 0, n_full = 0;
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                require(model->hparams.n_embd_head_k(il) == 256, "resident test has 256-channel heads");
+                const ggml_tensor * body = cache->get_sj_kvarn_body(il);
+                require(body && body->buffer, "resident body allocated");
+                const auto buft = ggml_backend_buffer_get_type(body->buffer);
+                const bool split = strstr(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_") != nullptr;
+                require(split == (model->hparams.dsv4_compress_ratios[il] > 0), "only eligible QSA layers use split bodies");
+                require(ggml_backend_buft_get_device(buft) == model->dev_layer(il), "body stays on the model layer device");
+                require(ggml_backend_dev_type(model->dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_GPU, "resident state test runs on GPU");
+                if (split) {
+                    ++n_split;
+                } else {
+                    ++n_full;
+                }
+            }
+            require(n_split == 2 && n_full == 2, "resident state test has two split and two full bodies");
+        } catch (...) {
+            llama_free(ctx);
+            throw;
+        }
+    }
+    return ctx;
 }
 
 static llama_token token_at(llama_pos p, int salt) { return (llama_token) ((p*37 + salt*11 + 5) % n_vocab); }
@@ -261,9 +304,36 @@ static std::vector<uint8_t> seq_state(llama_context * ctx, llama_state_seq_flags
     return buf;
 }
 
+static void device_bytes_case(llama_model * model) {
+    const sj_cfg cfg = { "4/4 device bytes", 4, 4, GGML_TYPE_F32 };
+    llama_context * ctx = make_ctx(model, cfg);
+    require(ctx != nullptr, "device-byte context");
+    try {
+        decode(ctx, 0, 129, 128);
+        const auto host = seq_state(ctx);
+        for (int reuse = 0; reuse < 2; ++reuse) {
+            const auto device = seq_state(ctx, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            decode(ctx, 129, 146, 17, 9);
+            require(llama_state_seq_set_data_ext(ctx, device.data(), device.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == device.size(), "restore packed-byte snapshot");
+            require(seq_state(ctx) == host, "packed-byte snapshot matches host state");
+            llama_memory_clear(llama_get_memory(ctx), true);
+            require(llama_state_seq_set_data_ext(ctx, device.data(), device.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == device.size(), "restore packed-byte snapshot after clear");
+            require(seq_state(ctx) == host, "packed-byte snapshot survives clear");
+        }
+    } catch (...) {
+        llama_free(ctx);
+        throw;
+    }
+    llama_free(ctx);
+}
+
 static bool same_logits(const std::vector<float> & a, const std::vector<float> & b) {
     return a.size() == b.size() && memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0;
 }
+
+#include "test-sjkvarn-compact-state.h"
 
 static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_cfg> & mismatches, const char * tmp_dir) {
     llama_context * src = make_ctx(model, c);
@@ -288,6 +358,20 @@ static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_
         const auto blob = seq_state(src);
         const live_cache before = snapshot(src);
         const auto rec_before = records(src, n_groups_pool);
+        if (c.resident) {
+            const auto device_blob = seq_state(src, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            decode(src, N0, N0 + 256, 128, 9);
+            require(llama_state_seq_set_data_ext(src, device_blob.data(), device_blob.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == device_blob.size(), "on-device snapshot restores after further seals");
+            require(seq_state(src) == blob, "on-device restore produces identical host state bytes");
+            require(records(src, n_groups_pool) == rec_before, "on-device restore preserves split and full body bytes");
+            const auto device_blob_reused = seq_state(src, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            llama_memory_clear(llama_get_memory(src), true);
+            require(llama_state_seq_set_data_ext(src, device_blob_reused.data(), device_blob_reused.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == device_blob_reused.size(), "reused on-device snapshot restores after clear");
+            require(seq_state(src) == blob, "reused on-device snapshot keeps identical host state bytes");
+            require(records(src, n_groups_pool) == rec_before, "reused on-device snapshot keeps sealed body bytes");
+        }
 
         dst = make_ctx(model, c);
         require(dst != nullptr, "destination context");
@@ -302,6 +386,39 @@ static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_
         require(after.tail_k == before.tail_k && after.tail_v == before.tail_v, "tail rows byte-identical");
         require(descriptor(kv_dst, N0) == descriptor(kv_src, N0), "descriptor identical");
         require(seq_state(dst) == blob, "re-saved state byte-identical");
+
+        if (std::string(c.name) == "4/4") {
+            // The synthetic llama has one sequence per cell and no cell extensions.
+            size_t off = 4*sizeof(uint32_t) + (size_t) N0*(sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_seq_id));
+            auto read_u32 = [&]() {
+                require(off <= blob.size() && blob.size() - off >= sizeof(uint32_t), "state header fits");
+                uint32_t value;
+                std::memcpy(&value, blob.data() + off, sizeof(value));
+                off += sizeof(value);
+                return value;
+            };
+            require(read_u32() == 0x564b4a53u && read_u32() == 2, "SJ-KVaRN v2 state header");
+            const uint32_t n_cfg = read_u32();
+            off += (size_t) n_cfg*sizeof(int64_t);
+            const uint32_t n_info = read_u32();
+            off += (size_t) n_info*sizeof(int64_t);
+            require(off <= blob.size() && blob.size() - off >= 5*sizeof(uint32_t), "SJ-KVaRN state fields fit");
+            const struct { uint32_t field, value; const char * name; } corruptions[] = {
+                { 1, S + 1, "misaligned previous sealed end" },
+                { 2, kv_dst->get_size() + 1, "visible end beyond cache" },
+                { 3, 2, "invalid draining flag" },
+            };
+            for (const auto & corruption : corruptions) {
+                auto invalid = blob;
+                std::memcpy(invalid.data() + off + corruption.field*sizeof(uint32_t), &corruption.value, sizeof(uint32_t));
+                g_last_error.clear();
+                require(llama_state_seq_set_data(dst, invalid.data(), invalid.size(), 0) == 0, std::string(corruption.name) + " refused");
+                require(g_last_error.find("corrupt state") != std::string::npos, std::string(corruption.name) + " rejected by header validation");
+                require(seq_state(dst) == blob, std::string(corruption.name) + " leaves the cache unchanged");
+            }
+            printf("%-14s OK: three corrupt state headers refused without changing the cache\n", c.name);
+        }
+
         size_t tail_bytes = 0, rec_bytes = 0;
         for (uint32_t il = 0; il < n_layer; ++il) {
             tail_bytes += before.tail_k[il].size() + before.tail_v[il].size() + before.sink_k[il].size() + before.sink_v[il].size() +
@@ -803,20 +920,157 @@ static std::string write_transform(const char * dir, const char * name, uint32_t
     return path;
 }
 
+static void scratch_views_case(llama_model * model, sj_cfg cfg) {
+    llama_context_ptr ctx(make_ctx(model, cfg));
+    require(ctx != nullptr, "scratch context created");
+    auto * kv = cache_of(ctx.get());
+    auto * buft = ggml_backend_buffer_get_type(kv->get_k_storage(0)->buffer);
+    if (getenv("SJ_TEST_GPU")) {
+        auto * device = ggml_backend_buft_get_device(buft);
+        require(device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU,
+                "scratch views must use the requested GPU");
+    }
+    printf("scratch-views: %s buffer=%s\n", cfg.plain ? "plain" : "SJ-KVaRN", ggml_backend_buft_name(buft));
+    constexpr uint32_t prompt_limit = 512;
+    uint32_t protected_cells = prompt_limit;
+    if (cfg.plain) {
+        // A cold sequence in a reused cache need not occupy cells starting at zero.
+        // Place a low logical position beyond the token-count loan boundary.
+        llama_pos pos = 0;
+        int32_t n_seq_id = 1;
+        llama_seq_id seq_id = 0;
+        llama_seq_id * seq_ids = &seq_id;
+        llama_ubatch ubatch = {};
+        ubatch.n_tokens = ubatch.n_seq_tokens = ubatch.n_seqs = ubatch.n_seqs_unq = ubatch.n_pos = 1;
+        ubatch.pos = &pos;
+        ubatch.n_seq_id = &n_seq_id;
+        ubatch.seq_id = &seq_ids;
+        llama_kv_cache::slot_info slot = {};
+        slot.strm = {0};
+        slot.idxs = {{768}};
+        kv->apply_ubatch(slot, ubatch);
+        require(kv->get_cells(0).used_max_p1() == 769, "offset physical cell fixture applied");
+        protected_cells = kv->get_n_kv(slot);
+        require(protected_cells == 1024, "masked attention pads beyond occupied physical cells");
+    }
+    for (int32_t first_unused : {2, 4}) {
+        for (int32_t il = 0; il < 4; ++il) {
+            for (auto * t : {kv->get_k_storage(il), kv->get_v_storage(il), cfg.plain ? nullptr : kv->get_sj_kvarn_body(il)}) {
+                if (!t) { continue; }
+                ggml_backend_tensor_memset(t, 0xa5, 0, ggml_nbytes(t));
+            }
+        }
+        auto views = kv->b1_scratch_views(buft, first_unused, prompt_limit);
+        require(!views.empty(), "scratch views exist");
+        for (auto & view : views) { ggml_backend_buffer_clear(view.get(), 0x3c); }
+        size_t touched = 0;
+        for (int32_t il = 0; il < 4; ++il) {
+            for (auto * t : {kv->get_k_storage(il), kv->get_v_storage(il), cfg.plain ? nullptr : kv->get_sj_kvarn_body(il)}) {
+                if (!t) { continue; }
+                std::vector<uint8_t> bytes(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
+                size_t protected_end = bytes.size();
+                if (il >= first_unused) {
+                    protected_end = 0;
+                } else if (cfg.plain) {
+                    protected_end = protected_cells * t->nb[1];
+                } else if (t == kv->get_sj_kvarn_body(il)) {
+                    // 512 cells: 128 sink cells followed by three sealed groups of 128.
+                    protected_end = 3 * ggml_sj_kvarn_rec_bytes(256, 128, 4, 4) * 2;
+                }
+                for (size_t i = 0; i < bytes.size(); ++i) {
+                    if (i < protected_end) { require(bytes[i] == 0xa5, "live KV bytes were preserved"); }
+                    else if (bytes[i] == 0x3c) { ++touched; }
+                    else { require(bytes[i] == 0xa5, "untouched padding preserved"); }
+                }
+            }
+        }
+        require(touched > 0, "borrowed views were written");
+    }
+    llama_context_ptr multi(make_ctx(model, cfg, 2));
+    require(multi != nullptr, "multi scratch context created");
+    require(cache_of(multi.get())->b1_scratch_views(buft, 0, 512).empty(), "multiple streams refuse borrowing");
+}
+
 int main(int argc, char ** argv) {
-    const char * tmp_dir = argc > 1 ? argv[1] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    const bool scratch_views = argc > 1 && strcmp(argv[1], "--scratch-views") == 0;
+    const bool resident = argc > 1 && strcmp(argv[1], "--resident") == 0;
+    const bool scalar_only = argc > 1 && strcmp(argv[1], "--scalar-only") == 0;
+    const bool device_bytes = argc > 1 && strcmp(argv[1], "--device-bytes") == 0;
+    const bool compact = argc > 1 && strcmp(argv[1], "--compact") == 0;
+    const int tmp_arg = resident || scalar_only || compact ? 2 : 1;
+    const char * tmp_dir = argc > tmp_arg ? argv[tmp_arg] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ggml_backend_load_all();
     llama_backend_init();
     llama_log_set([](ggml_log_level level, const char * text, void *) {
         if (level == GGML_LOG_LEVEL_ERROR) g_last_error = text;
     }, nullptr);
-    llama_model * model = make_model();
+    llama_model * model = make_model(resident);
     if (!model) {
         fprintf(stderr, "model init failed\n");
         return 1;
     }
 
     const sj_cfg s44  = { "4/4",        4, 4, GGML_TYPE_F32 };
+    if (compact) {
+        int result = 0;
+        try {
+            compact_state_case(model, s44, tmp_dir);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "compact state: FAIL: %s\n", e.what());
+            result = 1;
+        }
+        llama_model_free(model);
+        llama_backend_free();
+        return result;
+    }
+    if (scratch_views) {
+        int result = 0;
+        try {
+            scratch_views_case(model, s44);
+            sj_cfg plain = s44;
+            plain.plain = true;
+            scratch_views_case(model, plain);
+            printf("OK: empty future layers and unused cell suffixes preserve live bytes; multiple streams refuse borrowing\n");
+        } catch (const std::exception & e) {
+            fprintf(stderr, "scratch views: FAIL: %s\n", e.what());
+            result = 1;
+        }
+        llama_model_free(model);
+        llama_backend_free();
+        return result;
+    }
+    if (device_bytes) {
+        int result = 0;
+        try {
+            device_bytes_case(model);
+            printf("OK: packed TQ6/F16 sink device snapshot, reuse and clear, exact host bytes\n");
+        } catch (const std::exception & e) {
+            fprintf(stderr, "device bytes: FAIL: %s\n", e.what());
+            result = 1;
+        }
+        llama_model_free(model);
+        llama_backend_free();
+        return result;
+    }
+    if (resident) {
+        int fails = 0;
+        try {
+            for (uint32_t cells : { 768u, 1024u }) {
+                sj_cfg c = s44;
+                c.name = cells == 768 ? "4/4 resident768" : "4/4 resident1024";
+                c.resident = cells;
+                fails += run_case(model, c, {}, tmp_dir);
+            }
+        } catch (const std::exception & e) {
+            fprintf(stderr, "resident state: FAIL: %s\n", e.what());
+            ++fails;
+        }
+        printf("%s: resident state round trips, split2/full2, GPU seals and continuation\n", fails ? "FAIL" : "OK");
+        llama_model_free(model);
+        llama_backend_free();
+        return fails ? 1 : 0;
+    }
     const sj_cfg s33  = { "3/3",        3, 3, GGML_TYPE_F32 };
     const sj_cfg s33t = { "3/3t",       3, 3, GGML_TYPE_I16 };
     const sj_cfg s32t = { "3/2t",       3, 2, GGML_TYPE_I16 };
@@ -853,31 +1107,49 @@ int main(int argc, char ** argv) {
         { fixed, { s44 } },
     };
     int fails = 0;
+    int cases_run = 0;
     const bool multi_only = getenv("SJ_TEST_MULTI_ONLY") != nullptr; // debugging: only the multi-sequence checks
     for (const auto & c : cases) {
         if (multi_only) { break; }
+        if (scalar_only && strcmp(c.first.name, s44.name) != 0) { continue; }
         if (getenv("SJ_TEST_CASE") && strcmp(getenv("SJ_TEST_CASE"), c.first.name) != 0) { continue; } // debugging
+        ++cases_run;
         fails += run_case(model, c.first, c.second, tmp_dir);
     }
     if (!multi_only) { plain_mixed_control(model); }
     int fails_multi = 0;
+    int multi_run = 0;
     for (const auto & c : { s44, s33t, s32t }) {
+        if (scalar_only && c.body != GGML_TYPE_F32) { continue; }
+        ++multi_run;
         fails_multi += run_multi(model, c, false);
     }
+    ++multi_run;
     fails_multi += run_multi(model, s44, true);
-    fails_multi += run_multi(model, w1t, false); // transform with one FA node per stream
-    int fails_mrope = 0;
-    llama_model * model_mrope = make_model(LLM_ARCH_QWEN2VL);
-    if (!model_mrope) {
-        fprintf(stderr, "M-RoPE model init failed\n");
-        fails_mrope = 2;
-    } else {
-        fails_mrope += run_mrope(model_mrope, s44, 100);
-        fails_mrope += run_mrope(model_mrope, f16, 200);
-        llama_model_free(model_mrope);
+    if (!scalar_only) {
+        ++multi_run;
+        fails_multi += run_multi(model, w1t, false); // transform with one FA node per stream
     }
-    printf("%s: %d/%zu cases passed, multi-sequence %d/5, M-RoPE %d/2\n", fails || fails_multi || fails_mrope ? "FAIL" : "OK",
-           (int) (cases.size() - fails), cases.size(), 5 - fails_multi, 2 - fails_mrope);
+    int fails_mrope = 0;
+    int mrope_run = 0;
+    if (!multi_only) {
+        llama_model * model_mrope = make_model(false, LLM_ARCH_QWEN2VL);
+        if (!model_mrope) {
+            fprintf(stderr, "M-RoPE model init failed\n");
+            mrope_run = 1;
+            fails_mrope = 1;
+        } else {
+            ++mrope_run;
+            fails_mrope += run_mrope(model_mrope, s44, 100);
+            if (!scalar_only || f16.body == GGML_TYPE_F32) {
+                ++mrope_run;
+                fails_mrope += run_mrope(model_mrope, f16, 200);
+            }
+            llama_model_free(model_mrope);
+        }
+    }
+    printf("%s: %d/%d cases passed, multi-sequence %d/%d, M-RoPE %d/%d\n", fails || fails_multi || fails_mrope ? "FAIL" : "OK",
+           cases_run - fails, cases_run, multi_run - fails_multi, multi_run, mrope_run - fails_mrope, mrope_run);
     fails += fails_multi + fails_mrope;
     llama_model_free(model);
     llama_backend_free();

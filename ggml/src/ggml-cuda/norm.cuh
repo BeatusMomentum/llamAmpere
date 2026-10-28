@@ -7,8 +7,12 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // dst_override: write the result there instead of mul_tensor->data (same layout as mul_tensor)
+// dst_bf16: also write a BF16 copy of the result there (same layout, round to nearest even)
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
-                                 float * dst_override = nullptr);
+                                 float * dst_override = nullptr, nv_bfloat16 * dst_bf16 = nullptr);
+
+void ggml_cuda_op_rms_norm_mmq_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul,
+                                     void * q8_dst, int64_t ncols_padded);
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
 

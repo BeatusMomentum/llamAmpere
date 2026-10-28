@@ -41,6 +41,7 @@ struct llama_layer;
 struct llama_prec_policy;
 
 class llama_moe_cache;
+class llama_ple_prefetch;
 
 struct llama_memory_context_i;
 
@@ -182,6 +183,10 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+    bool h_device = false; // fork: the context supplies hidden rows by backend copy
+    // [RTPORT] LLAMA_MTP_PIPELINE: the token embedding row as a device input, written on the stream by the
+    // context (llama_context::mtp_pipe_input) instead of a host get_rows; F32 [n_embd_inp, 1], or nullptr
+    ggml_tensor * tok_row = nullptr;
 
     const int64_t n_embd = 0;
 };
@@ -423,6 +428,7 @@ public:
     ggml_tensor * self_sj_kvarn_desc_edge = nullptr; // tiered body: descriptor of the edge tier (nullptr unless edge layers exist)
     // multi-stream SJ-KVaRN: attended (padded) position count per stream of the ubatch; one FA node per stream
     std::vector<uint32_t> sj_kvarn_n_kv_streams;
+    bool skip_unused = false; // fork: KV-only device-input graphs do not consume attention geometry
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -864,6 +870,33 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// fork: prompt routing is packed across all ubatches before the expert GEMMs.
+struct llm_b1_ffn_bucket {
+    struct span { size_t offset; size_t count; };
+    std::vector<int32_t> rows;
+    std::vector<int32_t> experts;
+    std::vector<float> weights;
+    // Each span belongs to one expert and therefore has unique token rows.
+    std::vector<span> spans;
+};
+
+struct llm_b1_ffn {
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * ids = nullptr;
+    ggml_tensor * weights = nullptr;
+    std::vector<std::vector<int32_t>> expert_rows;
+    std::vector<std::vector<float>> expert_weights;
+    uint32_t max_rows = 8192;
+    size_t piece_first = 0;
+    size_t piece_count = 64; // Bound graph metadata independently of routing skew and the row dial.
+    bool grouped_mmid = false;
+    uint32_t routed_rows = 32768;
+    size_t bucket_index = 0;
+    std::vector<llm_b1_ffn_bucket> buckets;
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -927,10 +960,26 @@ struct llm_graph_params {
     // owning model (EXL3 side tensors for build_lora_mm); may be null for graphs that carry no EXL3 weights
     const llama_model * model = nullptr;
 
+    // [B1] layer-major prefill (LLAMA_B1, qwen4exp): build only the layers [b1_il0, b1_il1) (b1_il1 < 0: to the end).
+    // A range that starts above layer 0 reads the hidden state from b1_carry, a range that stops before the last layer
+    // writes it back there and builds no output. Set after construction.
+    int32_t       b1_il0   = 0;
+    int32_t       b1_il1   = -1;
+    ggml_tensor * b1_carry = nullptr;
+
+    // [PLEPF] the context's PLE page prefetch (null when off); set after construction
+    llama_ple_prefetch * ple_pf = nullptr;
+
+    // [RTPORT] 1-row MTP step whose token embedding row is a device input (LLAMA_MTP_PIPELINE); set after construction
+    bool mtp_tok_row = false;
+
     // true for a graph built only to reserve compute buffers (llama_context::graph_reserve): its output rows are
     // placeholders and may sit on sequences that have no backend sampler (none is attached yet at context creation)
     // set after construction, so it stays last
     bool is_reserve = false;
+    const llm_b1_ffn * b1_ffn = nullptr;
+    int b1_ffn_phase = 0; // 1: attention/router, 2: packed experts, 3: residual combine
+
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -994,6 +1043,14 @@ struct llm_graph_params {
             return false;
         }
 
+        if (b1_il0 != other.b1_il0 || b1_il1 != other.b1_il1 || b1_carry != other.b1_carry || b1_ffn != other.b1_ffn || b1_ffn_phase != other.b1_ffn_phase) {
+            return false;
+        }
+
+        if (mtp_tok_row != other.mtp_tok_row) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -1028,6 +1085,8 @@ public:
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
     int64_t get_max_nodes() const;
+    const llm_b1_ffn * get_b1_ffn() const { return params.b1_ffn; }
+    int get_b1_ffn_phase() const { return params.b1_ffn_phase; }
 
     void reset();
 
@@ -1076,6 +1135,7 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 
     std::vector<llm_graph_input_ptr> inputs;
+    bool mtp_device_input = false; // fork: device-input and host-input allocations cannot share a graph
 
     ggml_context_ptr ctx_compute;
 
@@ -1170,6 +1230,11 @@ struct llm_graph_context {
     std::atomic<uint32_t> * draft_vocab_warned; // see llm_graph_params
     const bool is_reserve; // see llm_graph_params
     const std::vector<float> * mtp_chain_samp; // see llm_graph_params
+    const int32_t       b1_il0;   // see llm_graph_params
+    const int32_t       b1_il1;   // see llm_graph_params (-1 = n_layer)
+    ggml_tensor * const b1_carry; // see llm_graph_params
+    llama_ple_prefetch * const ple_pf; // see llm_graph_params
+    const bool mtp_tok_row; // see llm_graph_params
 
     // [#81] logits of the compact draft head for `cur` [n_embd, n], [n_sel, n]: plain mul_mat on the activation the
     // head consumes (EXL3: x_rot = H128(suh * cur), the fused kernel's input glue built from generic ops)
@@ -1194,6 +1259,7 @@ struct llm_graph_context {
     mutable struct {
         ggml_tensor * body = nullptr; // seal output (view of the layer's record pool)
         ggml_tensor * desc = nullptr;
+        ggml_tensor * selected = nullptr; // QSA candidate positions; invalid slots lie outside the mask
         int32_t bits_k = 0;
         int32_t bits_v = 0;
         bool fused_rot = false; // Q/output rotation inside the FA node (ggml_sj_kvarn_fused_rot_enabled)

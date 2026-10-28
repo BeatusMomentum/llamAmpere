@@ -845,6 +845,71 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
         .from_float_ref           = NULL,
     },
+
+    [GGML_TYPE_AIT5_U] = {
+        .type_name                = "ait5_u",
+        .blck_size                = 128,
+        .type_size                = 82,   // per row and 128 K (fp16 scale + 128 x 5 bits), stored as 16-row units
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row units, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT2_U] = {
+        .type_name                = "ait2_u",
+        .blck_size                = 128,
+        .type_size                = 34,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row units, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT3_U] = {
+        .type_name                = "ait3_u",
+        .blck_size                = 128,
+        .type_size                = 50,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row units, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT4_U] = {
+        .type_name                = "ait4_u",
+        .blck_size                = 128,
+        .type_size                = 66,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row units, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT2] = {
+        .type_name                = "ait2",
+        .blck_size                = 512,
+        .type_size                = 130,  // 64 * 2 + 2 (ggml-ait.h chunk / 32 rows)
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT3] = {
+        .type_name                = "ait3",
+        .blck_size                = 512,
+        .type_size                = 194,  // 64 * 3 + 2 (ggml-ait.h chunk / 32 rows)
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT4] = {
+        .type_name                = "ait4",
+        .blck_size                = 512,
+        .type_size                = 258,  // 64 * 4 + 2 (ggml-ait.h chunk / 32 rows)
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT2P] = {
+        .type_name                = "ait2p",
+        .blck_size                = 512,
+        .type_size                = 130,  // AIT2 bytes, pair-table level map
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_MXFP4] = {
         .type_name                = "mxfp4",
         .blck_size                = QK_MXFP4,
@@ -1238,6 +1303,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_HC_DOWN",
+    "DSV4_HC_UP",
 
     "UNARY",
 
@@ -1255,7 +1322,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1355,6 +1422,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_hc_down(x, w_norm, w_down, w_inject)",
+    "dsv4_hc_up(x, w_norm, down, w_up)",
 
     "unary(x)",
 
@@ -1372,7 +1441,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1519,6 +1588,68 @@ bool ggml_is_quantized(enum ggml_type type) {
 
 int ggml_exl3_bits(enum ggml_type type) {
     return (type >= GGML_TYPE_EXL3_2 && type <= GGML_TYPE_EXL3_8) ? 2 + (int) (type - GGML_TYPE_EXL3_2) : 0;
+}
+
+// ---- AI+ unit types (ggml-ai4.h): rate, layout and the per-type decoder constant / encoder scale seed ----
+int ggml_ai4_rate(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U:  return 2;
+        case GGML_TYPE_AIT3_U:  return 3;
+        case GGML_TYPE_AIT4_U:  return 4;
+        case GGML_TYPE_AIT5_U:  return 5;
+        default:                return 0;
+    }
+}
+
+int ggml_ait_rate(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2:    return 2;
+        case GGML_TYPE_AIT3:    return 3;
+        case GGML_TYPE_AIT4:    return 4;
+        case GGML_TYPE_AIT2P:   return 2;
+        default:                return 0;
+    }
+}
+
+int ggml_ait_code(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2:
+        case GGML_TYPE_AIT3:
+        case GGML_TYPE_AIT4:    return 0;
+        case GGML_TYPE_AIT2P:   return 1;
+        default:                return -1;
+    }
+}
+
+bool ggml_ai4_is_unit(enum ggml_type type) {
+    return ggml_ai4_rate(type) != 0;
+}
+
+// 1 = unit-128 (the only AI+ unit byte layout), -1 = not an AI+ unit type
+int ggml_ai4_layout(enum ggml_type type) {
+    return ggml_ai4_rate(type) == 0 ? -1 : 1;
+}
+
+// The level of a 16-bit state is ((bytesum(state * C) + 2) >> 2) - 128, so C is part of the type.
+uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U:  return 0xC3CCD12Du;
+        case GGML_TYPE_AIT3_U:  return 0x87D8D12Du;
+        case GGML_TYPE_AIT4_U:
+        case GGML_TYPE_AIT5_U:  return 0xAA73876Bu;
+        default:                return 0u;
+    }
+}
+
+// Encoder scale seed = group rms / level rms * this (per-rate probe value; the encoder, not the decoder, uses it).
+float ggml_ai4_scale_mul(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U:  return 1.00f;
+        case GGML_TYPE_AIT3_U:  return 1.05f;
+        case GGML_TYPE_AIT4_U:
+        case GGML_TYPE_AIT5_U:  return 1.09f;
+        default:                return 0.0f;
+    }
 }
 
 const char * ggml_op_name(enum ggml_op op) {
@@ -5689,6 +5820,10 @@ struct ggml_tensor * ggml_arange(
 
 // ggml_flash_attn_ext
 
+bool ggml_flash_attn_ext_mask_packed(const struct ggml_tensor * mask) {
+    return mask != NULL && mask->type == GGML_TYPE_I32;
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5705,8 +5840,13 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F16);
-        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64);
+        GGML_ASSERT(mask->type != GGML_TYPE_I64 || (mask->ne[0] == 1 && mask->ne[1] >= q->ne[1] && mask->ne[2] == 1 && max_bias == 0.0f));
+        if (ggml_flash_attn_ext_mask_packed(mask)) {
+            GGML_ASSERT(mask->ne[0] >= k->ne[1]/32 + (k->ne[1]%32 != 0) && mask->ne[1] >= q->ne[1] && max_bias == 0.0f);
+        }
+        // rows may be strided (the CPU and CUDA kernels index the mask by nb[1..3])
+        GGML_ASSERT(ggml_is_contiguous_rows(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
@@ -5714,7 +5854,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
     }
 
     if (max_bias > 0.0f) {
-        GGML_ASSERT(mask);
+        GGML_ASSERT(mask && mask->type == GGML_TYPE_F16);
     }
 
     // permute(0, 2, 1, 3)
@@ -5786,12 +5926,16 @@ void ggml_flash_attn_ext_set_sj_kvarn(
         int32_t              bits_v,
         int32_t              n_kv_pad) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(a->src[3] == NULL || a->src[3]->type == GGML_TYPE_F16); // mask follows the standard FA convention
+    GGML_ASSERT(a->src[3] == NULL || a->src[3]->type == GGML_TYPE_F16 || a->src[3]->type == GGML_TYPE_I32); // standard FA mask convention (F16 or packed)
     GGML_ASSERT((a->src[1]->type == GGML_TYPE_F16 || a->src[1]->type == GGML_TYPE_Q8_0 || a->src[1]->type == GGML_TYPE_TQ6_0) && a->src[1]->type == a->src[2]->type);
     GGML_ASSERT(body->type == GGML_TYPE_I8 && ggml_is_contiguous(body));
     GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_nelements(desc) >= GGML_SJKVARN_DESC_N_ENTRIES);
     GGML_ASSERT(bits_k >= 2 && bits_k <= 8 && bits_v >= 2 && bits_v <= 8);
     GGML_ASSERT(n_kv_pad > 0 && n_kv_pad % 64 == 0);
+    if (a->src[3]) {
+        const int64_t mask_width = a->src[3]->ne[0]*(a->src[3]->type == GGML_TYPE_I32 ? 32 : 1);
+        GGML_ASSERT(mask_width >= n_kv_pad);
+    }
 
     ggml_set_op_params_i32(a, 7, ggml_get_op_params_i32(body, 7));
     a->src[5] = body;
@@ -6820,11 +6964,14 @@ struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask) {
 
+    // mask: F16 [n_kv, n_tokens, 1, ns] added to the scores, or (fork, opt-in) a range mask I32 [2, n_tokens, 1, ns]:
+    // per token the keys [lo, hi) get 0 added and every other key -inf, the same values as the F16 mask of 0 and -inf
+    const bool mrange = mask->type == GGML_TYPE_I32;
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(    mask->type == GGML_TYPE_F16 || (mrange && mask->ne[0] == 2));
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+    GGML_ASSERT(mrange || mask->ne[0] == k->ne[2]);
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
     GGML_ASSERT(      k->ne[1] == 1);
     GGML_ASSERT(   mask->ne[1] == q->ne[2]);
@@ -6997,6 +7144,96 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_dsv4_hc_down / ggml_dsv4_hc_up
+
+struct ggml_tensor * ggml_dsv4_hc_down(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_norm,
+        struct ggml_tensor  * w_down,
+        struct ggml_tensor  * w_inject,
+        float                 eps,
+        float                 lo_scale,
+        float                 inj_scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->type == GGML_TYPE_BF16);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t T      = x->ne[2];
+    const int64_t R      = w_down->ne[1];
+
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(w_norm->ne[0] == n_embd && w_norm->ne[1] == hc && w_norm->ne[2] == 1 && w_norm->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(w_norm));
+    GGML_ASSERT(w_down->ne[0] == hc*n_embd && w_down->ne[2] == 1 && w_down->ne[3] == 1);
+    GGML_ASSERT(w_down->nb[0] == ggml_type_size(GGML_TYPE_BF16));
+
+    int32_t hc_inj = 0;
+    if (w_inject) {
+        GGML_ASSERT(w_inject->type == GGML_TYPE_BF16);
+        GGML_ASSERT(w_inject->ne[0] == hc*n_embd && w_inject->ne[1] == hc && w_inject->ne[2] == 1 && w_inject->ne[3] == 1);
+        GGML_ASSERT(w_inject->nb[0] == ggml_type_size(GGML_TYPE_BF16));
+        hc_inj = (int32_t) hc;
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (R + hc_inj + hc)*T);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, hc_inj);
+    ggml_set_op_params_f32(result, 2, lo_scale);
+    ggml_set_op_params_f32(result, 3, inj_scale);
+
+    result->op     = GGML_OP_DSV4_HC_DOWN;
+    result->src[0] = x;
+    result->src[1] = w_norm;
+    result->src[2] = w_down;
+    result->src[3] = w_inject;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_up(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_norm,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * w_up,
+        float                 out_scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(down->type == GGML_TYPE_F32 && down->op == GGML_OP_DSV4_HC_DOWN);
+    GGML_ASSERT(w_up->type == GGML_TYPE_BF16);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t T      = x->ne[2];
+    const int64_t R      = w_up->ne[0];
+    const int32_t hc_inj = ggml_get_op_params_i32(down, 1);
+
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(w_norm->ne[0] == n_embd && w_norm->ne[1] == hc);
+    GGML_ASSERT(down->src[0] == x && down->src[1] == w_norm);
+    GGML_ASSERT(down->ne[0] == (R + hc_inj + hc)*T);
+    GGML_ASSERT(w_up->ne[1] == hc*n_embd && w_up->ne[2] == 1 && w_up->ne[3] == 1);
+    GGML_ASSERT(w_up->nb[0] == ggml_type_size(GGML_TYPE_BF16));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+
+    ggml_set_op_params_f32(result, 0, out_scale);
+    ggml_set_op_params_i32(result, 1, hc_inj);
+
+    result->op     = GGML_OP_DSV4_HC_UP;
+    result->src[0] = x;
+    result->src[1] = w_norm;
+    result->src[2] = down;
+    result->src[3] = w_up;
 
     return result;
 }

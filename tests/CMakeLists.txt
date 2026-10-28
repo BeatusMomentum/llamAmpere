@@ -162,6 +162,7 @@ llama_build_and_test(test-sjkvarn-state.cpp LABEL "turbo")
 target_include_directories(test-sjkvarn-state PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-sjkvarn-split.cpp LABEL "turbo")
 target_include_directories(test-sjkvarn-split PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build_and_test(test-sjkvarn-fill.cpp LABEL "turbo")
 llama_build(test-save-load-state.cpp)
 # prompt-cache state round trip over every KV / drafter / recurrent-state type (needs an MTP model: -m)
 llama_build(test-prompt-cache-types.cpp)
@@ -170,6 +171,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
     llama_build_and_test(test-sampling.cpp)
+    llama_build_and_test(test-sampler-topk-exact.cpp)
+    llama_build_and_test(test-spec-beat.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
@@ -215,6 +218,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-llama-archs.cpp)
     llama_build_and_test(test-mtp-state.cpp)
+    llama_build(test-mtp-q5-head.cpp)
+    llama_build(test-mtp-qsa-compact.cpp)
+    target_include_directories(test-mtp-qsa-compact PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_test(test-mtp-state NAME test-prompt-tail-chunks ARGS --tail-chunks)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -402,10 +409,6 @@ if (NOT BUILD_SHARED_LIBS)
 endif()
 llama_build_and_test(test-kv-stream-softmax.cpp llama-kv-stream-softmax.cpp)
 if (GGML_CUDA)
-    llama_build_and_test(
-        test-kv-stream-bench-config.cpp
-        ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench/kv-stream-bench-config.cpp)
-    target_include_directories(test-kv-stream-bench-config PRIVATE ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench)
     llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
     target_include_directories(test-kv-stream-cuda-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
     # The test exits 77 when no CUDA device is present (e.g. a CUDA build run
@@ -436,16 +439,32 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-fattn-prefill-policy.cpp)
+llama_build_and_test(test-fa-skip-dead.cpp) # [ROUNDFIX] dead-tile skip bit-identity; skips without a GPU backend
+llama_build_and_test(test-topk-select-fast.cpp) # [ROUNDFIX] fast radix select bit-identity; skips without a GPU backend
+llama_build_and_test(test-lid-gather.cpp) # [ROUNDFIX] pooled-key gather read in place, bit-identity; skips without a GPU backend
 llama_build_and_test(test-mtp-vocab.cpp)
 llama_build_and_test(test-mtp-vocab-builtin.cpp ../src/llama-mtp-vocab-builtin.cpp)
 llama_build_and_test(test-gdn-replay-split.cpp)
 llama_build_and_test(test-add-rms-q8.cpp) # [#46] skips without a GPU backend
+llama_build_and_test(test-hc-norm-fuse.cpp) # [HCPN] skips without a GPU backend
 llama_build_and_test(test-exl3-ffn-bridge.cpp) # [#74] skips without a GPU backend
 llama_build_and_test(test-exl3-weight-major.cpp) # [#73] skips without a GPU backend
 llama_build_and_test(test-exl3-decode.cpp) # [#41] skips without a GPU backend
+llama_build_and_test(test-exl3-glue-fold.cpp) # [#136] skips without a GPU backend
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    add_executable(test-exl3-cpu test-exl3-cpu.cpp)
+    target_link_libraries(test-exl3-cpu PRIVATE ggml ggml-cpu)
+    llama_test(test-exl3-cpu)
+    target_include_directories(test-exl3-cpu PRIVATE ../ggml/src ../ggml/src/ggml-cpu)
+    set_tests_properties(test-exl3-cpu PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 add_executable(test-fattn-mma-config test-fattn-mma-config.cpp)
 target_include_directories(test-fattn-mma-config PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
 llama_test(test-fattn-mma-config)
+
+add_executable(test-rpb-knobs test-rpb-knobs.cpp)
+target_include_directories(test-rpb-knobs PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+llama_test(test-rpb-knobs)
 
 llama_build_and_test(test-fattn-alloc-route.cpp) # [#64] skips without a GPU backend
 llama_build_and_test(test-fattn-bounded-prefill.cpp) # [#22/#29] forks one child per GGML_CUDA_PREFILL_KV_MIB arm; skips without a GPU backend
@@ -453,6 +472,7 @@ llama_build_and_test(test-mtp-chain-sample.cpp) # [#69] CPU always, the GPU when
 llama_build_and_test(test-gdn-ingr-compact.cpp) # [#63] CPU always, the GPU when present
 llama_build_and_test(test-draft-vocab-hot.cpp)
 llama_build_and_test(test-draft-vocab-compact.cpp)
+llama_build_and_test(test-nmse-masked-inf.cpp)
 if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build(test-moe-cache.cpp)
     if (GGML_CUDA)
@@ -474,7 +494,12 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
 
+# Manual fixed-token model gate; needs model paths and input IDs supplied by the caller.
+llama_build(test-moe-prefetch-model.cpp)
+
 llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-moe-expert-keep.cpp) # [#215/#217] CPU-only expert keep policy
+llama_build_and_test(test-decode-phase.cpp)     # one-shot decode tag gates the #217 trunk keep map
 llama_build_and_test(test-fit-extra.cpp)
 
 llama_build_and_test(test-tiled-mulmat.cpp)
@@ -497,8 +522,18 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
+    target_include_directories(test-quantize-fns PRIVATE ../ggml/src)
+    target_include_directories(test-quantize-perf PRIVATE ../ggml/src)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+endif()
+
+# fork MOEGAP: host expert pool bandwidth bench (not a ctest; run by hand on the target box)
+if (NOT GGML_BACKEND_DL AND GGML_CPU AND TARGET ggml-cuda AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    llama_build(test-moe-cs-bw.cpp)
+    target_link_libraries(test-moe-cs-bw PRIVATE ggml-cuda ggml-cpu)
+    llama_build(test-moe-iq-rows.cpp)
+    target_link_libraries(test-moe-iq-rows PRIVATE ggml-cuda ggml-cpu)
 endif()
 
 # libmtmd
@@ -552,3 +587,22 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    add_executable(test-ple-cache test-ple-cache.cpp ../src/llama-ple-cache.cpp ../src/llama-moe-arena.cpp)
+    target_link_libraries(test-ple-cache PRIVATE llama ggml ggml-cpu ggml-base)
+    llama_test(test-ple-cache LABEL "main;cpu")
+
+    add_executable(test-moe-arena test-moe-arena.cpp ../src/llama-moe-arena.cpp)
+    target_link_libraries(test-moe-arena PRIVATE llama ggml ggml-cpu ggml-base)
+    llama_test(test-moe-arena LABEL "main;cpu")
+endif()
+
+if (UNIX)
+    add_executable(test-moe-generation-profile test-moe-generation-profile.cpp)
+    llama_test(test-moe-generation-profile LABEL "main")
+endif()
+
+llama_build_and_test(test-gdn-conv-norm.cpp)
+set_tests_properties(test-gdn-conv-norm PROPERTIES SKIP_RETURN_CODE 77)
+llama_build_and_test(test-ait-format.cpp)

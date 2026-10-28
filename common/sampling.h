@@ -4,6 +4,8 @@
 
 #include "common.h"
 
+#include <functional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -37,6 +39,20 @@ struct common_sampler;
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
+// [DRAFTFAST] the top k of n logits as {id, logit, 0}, in exactly the order llama_sampler_top_k leaves them for
+// k <= 128 (std::partial_sort over the full array, equal logits included), without building the n-entry array.
+void common_sampler_topk_exact(const float * logits, int32_t n, int32_t k, std::vector<llama_token_data> & out);
+
+// Only repeated -INFINITY bans preserve full-vocabulary and compact-candidate semantics for duplicate ids.
+bool common_sampler_topk_biases_supported(const std::vector<llama_logit_bias> & biases);
+
+// Select using supported biases, but leave raw logits for the leading bias sampler to apply once.
+// Invalid token ids are ignored, as in the full-vocabulary bias sampler. Scratch is reused between calls.
+// Returns false without changing the candidates if a ban would produce a NaN; use the full candidate path.
+bool common_sampler_topk_exact_biased(
+        const float * logits, int32_t n, int32_t k, const std::vector<llama_logit_bias> & biases,
+        std::vector<float> & scratch, std::vector<llama_token_data> & out);
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params);
@@ -132,18 +148,41 @@ struct common_sampler_pq_stats {
     size_t n_match = 0; // accepted because the target sample equalled the draft token
     size_t n_extra = 0; // accepted by the residual acceptance test (id-match would have rejected)
     size_t n_rej   = 0; // rejected: token drawn from the residual distribution norm(max(p - q, 0))
+    size_t n_lossy = 0; // rejected by the exact test but kept because p(draft) >= p(replacement)
     double sum_p_d = 0; // sum of p(draft[i]): the id-match acceptance probability
     double sum_min = 0; // sum of sum_x min(p(x), q(x)): the p/q acceptance probability
 };
 
+struct common_sampler_pq_result {
+    llama_token id;
+    llama_token replacement = LLAMA_TOKEN_NULL;
+    double p_replacement = -1.0;
+    bool accepted = false;
+    bool rescued = false;
+};
+
+// Verify one position from the already filtered target distribution. Does not apply samplers or copy data.
+common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
+        llama_token draft, llama_token target, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
+        const llama_vocab * vocab = nullptr, const std::function<bool(llama_token)> & is_stop = {});
+
 // true when the chain samples on the CPU at temperature > 0 without grammar, reasoning budget or mirostat
 bool common_sampler_pq_supported(const struct common_sampler * gsmpl);
 
-// replay: the draft is a previously verified result being re-decoded after a checkpoint restore, so a
-// rejection at its last position is the recorded outcome and the fresh token after it is still sampled
-std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, bool replay = false);
+// The server re-decodes a verified prefix with a saved post-verification sampler; it does not re-decide tokens.
+std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, bool replay = false, int32_t seq = -1, int64_t generated = -1,
+        const std::function<bool(llama_token, const llama_tokens &)> & is_stop = {});
 
 const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_sampler * gsmpl);
+
+// top-1 probability of the target distribution at each position the last common_sampler_sample_and_accept_n_pq
+// call sampled from (request-matched, after the sampler chain; -1 where the chain sampled on the backend).
+// Entries 0..accepted belong to the committed tokens; later entries do not exist (the call stops at a rejection).
+const std::vector<float> & common_sampler_get_top1_trace(const struct common_sampler * gsmpl);
+
+// [MBFIX] draft position where the last common_sampler_sample_and_accept_n_pq call first kept a draft token that the
+// exact rule had rejected (mode-biased MTP rescue); -1 when it made none. The exact rule would have accepted this many.
+int32_t common_sampler_get_first_rescue(const struct common_sampler * gsmpl);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

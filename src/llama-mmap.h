@@ -57,6 +57,7 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+    void remap_private_writable(struct llama_file * file, size_t first, size_t last);
 
     static const bool SUPPORTED;
 
@@ -71,6 +72,7 @@ struct llama_mlock {
 
     void init(void * ptr);
     void grow_to(size_t target_size);
+    size_t locked_size() const;
 
     static const bool SUPPORTED;
 

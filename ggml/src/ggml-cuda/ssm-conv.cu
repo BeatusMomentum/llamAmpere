@@ -2,6 +2,99 @@
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
+// A block owns one complete 128-channel Q/K head (or one V segment).
+// Each channel keeps its history in registers and publishes the same snapshots
+// as the ordinary ring convolution. Only Q/K segments need a block reduction.
+template <int NT>
+static __global__ void ssm_conv_norm_f32(
+        ggml_cuda_conv_ring_args args, const float * weights, float * mixed,
+        float * q, float * k, int channels, int heads, float eps, float factor) {
+    ggml_cuda_pdl_sync();
+    const int lane = threadIdx.x;
+    const int seq = blockIdx.x;
+    const int segment = blockIdx.y;
+    const int channel = segment*128 + lane;
+    float x[3 + NT];
+    float w[4];
+    const auto * state = (const float *) ((const char *) args.state +
+            seq*args.state_nb2 + channel*args.state_nb1);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) { x[j] = state[j]; }
+    const char * input = (const char *) args.x + seq*args.x_nb2 + channel*args.x_nb1;
+#pragma unroll
+    for (int t = 0; t < NT; ++t) { x[3 + t] = *(const float *) (input + t*args.x_nb0); }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) { w[j] = weights[channel*4 + j]; }
+
+    // Preserve graph order, including an in-place update of the source plane.
+    for (int j = 0; j < args.n_win; ++j) {
+        const auto & win = args.win[j];
+        const int64_t row = win.rows ? win.rows[seq] : seq;
+        float * out = win.dst + row*win.row_stride + channel*3;
+#pragma unroll
+        for (int offset = 0; offset <= NT; ++offset) {
+            if (offset == win.s_idx) {
+#pragma unroll
+                for (int a = 0; a < 3; ++a) { out[a] = x[offset + a]; }
+            }
+        }
+    }
+
+    __shared__ float partial[32];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        float value = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { value += x[t + j]*w[j]; }
+        value += 0.0f; // same bias-free convolution expression as the ring path
+        value = ggml_cuda_op_silu_single(value);
+        mixed[((int64_t) seq*NT + t)*channels + channel] = value;
+        if (segment < 2*heads) {
+            // Match RMS_NORM followed by SCALE, retaining its epsilon and
+            // two multiplies instead of replacing them by a combined L2 scale.
+            const float sum = block_reduce<block_reduce_method::SUM, 128>(value*value, partial);
+            const float mean = sum/128.0f;
+            const float norm = rsqrtf(mean + eps);
+            float * out = segment < heads ? q : k;
+            out[(((int64_t) seq*NT + t)*heads + segment%heads)*128 + lane] = factor*(norm*value);
+            __syncthreads(); // every warp must finish reading partial before reuse
+        }
+    }
+    ggml_cuda_pdl_lc();
+}
+
+bool ggml_cuda_op_ssm_conv_norm(ggml_backend_cuda_context & ctx, ggml_tensor * conv,
+        ggml_tensor * mixed, ggml_tensor * q, ggml_tensor * k, float eps) {
+    for (auto & entry : ctx.conv_rings) {
+        if (entry.conv != conv) { continue; }
+        const ggml_cuda_kernel_launch_params params(
+                dim3(conv->ne[2], conv->ne[0]/128), dim3(128), 0, ctx.stream());
+        auto launch = [&](auto width) {
+            constexpr int nt = decltype(width)::value;
+            ggml_cuda_kernel_launch(ssm_conv_norm_f32<nt>, params, entry.args,
+                    (const float *) conv->src[1]->data, (float *) mixed->data,
+                    (float *) q->data, (float *) k->data, (int) conv->ne[0],
+                    (int) q->ne[1], eps, 1.0f/sqrtf(128.0f));
+        };
+        switch (conv->ne[1]) {
+            case 1: launch(std::integral_constant<int, 1>{}); break;
+            case 2: launch(std::integral_constant<int, 2>{}); break;
+            case 3: launch(std::integral_constant<int, 3>{}); break;
+            case 4: launch(std::integral_constant<int, 4>{}); break;
+            case 5: launch(std::integral_constant<int, 5>{}); break;
+            case 6: launch(std::integral_constant<int, 6>{}); break;
+            case 7: launch(std::integral_constant<int, 7>{}); break;
+            case 8: launch(std::integral_constant<int, 8>{}); break;
+            default: return false;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        entry.used = true;
+        ctx.fusion_stats.conv_ring++;
+        return true;
+    }
+    return false;
+}
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
                                     const float * bias_ptr,
@@ -256,6 +349,101 @@ static void ssm_conv_ring_f32_cuda(const ggml_cuda_conv_ring_args & args, const 
     }
 }
 
+// [CRP] GGML_CUDA_CONV_RING_PREFILL=1: the conv ring for prefill widths (n_t > GGML_CUDA_CONV_RING_MAX_T). Same plan,
+// same checks: the CONCAT and window nodes are not launched, the conv input is read from the CONCAT operands (kept
+// state columns, then the new rows through their transpose view: for a [C, T] activation each warp reads 32
+// consecutive channels of one token, coalesced). The conv arithmetic is ssm_conv_long_token_f32's term for term
+// (sumf = 0, += x[i+j]*w[j] for j = 0..3, += bias, SILU), so the output bytes match the unfused path; the windows
+// (n_keep columns each, at most GGML_CUDA_CONV_RING_MAX_WIN) are bit copies written by the token-tile-0 blocks, each
+// thread for its own channel and in graph order. The windows never overlap the operands (checked by the plan), so
+// the blocks still reading them are not affected.
+template <bool apply_silu, int TT>
+static __global__ void ssm_conv_ring_prefill_f32(const ggml_cuda_conv_ring_args args, const float * __restrict__ w_ptr,
+                                                 const int w_nb1, const float * __restrict__ bias,
+                                                 float * __restrict__ dst, const int dst_nb1, const int dst_nb2,
+                                                 const int64_t n_t) {
+    constexpr int d_conv = 4;
+    constexpr int n_keep = d_conv - 1;
+
+    const int     tid = threadIdx.x;
+    const int     s   = blockIdx.x;
+    const int64_t c   = (int64_t) blockIdx.y * blockDim.x + tid;
+    const int64_t t0  = (int64_t) blockIdx.z * TT;
+
+    const float * xs = (const float *) ((const char *) args.state + s * args.state_nb2 + c * args.state_nb1);
+    const char  * xn = (const char *) args.x + s * args.x_nb2 + c * args.x_nb1;
+    // conv input column q: the kept state for q < n_keep, then new row q - n_keep
+    const auto in = [&](const int64_t q) -> float {
+        return q < n_keep ? xs[q] : *(const float *) (xn + (q - n_keep) * args.x_nb0);
+    };
+
+    if (blockIdx.z == 0) {
+#pragma unroll
+        for (int k = 0; k < GGML_CUDA_CONV_RING_MAX_WIN; ++k) {
+            if (k < args.n_win) {
+                const ggml_cuda_conv_ring_window & win = args.win[k];
+                const int64_t row = win.rows != nullptr ? (int64_t) win.rows[s] : (int64_t) s;
+                float * out = win.dst + row * win.row_stride + c * n_keep;
+#pragma unroll
+                for (int j = 0; j < n_keep; ++j) {
+                    out[j] = in((int64_t) win.s_idx + j);
+                }
+            }
+        }
+    }
+
+    float w[d_conv];
+    const int stride_w = w_nb1 / sizeof(float);
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        w[j] = w_ptr[c * stride_w + j];
+    }
+    const float b = bias != nullptr ? bias[c] : 0.0f;
+
+    float * y = (float *) ((char *) dst + s * dst_nb2) + c;
+    const int64_t stride_y = dst_nb1 / sizeof(float);
+
+    if (t0 + TT <= n_t) {
+        float x[TT + n_keep];
+#pragma unroll
+        for (int q = 0; q < TT + n_keep; ++q) {
+            x[q] = in(t0 + q);
+        }
+#pragma unroll
+        for (int i = 0; i < TT; ++i) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                sumf += x[i + j] * w[j];
+            }
+            sumf += b;
+            y[(t0 + i) * stride_y] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        }
+    } else {
+        for (int64_t t = t0; t < n_t; ++t) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                sumf += in(t + j) * w[j];
+            }
+            sumf += b;
+            y[t * stride_y] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        }
+    }
+}
+
+template <bool apply_silu>
+static void ssm_conv_ring_prefill_f32_cuda(const ggml_cuda_conv_ring_args & args, const float * w, const int w_nb1,
+                                           const float * bias, float * dst, const int dst_nb1, const int dst_nb2,
+                                           const int64_t nr, const int64_t n_t, const int64_t n_s, cudaStream_t stream) {
+    const int threads = 128;
+    constexpr int TT = 32;
+    GGML_ASSERT(nr % threads == 0);
+    const dim3 blocks(n_s, nr / threads, (n_t + TT - 1) / TT);
+    ssm_conv_ring_prefill_f32<apply_silu, TT><<<blocks, threads, 0, stream>>>(args, w, w_nb1, bias, dst, dst_nb1, dst_nb2, n_t);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
@@ -300,8 +488,15 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         if (e.conv != dst) {
             continue;
         }
-        GGML_ASSERT(nc == 4 && n_t >= 1 && n_t <= GGML_CUDA_CONV_RING_MAX_T && out->nb[0] == sizeof(float));
-        if (fuse_silu) {
+        GGML_ASSERT(nc == 4 && n_t >= 1 && out->nb[0] == sizeof(float));
+        if (n_t > GGML_CUDA_CONV_RING_MAX_T) {
+            // [CRP] prefill width
+            if (fuse_silu) {
+                ssm_conv_ring_prefill_f32_cuda<true>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);
+            } else {
+                ssm_conv_ring_prefill_f32_cuda<false>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);
+            }
+        } else if (fuse_silu) {
             ssm_conv_ring_f32_cuda<true>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);
         } else {
             ssm_conv_ring_f32_cuda<false>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);

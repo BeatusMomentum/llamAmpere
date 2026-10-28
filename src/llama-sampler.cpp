@@ -686,7 +686,8 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
 
     bool is_backend = chain->is_init;
 
-    for (auto & smpl : chain->samplers) {
+    for (size_t i = 0; i < chain->samplers.size(); ++i) {
+        auto & smpl = chain->samplers[i];
         if (is_backend && smpl.is_backend) {
             continue;
         }

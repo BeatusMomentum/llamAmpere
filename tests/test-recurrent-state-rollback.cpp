@@ -6,6 +6,7 @@
 #include "../src/llama-context.h"
 #include "../src/llama-io.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-memory-hybrid-idx.h"
 
 #include <algorithm>
 #include <clocale>
@@ -1223,6 +1224,41 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         }
     }
 
+    // fork (bookkeep): no-op suffix removals preserve pooled keys and the next decode.
+    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx_src))) {
+        if (idx->get_mem_idx() && idx->get_kpool() > 0) {
+            llama_pos pos = n_tokens;
+            const llama_pos pooled_end = std::max<llama_pos>(pos, 2*idx->get_kpool() + 3);
+            const bool optimized = common_get_env("LLAMA_BOOKKEEP_KV") == "1";
+            for (; pos < pooled_end + 4; ++pos) {
+                if (pos >= pooled_end) {
+                    const auto stale_before = idx->mem_idx_stale_get();
+                    const auto & cells = idx->get_mem_idx()->get_cells(0);
+                    const auto positions_before = cells.seq_pos_get(0);
+                    const llama_pos p0 = pos + (pos - pooled_end);
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, p0, -1) ||
+                            cells.seq_pos_get(0) != positions_before ||
+                            (optimized && idx->mem_idx_stale_get() != stale_before)) {
+                        fprintf(stderr, "%s : no-op suffix removal changed indexer metadata at %d\n", __func__, pos);
+                        return 1;
+                    }
+                }
+                const llama_token token = tokens[(size_t) pos % tokens.size()];
+                if (!decode_one(ctx_src, token, pos) || !decode_one(ctx_dst, token, pos)) {
+                    fprintf(stderr, "%s : no-op suffix continuation decode failed at %d\n", __func__, pos);
+                    return 1;
+                }
+                const float * a = llama_get_logits_ith(ctx_src, 0);
+                const float * b = llama_get_logits_ith(ctx_dst, 0);
+                if (!a || !b || nmse(a, b, n_vocab) != 0.0) {
+                    fprintf(stderr, "%s : no-op suffix changed next-decode logits at %d\n", __func__, pos);
+                    return 1;
+                }
+            }
+            fprintf(stderr, "%s : no-op indexer suffix removals preserve next-decode logits after two full pools\n", __func__);
+        }
+    }
+
     fprintf(stderr, "%s : recurrent rollback checkpoint restored successfully\n", __func__);
 
     // RB1b reader-bound gates. Run after the original checkpoint test so a failure here is
@@ -1243,6 +1279,40 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     }
 
     return 0;
+}
+
+static bool test_single_seq_reserve(const common_params & params, llama_model * model) {
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_seq_max = 2;
+    cparams.kv_unified = false;
+    cparams.n_ctx = 256;
+    cparams.n_batch = cparams.n_ubatch = 32;
+    llama_context_ptr ctx(llama_init_from_model(model, cparams));
+    if (!ctx) { return false; }
+    auto * memory = ctx->get_memory();
+    if (!memory) { return false; }
+    // Odd token counts must not be rounded to the number of configured slots.
+    for (uint32_t rows : {1u, 3u, 9u}) {
+        auto view = memory->init_full_single_seq();
+        if (dynamic_cast<llama_memory_hybrid_idx *>(memory)) {
+            const auto * idx_view = dynamic_cast<const llama_memory_hybrid_idx_context *>(view.get());
+            if (!idx_view) { return false; }
+            if (idx_view->get_idx() && (idx_view->get_n_stream() != 1 ||
+                    idx_view->get_idx()->get_n_kv() != idx_view->get_attn()->get_n_kv())) { return false; }
+        }
+        if (!view || !ctx->graph_reserve(rows, 1, 1, view.get())) { return false; }
+    }
+    // Narrowing a reservation must not narrow the live cache or the next full view.
+    auto full = memory->init_full();
+    if (dynamic_cast<llama_memory_hybrid_idx *>(memory)) {
+        const auto * idx_view = dynamic_cast<const llama_memory_hybrid_idx_context *>(full.get());
+        if (!idx_view) { return false; }
+        if (idx_view->get_idx() && idx_view->get_n_stream() != 2) { return false; }
+    }
+    if (!full || !ctx->graph_reserve(4, 2, 2, full.get()) ||
+            memory->seq_pos_max(0) >= 0 || memory->seq_pos_max(1) >= 0) { return false; }
+    fprintf(stderr, "single-sequence full-cache graph reservation PASS\n");
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -1270,6 +1340,10 @@ int main(int argc, char ** argv) {
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
         fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
         return 0;
+    }
+
+    if (common_get_env("LLAMA_TEST_B1_SINGLE_SEQ_RESERVE") == "1") {
+        return test_single_seq_reserve(params, model) ? 0 : 1;
     }
 
     for (uint8_t fill : { 0, 0x3e }) {

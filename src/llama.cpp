@@ -27,6 +27,12 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#include <cstdlib>
+#include <unistd.h>
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -440,6 +446,45 @@ static struct llama_model * llama_model_load_from_file_impl(
         }
         return nullptr;
     }
+
+#if defined(__GLIBC__)
+    const char * trim = getenv("LLAMA_MALLOC_TRIM");
+    if (trim && strcmp(trim, "1") == 0) {
+        // The loader and its temporary metadata have been destroyed here.
+        auto resident_kib = []() -> size_t {
+            size_t result = 0;
+#if defined(__linux__)
+            // LOADFAST (opt-in LLAMA_MALLOC_TRIM_STATM=1): smaps_rollup walks every page table entry, about
+            // 1 s per read with the 40 GiB pinned arena resident; statm reads the same RSS counter in O(1).
+            if (const char * statm = getenv("LLAMA_MALLOC_TRIM_STATM"); statm && atoi(statm) != 0) {
+                FILE * fs = fopen("/proc/self/statm", "r");
+                if (fs) {
+                    size_t pages_total = 0, pages_resident = 0;
+                    if (fscanf(fs, "%zu %zu", &pages_total, &pages_resident) == 2) {
+                        result = pages_resident * (size_t) sysconf(_SC_PAGESIZE) / 1024;
+                    }
+                    fclose(fs);
+                }
+                return result;
+            }
+            FILE * file = fopen("/proc/self/smaps_rollup", "r");
+            if (file) {
+                char line[256];
+                while (fgets(line, sizeof(line), file)) {
+                    if (sscanf(line, "Rss: %zu kB", &result) == 1) { break; }
+                }
+                fclose(file);
+            }
+#endif
+            return result;
+        };
+        const size_t before = resident_kib();
+        const int released = malloc_trim(0);
+        const size_t after = resident_kib();
+        LLAMA_LOG_INFO("%s: malloc_trim after load: released=%d RSS_before=%zu KiB RSS_after=%zu KiB decrease=%zu KiB\n",
+                __func__, released, before, after, before > after ? before - after : 0);
+    }
+#endif
 
     return model;
 }

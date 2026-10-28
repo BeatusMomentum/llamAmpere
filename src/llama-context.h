@@ -20,12 +20,18 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_b1;
+class llama_ple_prefetch;
+struct llama_ple_hinter;
+struct llama_moe_output;
+class llama_kv_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
+class  llama_memory_recurrent;
 struct llama_memory_context_i;
 
 // stores copy of the memory in device buffer. used for fast state save/load
@@ -57,11 +63,13 @@ struct llama_context {
     //   - changing samplers
     //   - changing attention type
     //   - etc.
-    void sched_reserve();
+    void sched_reserve(bool suspend_prompt_cache = false);
+    void detach_compute_borrower();
 
     void synchronize();
     ggml_backend_t sj_kvarn_backend(ggml_backend_buffer_t buffer) const;
     bool maintain_sj_kvarn();
+    bool b1_seal_sj_kvarn(int32_t il0, int32_t il1); // [B1] seal the current ubatch's groups in layers [il0, il1) only
     int32_t compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
 
 
@@ -69,6 +77,14 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    int b1_status() const {
+        if (!b1_tried) { return -1; }
+        if (!b1 || moe_cache) { return 0; }
+        for (bool extract : cparams.embeddings_layer_inp) {
+            if (extract) { return 0; }
+        }
+        return 1;
+    }
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -80,6 +96,7 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+    const llama_sj_kvarn_config * get_sj_kvarn() const;
 
     // return the *effective* K/V cache tensor types currently in use by the memory object.
     // this can differ from what was requested via llama_context_params.type_k/type_v because
@@ -105,6 +122,8 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    bool copy_embeddings_nextn(float * dst, int32_t first, int32_t count);
+    bool release_embeddings_nextn(int32_t first, int32_t count);
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -120,6 +139,8 @@ struct llama_context {
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
 
+    llama_sampler_output get_sampler_output_ith(int32_t idx);
+
     bool get_causal_attn() const;
 
     void attach_threadpool(
@@ -130,6 +151,7 @@ struct llama_context {
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
     void set_decode_phase(enum llama_decode_phase phase);
+    void set_next_decode_phase(enum llama_decode_phase phase);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
@@ -169,6 +191,37 @@ struct llama_context {
     // compat version
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    bool mtp_prefill_init();
+    void mtp_prefill_reset(llama_seq_id seq);
+    int mtp_prefill_decode(llama_context & target, llama_batch batch, const float * const * carry, uint32_t n_seq);
+    void mtp_prefill_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
+    void mtp_prefill_input(llm_graph_input_embd_h & input, const llama_ubatch & ubatch);
+    void mtp_prefill_place(llm_graph_result & res);
+    // [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: per-ubatch device handoff of the target's hidden rows to the helper
+    bool mtp_handoff_init();
+    void mtp_handoff_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
+    bool mtp_handoff_ready(int32_t first, int32_t count) const;
+    bool mtp_handoff_row(float * dst, int32_t row) const;
+    void mtp_handoff_release();
+    void set_ubatch_rows_callback(void (*cb)(void * user, int32_t first, int32_t count), void * user);
+    int mtp_handoff_decode(llama_context & target, llama_batch batch, int32_t first, const float * carry);
+    void (*ubatch_rows_cb)(void * user, int32_t first, int32_t count) = nullptr;
+    void * ubatch_rows_cb_user = nullptr;
+    bool mtp_device_feedback_init();
+    int mtp_device_feedback_decode(llama_batch batch, bool use_previous);
+    void mtp_device_feedback_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
+    void mtp_device_feedback_input(llm_graph_input_embd_h & input);
+    bool mtp_pipe_init();
+    int  mtp_pipe_decode(llama_batch batch, bool use_previous, bool defer);
+    bool mtp_pipe_supply(llama_token token);
+    // [RTPORT] early PLE page reads, see llama_ple_hint()
+    void ple_hint_add(const llama_token * window, int32_t n_window);
+    void mtp_pipe_cancel();
+    bool mtp_pipe_step_ok();
+    bool mtp_pipe_stats(uint64_t * n_steps, uint64_t * n_deferred, uint64_t * n_cancel) const;
+    void mtp_pipe_input(llm_graph_input_embd_h & input);
+    void mtp_pipe_publish(uint32_t seq, llama_token token);
 
     //
     // state save/load
@@ -252,7 +305,7 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    uint32_t output_reserve(int32_t n_outputs, int32_t n_tokens = 0);
 
     // re-run the reservation for the rows reserved so far, so that a configuration change
     // (e.g. enabling nextn embeddings) grows the pinned buffers at setup time, not inside a request
@@ -309,6 +362,7 @@ private:
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+    static bool sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -438,6 +492,7 @@ private:
 
     // [#69] sampled MTP chain inputs: the packed sampling params, then one uniform per chain step
     std::vector<float> mtp_chain_samp;
+    bool mtp_chain_qwen4exp_reserve = false;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
@@ -445,6 +500,10 @@ private:
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
+
+    // Opt-in MTP catch-up translation storage, at most128MiB hidden payload.
+    // Independent from ubatch/output memory; decode's allocr copies its contents.
+    std::unique_ptr<llama_batch_ext> mtp_compat_reuse;
 
     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
@@ -464,7 +523,79 @@ private:
     // the two never compute at the same time, each synchronizes the other before computing
     llama_context * compute_peer = nullptr;
 
+    // fork: Private MTP storage permits target/draft stream overlap without sharing scratch allocations.
+    bool mtp_prefill_async = false;
+    bool mtp_reserve_tight = false;
+    bool mtp_scratch_enabled = false;
+    bool mtp_scratch_active = false;
+    llama_context * mtp_scratch_target = nullptr;
+    std::vector<llama_context *> mtp_scratch_clients;
+    llama_kv_cache * mtp_scratch_cache = nullptr;
+    ggml_backend_t mtp_scratch_backend = nullptr;
+    std::vector<ggml_backend_buffer_ptr> mtp_scratch_views;
+    void mtp_scratch_prepare(bool kv_only, const llama_memory_context_i * mctx = nullptr, const llama_ubatch * ubatch = nullptr);
+    void mtp_scratch_end();
+    bool compute_is_shared() const;
+    struct {
+        bool enabled = false;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * rows = nullptr;
+        ggml_backend_t backend = nullptr;
+        ggml_backend_event_ptr ready;
+        ggml_backend_event_ptr consumed;
+        bool consuming = false;
+        std::vector<bool> captured;
+        std::vector<llama_pos> carry_pos;
+        bool ring = false;        // [PREFILLFAST] handoff staging holds one ubatch (rows [0, n_ubatch) + one carry row per seq)
+        int64_t ring_first = -1;  // batch index of staged row 0, or -1
+        int32_t ring_rows = 0;
+    } mtp_hidden;
+    llama_context * mtp_hidden_source = nullptr; // scoped to mtp_prefill_decode
+    std::vector<int32_t> mtp_hidden_rows;
+    // fork: Within-round helper carry only. The speculative sidecar keeps the accepted target hidden row.
+    struct {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * rows = nullptr;
+        ggml_backend_t backend = nullptr;
+        llama_pos pos = -1;
+        bool valid = false;
+        bool active = false;
+        bool use_previous = false;
+    } mtp_feedback;
+    // [RTPORT] LLAMA_MTP_PIPELINE: guess steps queued before their token is known (see llama_mtp_pipe_decode)
+    struct {
+        bool enabled = false;
+        bool active  = false;   // inside a pipe decode: the graph takes its token row from the stream
+        bool pending = false;   // the last queued step waits for its token
+        bool failed  = false;   // a step timed out; the pipeline stays off for this context
+        uint32_t seq = 0;       // sequence number of the last queued step (0 = none)
+        ggml_backend_buffer_ptr host;   // pinned: flag[2], status[2], rows[2][n_embd]
+        uint32_t * flag   = nullptr;
+        uint32_t * status = nullptr;
+        float    * rows   = nullptr;
+        int64_t n_embd = 0;
+        ggml_backend_t backend = nullptr;
+        ggml_backend_event_ptr ev[2];   // recorded after each step's output copies
+        bool (*row_wait)(ggml_backend_t, ggml_tensor *, const uint32_t *, uint32_t, const float *, uint32_t *, uint64_t) = nullptr;
+        uint64_t n_steps = 0, n_deferred = 0, n_cancel = 0;
+    } mtp_pipe;
+    std::vector<ggml_backend_buffer_ptr> mtp_input_uploads;
+    size_t mtp_input_upload_next = 0;
+    ggml_backend_event_ptr mtp_input_upload_done;
+
     bool sched_need_reserve = true;
+    // fork: limit only the reserved graph, not the caller's physical batch size.
+    uint32_t sched_reserve_tokens = 0;
+    // The scheduler owns expert residency independently of its compute allocator.
+    // Reuse it for graph-shape changes while its fixed capacity/configuration fits.
+    size_t sched_node_capacity = 0;
+    int sched_cache_mode = -1;
+    size_t sched_cache_budget_mib = 0;
+    bool sched_pipeline_parallel = false;
+    bool sched_op_offload = false;
+    bool prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch);
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
@@ -506,9 +637,119 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
     uint64_t           gf_res_prev_epoch  = 0; // ggml_backend_sched_get_alloc_epoch when gf_res_prev_active was allocated
+    // fork ROUNDPREP (LLAMA_MTP_PLAN_SLOTS=1): the helper keeps its catch-up graph (slot 0) and its guess-step graph
+    // (slot 1) allocated in two scheduler plans, so the first guess step of a round reuses last round's graph
+    std::array<llm_graph_result *, 2> plan_res    = {};
+    std::array<uint64_t, 2>           plan_epoch  = {};
+    std::array<uint64_t, 2>           plan_serial = {};
     uint64_t           backend_buf_exp_epoch = 0; // ggml_backend_sched_get_alloc_epoch when backend_buf_exp_size was taken
 
+    // [B1] layer-major prefill (LLAMA_B1=1, opt-in; see llama-b1.h). Declared after the backends so it is
+    // destroyed first; the destructor also resets it explicitly.
+    std::unique_ptr<llama_b1> b1;
+    // [PLEPF] PLE page prefetch (LLAMA_PLE_PREFETCH=<threads>, opt-in; see llama-ple-prefetch.h)
+    std::unique_ptr<llama_ple_prefetch> ple_pf;
+    bool ple_pf_tried = false;
+    // [RTPORT] early PLE page reads for the next check (LLAMA_PLE_HINT=1, opt-in; see llama_ple_hint)
+    std::unique_ptr<llama_ple_hinter> ple_hint;
+    bool ple_hint_tried = false;
+    bool b1_env   = false; // LLAMA_B1 set
+    bool b1_tried = false; // b1 construction attempted
+    bool b1_ffn_scratch_active = false;
+    bool b1_layer_scratch_active = false;
+    bool b1_kv_scratch_enabled = false;
+    uint32_t b1_kv_prompt_cells = 0;
+    uint32_t b1_kv_outputs = 1;
+    ggml_backend_t b1_kv_backend = nullptr;
+    std::vector<size_t> b1_layer_compute_bytes;
+    std::vector<ggml_backend_buffer_ptr> b1_kv_views;
+    ggml_backend_buffer_ptr b1_kv_owned;
+    bool b1_kv_scratch_release();
+    bool b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight = false);
+
+    bool b1_off_logged = false; // the once-per-context note on why B1 is not used was printed
+    bool b1_mc_suspended = false; // this call freed the MoE expert cache's pool (made again in b1_end)
+    struct {
+        bool          active = false;   // the graph being built is a B1 graph (memory already applied)
+        int32_t       il0    = 0;
+        int32_t       il1    = -1;
+        ggml_tensor * carry  = nullptr;
+        const llm_b1_ffn * ffn = nullptr;
+        int ffn_phase = 0;
+    } b1_cur;
+
+    // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),
+    // 0 for the normal path, < 0 for a decode error code
+    int  b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all, int64_t n_outputs_all);
+    bool b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes, int64_t n_outputs_all);
+    // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with
+    // the last layer's experts ready; false on failure (status set)
+    bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
+    // ends the B1 call (b1->end) and gives the MoE expert cache back if the call suspended it
+    void b1_end(bool failed);
+    bool b1_cache_graph_reset();
+    void b1_cache_resume();
+    int64_t b1_final_rows(int64_t n_out, int64_t n_tok) const;
+
+    // fork: opt-in prompt routing counts use layer IDs, never temporary B1 weight addresses.
+    bool b1_cache_warm_enabled = false;
+    bool b1_cache_collect = false;
+    static bool b1_cache_collect_wanted();
+    bool b1_cache_needs_refresh = false;
+    bool b1_cache_profile_attempted = false;
+    bool b1_cache_device_pending = false;
+    void b1_cache_begin();
+    ggml_tensor * b1_cache_user_node = nullptr;
+    std::vector<std::vector<uint64_t>> b1_cache_counts;
+    uint64_t b1_cache_readbacks = 0;
+    int64_t b1_compute_submit_us = 0;
+    static bool b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_data);
+    void b1_cache_profile_load();
+    void b1_cache_warm();
+    void b1_cache_device_prepare();
+
+public:
+    // in-call checkpoints (llama_state_seq_capture_arm)
+    struct ckpt_write {
+        ggml_tensor * t;
+        size_t        offset;   // in the tensor
+        size_t        size;
+        size_t        blob_off; // in the blob
+        int32_t       il;       // layer of the tensor
+    };
+    struct ckpt_capture {
+        llama_pos n_tokens = 0; // copied after the ubatch whose last position is n_tokens - 1
+        llama_pos pos_min  = -1;
+        llama_pos pos_max  = -1;
+        std::vector<uint8_t>    blob;   // the bytes state_seq_get_data(PARTIAL_ONLY) would write at that spot
+        std::unique_ptr<llama_moe_output> blob_file;
+        uint8_t * blob_data();
+        const uint8_t * blob_data() const;
+        size_t blob_size() const;
+        std::vector<ckpt_write> writes; // where the blob's tensor rows come from
+        std::vector<uint8_t>    layer_done;
+        bool laid_out = false;
+        bool failed   = false;
+    };
+
+    int32_t capture_arm(llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n);
+    int32_t capture_min_tail() const;
+    bool    capture_select(int32_t k, llama_pos * pos_min, llama_pos * pos_max);
+
+private:
+    llama_seq_id              ckpt_seq   = -1;
+    bool                      ckpt_armed = false; // set by capture_arm, consumed by the next decode
+    int32_t                   ckpt_sel   = -1;
+    std::vector<ckpt_capture> ckpt_caps;
+
+    // the recurrent memory whose PARTIAL_ONLY state the captures copy, nullptr when unsupported
+    const llama_memory_recurrent * capture_mem() const;
+    // after a ubatch graph over layers [il0, il1) (il1 < 0: to the last layer) ran: copy the rows of a capture
+    // whose spot this ubatch ends
+    void capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int32_t il1);
+
     // host buffer for the model output (logits and embeddings)
+    std::unique_ptr<llama_moe_output> output_file;
     ggml_backend_buffer_ptr buf_output;
 
     // host buffer for the backend sampling outputs (sampled ids, and the optional logits/probs/candidates)
@@ -529,8 +770,20 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // sticky KV-stream phase (llama_set_decode_phase). Does not change model math.
     enum llama_decode_phase decode_phase =
         LLAMA_DECODE_PHASE_AUTOMATIC;
+
+    // one-shot tag for the next decode, and the tag of the decode in progress
+    enum llama_decode_phase next_decode_phase = LLAMA_DECODE_PHASE_UNKNOWN;
+    enum llama_decode_phase decode_call_phase = LLAMA_DECODE_PHASE_UNKNOWN;
+
+    // #217 trunk map is lossy: install it only while decode_call_phase is GENERATION.
+    // Prompt, untagged, and encode calls clear it. #215 draft keep (MTP) stays installed.
+    // compute_splits copies the scheduler policy into thread-local storage on every
+    // compute, and the CPU MUL_MAT_ID mask is rebuilt from that. The policy is not part
+    // of the ggml graph or the CUDA graph key, so a reused graph cannot carry an old tag.
+    void sync_moe_keep();
 
     // perf
     mutable int64_t t_start_us  = 0;

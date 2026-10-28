@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "exl3.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -451,6 +452,14 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
+            if (ggml_ait_rate(src0->type) != 0) {
+                return false;   // AI+ tile layout: CUDA only
+            }
+            if (ggml_ai4_rate(src0->type) != 0) {
+                // reference path only (unit slab dequantize + f32 dot): 2-D weights, f32 activations
+                return src1->type == GGML_TYPE_F32 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                       src0->ne[0] % 128 == 0 && src0->ne[1] % 16 == 0;
+            }
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
@@ -459,6 +468,20 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src1->type == GGML_TYPE_F32 ||
                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
                    (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
+        case GGML_OP_MUL_MAT_ID:
+            if (ggml_ait_rate(src0->type) != 0) {
+                return false;
+            }
+            if (ggml_exl3_bits(src0->type)) {
+                // opt-in EXL3 expert matmul (GGML_CPU_EXL3=1)
+                return ggml_cpu_exl3_enabled() && ggml_cpu_exl3_supported(op);
+            }
+            if (ggml_ai4_rate(src0->type) != 0) {
+                // unit slab reference path: 3-D expert stack, f32 activations
+                return src1->type == GGML_TYPE_F32 && src0->ne[3] == 1 &&
+                       src0->ne[0] % 128 == 0 && src0->ne[1] % 16 == 0;
+            }
+            return true;
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

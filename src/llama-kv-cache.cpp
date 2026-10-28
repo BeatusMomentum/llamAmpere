@@ -16,6 +16,35 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <chrono>
+
+// [PFDIAG] host timing of init_batch pieces (LLAMA_DECODE_HOST_US=1, batches >= 256 tokens)
+namespace {
+struct kv_host_us {
+    bool on = false; std::chrono::steady_clock::time_point t;
+    double split = 0, find = 0, cp = 0, apply = 0, restore = 0, ctor = 0;
+    void begin(uint32_t n) {
+        static const bool en = [](){ const char * e = std::getenv("LLAMA_DECODE_HOST_US"); return e && e[0] == '1'; }();
+        on = en && n >= 256; split = find = cp = apply = restore = ctor = 0; t = std::chrono::steady_clock::now();
+    }
+    void add(double & acc) {
+        if (!on) return; auto n = std::chrono::steady_clock::now();
+        acc += std::chrono::duration<double, std::milli>(n - t).count(); t = n;
+    }
+};
+thread_local kv_host_us g_kv_host_us;
+}
+// [PFDIAG] hooks for the hybrid_idx wrapper (the MTP draft context's memory)
+void llama_pfdiag_kv_begin(uint32_t n) { g_kv_host_us.begin(n); }
+void llama_pfdiag_kv_mark(int which) {
+    double * f[] = { &g_kv_host_us.split, &g_kv_host_us.find, &g_kv_host_us.cp, &g_kv_host_us.apply, &g_kv_host_us.restore, &g_kv_host_us.ctor };
+    if (which >= 0 && which < 6) g_kv_host_us.add(*f[which]);
+}
+void llama_pfdiag_kv_report(const char * tag, size_t n_ub) {
+    if (!g_kv_host_us.on) return;
+    LLAMA_LOG_WARN("kv init_batch host ms [%s] (%zu ubatches): split %.2f recr+find %.2f cp %.2f apply %.2f restore %.2f ctor %.2f\n", tag, n_ub,
+        g_kv_host_us.split, g_kv_host_us.find, g_kv_host_us.cp, g_kv_host_us.apply, g_kv_host_us.restore, g_kv_host_us.ctor);
+}
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -259,6 +288,47 @@ llama_kv_cache::llama_kv_cache(
         // cell behind and a decode/verify ubatch (kept whole) may cross a grid line: one more group of rows
         sj_kvarn_cap           = GGML_PAD(std::max(sj_kvarn.tail, sj_kvarn.tail_max) + sj_kvarn.group + 2*sj_kvarn.n_ubatch +
                                           (sj_kvarn_split_grid ? sj_kvarn.group : 0), 128); // see apply_ubatch
+        // [NOSEAL] LLAMA_SJKVARN_NOSEAL: "all", a comma list of model layers / ranges (e.g. "3,7,11-23"), or "none"
+        // (no layer: only the whole-context ring, the control for the ring size)
+        if (const char * e = getenv("LLAMA_SJKVARN_NOSEAL"); e && *e) {
+            const std::string spec = e;
+            const uint32_t n_layer_model = hparams.n_layer();
+            std::vector<bool> on(n_layer_model, false);
+            if (spec == "all") {
+                std::fill(on.begin(), on.end(), true);
+            } else if (spec != "none") {
+                size_t i = 0;
+                while (i < spec.size()) {
+                    size_t j = spec.find(',', i);
+                    if (j == std::string::npos) {
+                        j = spec.size();
+                    }
+                    const std::string tok = spec.substr(i, j - i);
+                    const size_t dash = tok.find('-');
+                    const int a = atoi(tok.substr(0, dash).c_str());
+                    const int b = dash == std::string::npos ? a : atoi(tok.substr(dash + 1).c_str());
+                    if (tok.empty() || a < 0 || b < a) {
+                        throw std::runtime_error("LLAMA_SJKVARN_NOSEAL: bad layer list '" + spec + "'");
+                    }
+                    // layers past this model's trunk are ignored (a draft model's own cache has fewer layers)
+                    for (int l = a; l <= b && (uint32_t) l < n_layer_model; ++l) {
+                        on[l] = true;
+                    }
+                    i = j + 1;
+                }
+            }
+            for (uint32_t l = 0; l < n_layer_model; ++l) {
+                if (on[l]) {
+                    sj_kvarn_noseal_il.push_back((int32_t) l);
+                }
+            }
+            if (sj_kvarn.edge_layers > 0) {
+                throw std::runtime_error("LLAMA_SJKVARN_NOSEAL cannot be combined with --sjkvarn-edge-layers");
+            }
+            sj_kvarn_noseal = true;
+            // every position stays in its own ring row: [sink, kv_size) never wraps
+            sj_kvarn_cap = GGML_PAD(std::max(sj_kvarn_cap, kv_size), 128);
+        }
         // Records the pool can ever hold: every seal target is sink + group*floor((end - tail - sink)/group) with
         // end <= kv_size (apply_ubatch: end = pos0 < kv_size; compress_sj_kvarn_idle: end = accepted_end <= kv_size),
         // so the newest `tail` positions never reach the body. Sizing for kv_size - sink kept `tail` positions'
@@ -291,6 +361,17 @@ llama_kv_cache::llama_kv_cache(
         }
         LLAMA_LOG_INFO("%s: %s cache: K%u/V%u records, sink %u (%s), tail %u, group %u, ring %u rows (%s), pool %u groups/head\n",
                 __func__, sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? "Tiered TQ" : sj_kvarn.body_type == GGML_TYPE_I16 ? "SJ-KVaRN (trellis body)" : "SJ-KVaRN", sj_kvarn.bits_k, sj_kvarn.bits_v, sj_kvarn.sink, ggml_type_name(sj_kvarn.sink_type == GGML_TYPE_COUNT ? type_k : sj_kvarn.sink_type), sj_kvarn.tail, sj_kvarn.group, sj_kvarn_cap, ggml_type_name(type_k), sj_kvarn_n_groups);
+        if (sj_kvarn_noseal) {
+            std::string l;
+            for (int32_t il : sj_kvarn_noseal_il) {
+                l += (l.empty() ? "" : ",") + std::to_string(il);
+            }
+            if (l.empty()) {
+                l = "(none)";
+            }
+            LLAMA_LOG_WARN("%s: [NOSEAL] SJ-KVaRN never-seal model layers %s (those that hold KV keep every position in the ring; "
+                    "ring %u rows for all layers)\n", __func__, l.c_str(), sj_kvarn_cap);
+        }
         if (sj_kvarn.edge_layers > 0) {
             LLAMA_LOG_INFO("%s: SJ-KVaRN tiered body: KV layers within the first %u and last %u model layers seal at K%u/V%u (%s), interior at K%u/V%u (%s)\n",
                     __func__, sj_kvarn.edge_layers, sj_kvarn.edge_layers, sj_kvarn.edge_bits_k, sj_kvarn.edge_bits_v, sj_kvarn.edge_body_type == GGML_TYPE_I16 ? "trellis" : "scalar",
@@ -821,7 +902,10 @@ llama_kv_cache::llama_kv_cache(
             GGML_ASSERT(hparams.n_embd_head_v(il) == D && n_embd_k_gqa_eff == n_embd_k_gqa && n_embd_v_gqa_eff == n_embd_v_gqa);
             // tier: a KV-bearing layer inside the first or last edge_layers model layers is the edge tier
             const bool edge = sj_kvarn.edge_layers > 0 && (il < sj_kvarn.edge_layers || il + sj_kvarn.edge_layers >= sj_kvarn_n_layers_model);
-            layer_new.sj_kvarn_tier      = edge ? 1 : 0;
+            // [NOSEAL] a never-seal layer is tier 1 with the interior codec (its records are never written or read)
+            const bool noseal = sj_kvarn_noseal &&
+                std::find(sj_kvarn_noseal_il.begin(), sj_kvarn_noseal_il.end(), (int32_t) il) != sj_kvarn_noseal_il.end();
+            layer_new.sj_kvarn_tier      = edge || noseal ? 1 : 0;
             layer_new.sj_kvarn_bits_k    = edge ? sj_kvarn.edge_bits_k : sj_kvarn.bits_k;
             layer_new.sj_kvarn_bits_v    = edge ? sj_kvarn.edge_bits_v : sj_kvarn.bits_v;
             layer_new.sj_kvarn_body_type = edge ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
@@ -831,7 +915,7 @@ llama_kv_cache::llama_kv_cache(
                 sj_kvarn_rec_bytes[layer_new.sj_kvarn_tier] = rb;
             }
             GGML_ASSERT(rb == sj_kvarn_rec_bytes[layer_new.sj_kvarn_tier] && "SJ-KVaRN cache: head size must be constant across layers");
-            if (edge) {
+            if (edge || noseal) {
                 sj_kvarn_n_layers_edge++;
             }
             // the CUDA kernels of the low-bit pairs (every pair but 4/4) serve GQA ratios 5..8 only; at other ratios that
@@ -843,7 +927,50 @@ llama_kv_cache::llama_kv_cache(
                         "kernels serve 5 to 8, so this attention runs on the CPU (it works, but much slower). Use -ctk sjkvarn4 "
                         "-ctv sjkvarn4 on this model.\n", __func__, layer_new.sj_kvarn_bits_k, layer_new.sj_kvarn_bits_v, gqa);
             }
-            body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * sj_kvarn_n_groups);
+            // fork: split only CUDA QSA sealed bodies; exact ring storage remains on its layer backend.
+            ggml_context * body_ctx = ctx;
+            if (sj_kvarn.resident_cells && hparams.dsv4_compress_ratios[il] > 0 && offload &&
+                ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                if (n_stream != 1 || D != 256 || layer_new.sj_kvarn_bits_k != 4 || layer_new.sj_kvarn_bits_v != 4 ||
+                    layer_new.sj_kvarn_body_type != GGML_TYPE_F32) {
+                    throw std::runtime_error("--kv-gpu-tokens requires single-stream scalar SJ-KVaRN 4/4 with 256-channel QSA heads");
+                }
+                const uint32_t exact_cells = sj_kvarn.sink + std::max(sj_kvarn.tail, sj_kvarn.tail_max);
+                if (sj_kvarn.resident_cells < exact_cells + sj_kvarn.group) {
+                    throw std::runtime_error(format("--kv-gpu-tokens must be at least %u cells for this sink and tail", exact_cells + sj_kvarn.group));
+                }
+                auto * dev = model.dev_layer(il);
+                using resident_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, size_t, uint32_t);
+                auto * get_type = reinterpret_cast<resident_type_fn>(ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_resident_buffer_type"));
+                const uint32_t resident_groups = (sj_kvarn.resident_cells - exact_cells)/sj_kvarn.group;
+                const char * clock_env = getenv("GGML_CUDA_QSA_RESIDENT_CLOCK");
+                const bool clock = !clock_env || atoi(clock_env) != 0;
+                if (clock && (sj_kvarn.group != 128 || (hparams.indexer_top_k > 0 &&
+                    (hparams.dsv4_compress_ratios[il] != 4 || sj_kvarn.sink % 4 ||
+                    uint64_t(resident_groups)*(sj_kvarn.group/4) < 8*((uint64_t(hparams.indexer_top_k) + 3)/4 + 1))))) {
+                    throw std::runtime_error("CLOCK resident KV requires G128, four-cell QSA pools, and enough pages for eight selections");
+                }
+                auto * resident_buft = get_type ? get_type(dev, rb*hparams.n_head_kv(il), resident_groups) : nullptr;
+                if (!resident_buft) {
+                    throw std::runtime_error("--kv-gpu-tokens requires the CUDA QSA resident backend");
+                }
+                body_ctx = ctx_for_buft(resident_buft);
+                const size_t groups_card = std::min(resident_groups, sj_kvarn_n_groups);
+                if (clock) {
+                    const size_t pages_card = groups_card*(sj_kvarn.group/4);
+                    const size_t resident_bytes = pages_card*(hparams.n_head_kv(il)*1048 + 5*sizeof(int32_t)) +
+                        sj_kvarn_n_groups*(hparams.n_head_kv(il)*1536 + (sj_kvarn.group/4)*sizeof(int32_t)) + 256;
+                    const double bytes_freed = double(sj_kvarn_n_groups*rb*hparams.n_head_kv(il)) - resident_bytes;
+                    LLAMA_LOG_INFO("%s: QSA layer %u: %zu four-cell CLOCK pages plus %u staging rows, %.2f MiB pinned body, %.2f MiB VRAM freed for expert cache\n",
+                        __func__, il, pages_card, kv_rows, (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024*1024), bytes_freed/(1024*1024));
+                } else {
+                    const size_t bytes_freed = (sj_kvarn_n_groups - groups_card)*rb*hparams.n_head_kv(il);
+                    LLAMA_LOG_INFO("%s: QSA layer %u: %zu resident body groups plus %u staging rows, %.2f MiB pinned body, %.2f MiB VRAM freed for expert cache\n",
+                        __func__, il, groups_card, kv_rows, (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024*1024), (double) bytes_freed/(1024*1024));
+                }
+            }
+            body = ggml_new_tensor_1d(body_ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * sj_kvarn_n_groups);
             body->op_params[7] = layer_new.sj_kvarn_body_type;
             ggml_format_name(body, "cache_%ssj_kvarn_l%d", name_tag, il);
             layer_new.body = body;
@@ -1133,6 +1260,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    scratch_cancel();
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -1250,17 +1378,33 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        // fork: SJ-KVaRN positions never decrease along the cells, so only the cells [cell_of(p0), cell_of(p1)) can match
-        const uint32_t i_beg = sj_kvarn.enabled() ? sj_kvarn_cell_of(seq_to_stream[seq_id], p0) : 0;
-        const uint32_t i_end = sj_kvarn.enabled() ? sj_kvarn_cell_of(seq_to_stream[seq_id], p1) : cells.size();
-        for (uint32_t i = i_beg; i < i_end; ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
+        // fork (bookkeep): visit only the indexed positions in the removed range.
+        static const bool bookkeep_kv = [] {
+            const char * e = getenv("LLAMA_BOOKKEEP_KV");
+            return !(e && strcmp(e, "0") == 0);  // default on (owner 2026-10-22); 0 turns it off
+        }();
+        if (bookkeep_kv) {
+            const auto & positions = cells.seq_pos_get(seq_id);
+            auto it = positions.lower_bound({p0, 0});
+            while (it != positions.end() && it->first < p1) {
+                const uint32_t i = (it++)->second;
+                if (cells.seq_rm(i, seq_id)) {
+                    new_head = std::min(new_head, i);
+                }
             }
+        } else {
+            // fork: SJ-KVaRN positions never decrease along the cells, so only the cells [cell_of(p0), cell_of(p1)) can match
+            const uint32_t i_beg = sj_kvarn.enabled() ? sj_kvarn_cell_of(seq_to_stream[seq_id], p0) : 0;
+            const uint32_t i_end = sj_kvarn.enabled() ? sj_kvarn_cell_of(seq_to_stream[seq_id], p1) : cells.size();
+            for (uint32_t i = i_beg; i < i_end; ++i) {
+                if (!cells.pos_in(i, p0, p1)) {
+                    continue;
+                }
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                    if (new_head == cells.size()) {
+                        new_head = i;
+                    }
                 }
             }
         }
@@ -1302,6 +1446,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    scratch_cancel();
     if (kv_stream_runtime.runtime != nullptr) {
         throw std::runtime_error("seq_cp is not supported while block KV streaming is active");
     }
@@ -1570,7 +1715,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
-        if (hparams.no_alloc) {
+        if (strncmp(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_", 18) == 0) {
+            auto * dev = ggml_backend_buft_get_device(buft);
+            using bytes_fn = size_t (*)(ggml_backend_buffer_type_t, const ggml_tensor *);
+            auto * device_bytes = reinterpret_cast<bytes_fn>(ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_resident_device_bytes"));
+            GGML_ASSERT(device_bytes);
+            ret[ggml_backend_cpu_buffer_type()] += hparams.no_alloc ?
+                ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) : ggml_backend_buffer_get_size(buf.get());
+            for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (!t->view_src) ret[ggml_backend_dev_buffer_type(dev)] += device_bytes(buft, t);
+            }
+        } else if (hparams.no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
@@ -1598,6 +1754,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             uint32_t n_ubatch,
             bool embd_all) {
     GGML_UNUSED(embd_all);
+    g_kv_host_us.begin(balloc.get_n_tokens());
 
     do {
         balloc.split_reset();
@@ -1619,13 +1776,22 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             break;
         }
 
+        g_kv_host_us.add(g_kv_host_us.split);
         auto sinfos = prepare(ubatches);
         if (sinfos.empty()) {
             break;
         }
 
-        return std::make_unique<llama_kv_cache_context>(
+        const size_t n_ub_diag = ubatches.size();
+        auto ctx_ret = std::make_unique<llama_kv_cache_context>(
                 this, std::move(sinfos), std::move(ubatches));
+        g_kv_host_us.add(g_kv_host_us.ctor);
+        if (g_kv_host_us.on) {
+            LLAMA_LOG_WARN("kv init_batch host ms (%u rows, %zu ubatches, %u cells, used %u): split %.2f find %.2f cp %.2f apply %.2f restore %.2f ctor %.2f\n",
+                    balloc.get_n_tokens(), n_ub_diag, get_size(), v_cells.empty() ? 0u : v_cells[0].get_used(),
+                    g_kv_host_us.split, g_kv_host_us.find, g_kv_host_us.cp, g_kv_host_us.apply, g_kv_host_us.restore, g_kv_host_us.ctor);
+        }
+        return ctx_ret;
     } while (false);
 
     return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -1635,10 +1801,17 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache::init_full_single_seq() {
+    return std::make_unique<llama_kv_cache_context>(this, true);
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
     bool do_shift = get_has_shift();
+    if (do_shift || !sc_info.empty()) {
+        scratch_cancel();
+    }
 
     return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
 }
@@ -1670,7 +1843,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
+        g_kv_host_us.add(g_kv_host_us.apply);
         const auto sinfo_new = find_slot(ubatch, false);
+        g_kv_host_us.add(g_kv_host_us.find);
         if (sinfo_new.empty()) {
             success = false;
             break;
@@ -1691,6 +1866,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
             states.push_back(std::move(state));
         }
+        g_kv_host_us.add(g_kv_host_us.cp);
 
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch);
@@ -1708,6 +1884,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     }
 
     GGML_ASSERT(!states.empty() || !success);
+    g_kv_host_us.add(g_kv_host_us.apply);
 
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
@@ -1722,6 +1899,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
     }
 
+    g_kv_host_us.add(g_kv_host_us.restore);
     for (size_t i = 0; i < sj_kvarn_st.size(); ++i) {
         auto & st = sj_kvarn_st[i];
         const auto & o = sj_kvarn_old[i];
@@ -2008,6 +2186,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     }
                 }
 
+                if (!scratch.limits.empty() && idx >= scratch.limits[seq_to_stream[seq_id]]) {
+                    can_use = false;
+                }
                 if (can_use) {
                     res.idxs[s].push_back(idx);
                 } else {
@@ -2185,6 +2366,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             GGML_ASSERT((st.B_pending - sj_kvarn.sink)/sj_kvarn.group <= sj_kvarn_n_groups_seq);
 
             st.N = N;
+            st.exact_at = -1;
             if (N > sj_kvarn_cap) {
                 // position p's ring row now holds p + cap
                 st.ring_lo = std::max(st.ring_lo, N - sj_kvarn_cap);
@@ -2428,8 +2610,266 @@ ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
     return layers[ikv].v;
 }
 
+std::vector<ggml_backend_buffer_ptr> llama_kv_cache::b1_scratch_views(
+        ggml_backend_buffer_type_t buft, int32_t first_unused_layer, uint32_t prompt_cells) const {
+    std::vector<ggml_backend_buffer_ptr> result;
+    if (!buft || n_stream != 1 || n_swa || other || kv_stream_runtime.runtime || get_has_shift() || !sc_info.empty()) {
+        return result;
+    }
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    if (!alignment) { return result; }
+    // B1 has applied every ubatch's cell metadata before borrowing. A reused plain
+    // cache can place a cold sequence beyond cell zero; token count alone does not
+    // bound those physical writes. Attention can read masked padding too: protect
+    // the same padded frontier as get_n_kv(), not only the occupied cells.
+    const uint32_t cell_pad = std::max(n_pad, 256u);
+    const uint32_t occupied_end = std::min(v_cells[0].size(),
+            std::max(cell_pad, GGML_PAD(v_cells[0].used_max_p1(), cell_pad)));
+    const uint32_t protected_cells = std::max(prompt_cells, occupied_end);
+    struct span { ggml_backend_buffer_t parent; size_t offset; size_t size; };
+    std::vector<span> spans;
+    auto add = [&](ggml_tensor * t, size_t offset) {
+        if (!t || !t->buffer || !t->data || ggml_backend_buffer_get_type(t->buffer) != buft || offset >= ggml_nbytes(t)) { return; }
+        auto * parent = t->buffer;
+        const size_t base = (char *) t->data - (char *) ggml_backend_buffer_get_base(parent);
+        const size_t size = ggml_nbytes(t) - offset;
+        const size_t begin = base + offset;
+        const size_t pad = (alignment - begin % alignment) % alignment;
+        if (pad >= size) { return; }
+        const size_t length = (size - pad) / alignment * alignment;
+        if (length) { spans.push_back({parent, begin + pad, length}); }
+    };
+    for (const auto & layer : layers) {
+        if ((int32_t) layer.il >= first_unused_layer) {
+            add(layer.k, 0);
+            add(layer.v, 0);
+            add(layer.body, 0);
+        } else if (!sj_kvarn.enabled()) {
+            for (auto * t : {layer.k, v_trans ? nullptr : layer.v}) {
+                if (t && protected_cells < t->ne[1]) { add(t, (size_t) protected_cells * t->nb[1]); }
+            }
+        } else if (!sj_kvarn_paged && layer.body) {
+            const uint64_t end = prompt_cells > sj_kvarn.sink ? prompt_cells - sj_kvarn.sink : 0;
+            const uint64_t groups = (end + sj_kvarn.group - 1) / sj_kvarn.group;
+            if (groups < sj_kvarn_n_groups) {
+                add(layer.body, (size_t) groups * layer.sj_kvarn_rec_bytes * hparams.n_head_kv(layer.il));
+            }
+        }
+    }
+    std::sort(spans.begin(), spans.end(), [](const span & a, const span & b) {
+        if (a.parent != b.parent) { return std::less<ggml_backend_buffer_t>{}(a.parent, b.parent); }
+        return a.offset < b.offset;
+    });
+    std::vector<span> merged;
+    for (const auto & span : spans) {
+        if (!merged.empty() && merged.back().parent == span.parent &&
+                span.offset <= merged.back().offset + merged.back().size) {
+            const size_t end = std::max(merged.back().offset + merged.back().size, span.offset + span.size);
+            merged.back().size = end - merged.back().offset;
+        } else {
+            merged.push_back(span);
+        }
+    }
+    for (const auto & span : merged) {
+        ggml_backend_buffer_ptr view(ggml_backend_buffer_view(span.parent, span.offset, span.size));
+        if (view) { result.push_back(std::move(view)); }
+    }
+    return result;
+}
+
 bool llama_kv_cache::get_v_transposed() const {
     return v_trans;
+}
+
+void llama_kv_cache::scratch_cancel() {
+    if (scratch.cancel) {
+        auto cancel = scratch.cancel;
+        auto user = scratch.user;
+        scratch.cancel = nullptr;
+        cancel(user);
+    }
+}
+
+void llama_kv_cache::scratch_release() {
+    for (int32_t record : scratch.records) {
+        GGML_ASSERT(sj_kvarn_ref[record] == 0);
+    }
+    sj_kvarn_free.insert(sj_kvarn_free.begin(), scratch.records.begin(), scratch.records.end());
+    scratch = {};
+}
+
+bool llama_kv_cache::scratch_safe(uint32_t n_tokens) const {
+    if (!scratch.user) {
+        return true;
+    }
+    if (get_has_shift() || !sc_info.empty()) {
+        return false;
+    }
+    const uint64_t guard = (uint64_t) n_tokens + scratch.guard_tokens;
+    if (sj_kvarn_paged) {
+        return sj_kvarn_free.size() >= (guard / sj_kvarn.group + n_stream + 1) &&
+                (sj_kvarn_free.size() + scratch.records.size()) * scratch.record_bytes >= scratch.min_free_bytes;
+    }
+    size_t free_bytes = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const uint64_t end = v_cells[s].used_max_p1() + guard;
+        if (sj_kvarn.enabled()) {
+            if (end > (uint64_t) sj_kvarn.sink + (uint64_t) scratch.first_group * sj_kvarn.group) {
+                return false;
+            }
+            const uint64_t groups = std::min<uint64_t>(sj_kvarn_n_groups, (end + sj_kvarn.group - 1) / sj_kvarn.group);
+            free_bytes += (sj_kvarn_n_groups - groups) * scratch.record_bytes;
+        } else if (!scratch.limits.empty() && end > scratch.limits[s]) {
+            return false;
+        }
+    }
+    if (!sj_kvarn.enabled() && scratch.min_free_bytes) {
+        for (const auto & layer : layers) {
+            for (auto * tensor : {layer.k, v_trans ? nullptr : layer.v}) {
+                if (!tensor || !tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != scratch.buft) {
+                    continue;
+                }
+                for (uint32_t s = 0; s < n_stream; ++s) {
+                    const uint64_t end = std::min<uint64_t>(tensor->ne[1], v_cells[s].used_max_p1() + guard);
+                    free_bytes += (tensor->ne[1] - end) * tensor->nb[1];
+                }
+            }
+        }
+    }
+    return free_bytes >= scratch.min_free_bytes;
+}
+
+std::vector<ggml_backend_buffer_ptr> llama_kv_cache::scratch_borrow(
+        ggml_backend_buffer_type_t buft, size_t chunk_bytes, size_t max_chunks, size_t min_free_bytes,
+        uint32_t guard_tokens, void (*cancel)(void *), void * user) {
+    std::vector<ggml_backend_buffer_ptr> result;
+    if (scratch.user || !cancel || !user || chunk_bytes == 0 || max_chunks == 0 || max_chunks > 16 ||
+            other || kv_stream_runtime.runtime || n_swa || get_has_shift() || !sc_info.empty()) {
+        return result;
+    }
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    if (chunk_bytes > SIZE_MAX - alignment || guard_tokens > UINT32_MAX - 512) {
+        return result;
+    }
+    chunk_bytes = GGML_PAD(chunk_bytes, alignment);
+    const uint64_t guard = (uint64_t) guard_tokens + 512;
+    struct region {
+        ggml_tensor * tensor;
+        size_t offset;
+        size_t size;
+        uint32_t stream;
+        uint32_t first_group;
+    };
+    std::vector<region> regions;
+    size_t free_bytes = 0;
+    size_t record_bytes = 0;
+    uint32_t group_first = sj_kvarn_n_groups;
+    if (sj_kvarn.enabled()) {
+        if (sj_kvarn_paged) {
+            // All layers use the same physical record IDs. Borrow one free suffix across those layers.
+            while (group_first && sj_kvarn_ref[group_first - 1] == 0) {
+                --group_first;
+            }
+        } else {
+            const uint64_t end = v_cells[0].used_max_p1() + guard;
+            const uint64_t groups = (end + sj_kvarn.group - 1) / sj_kvarn.group;
+            group_first = (uint32_t) std::min<uint64_t>(groups, sj_kvarn_n_groups);
+        }
+        for (const auto & layer : layers) {
+            auto * tensor = layer.body;
+            if (!tensor || !tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != buft) {
+                continue;
+            }
+            const size_t stride = (size_t) hparams.n_head_kv(layer.il) * layer.sj_kvarn_rec_bytes;
+            record_bytes += stride;
+            const size_t size = (sj_kvarn_n_groups - group_first) * stride;
+            regions.push_back({tensor, group_first * stride, size, 0, group_first});
+            free_bytes += size;
+        }
+    } else {
+        for (const auto & layer : layers) {
+            // A transposed V tensor has no contiguous position suffix.
+            for (auto * tensor : {layer.k, v_trans ? nullptr : layer.v}) {
+                if (!tensor || !tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != buft) {
+                    continue;
+                }
+                for (uint32_t s = 0; s < n_stream; ++s) {
+                    const uint64_t first = std::min<uint64_t>(tensor->ne[1], v_cells[s].used_max_p1() + guard);
+                    const size_t size = (tensor->ne[1] - first) * tensor->nb[1];
+                    regions.push_back({tensor, s * tensor->nb[2] + first * tensor->nb[1], size, s, UINT32_MAX});
+                    free_bytes += size;
+                }
+            }
+        }
+    }
+    if (free_bytes < min_free_bytes) {
+        return result;
+    }
+    std::vector<uint32_t> limits(n_stream, UINT32_MAX);
+    uint32_t reserved_first = sj_kvarn_n_groups;
+    // Spread chunks across layers before taking a second chunk from any region.
+    for (size_t pass = 0; result.size() < max_chunks; ++pass) {
+        bool found = false;
+        for (const auto & region : regions) {
+            auto * tensor = region.tensor;
+            auto * parent = tensor->buffer;
+            const size_t base = (char *) tensor->data - (char *) ggml_backend_buffer_get_base(parent);
+            const size_t end = base + region.offset + region.size;
+            const size_t aligned_end = end - end % alignment;
+            if (aligned_end <= base + region.offset ||
+                    pass >= (aligned_end - (base + region.offset)) / chunk_bytes) {
+                continue;
+            }
+            const size_t start = aligned_end - (pass + 1) * chunk_bytes;
+            ggml_backend_buffer_ptr view(ggml_backend_buffer_view(parent, start, chunk_bytes));
+            if (!view) {
+                continue;
+            }
+            result.push_back(std::move(view));
+            if (sj_kvarn.enabled()) {
+                const size_t stride = (size_t) ggml_nbytes(tensor) / sj_kvarn_n_groups;
+                reserved_first = std::min<uint32_t>(reserved_first, (start - base) / stride);
+            } else {
+                limits[region.stream] = std::min<uint32_t>(limits[region.stream],
+                        (start - base - region.stream * tensor->nb[2]) / tensor->nb[1]);
+            }
+            found = true;
+            if (result.size() == max_chunks) {
+                break;
+            }
+        }
+        if (!found) {
+            break;
+        }
+    }
+    if (result.empty()) {
+        return result;
+    }
+    scratch.cancel = cancel;
+    scratch.user = user;
+    scratch.guard_tokens = guard_tokens + 512;
+    scratch.min_free_bytes = min_free_bytes;
+    scratch.record_bytes = record_bytes;
+    scratch.buft = buft;
+    if (sj_kvarn.enabled()) {
+        scratch.first_group = reserved_first;
+        if (sj_kvarn_paged) {
+            auto & free = sj_kvarn_free;
+            for (auto it = free.begin(); it != free.end();) {
+                if ((uint32_t) *it >= reserved_first) {
+                    scratch.records.push_back(*it);
+                    it = free.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    } else {
+        scratch.limits = std::move(limits);
+    }
+    LLAMA_LOG_INFO("%s: borrowed %zu x %.3f MiB from unused KV (%.3f MiB free, floor %.3f MiB)\n", __func__,
+            result.size(), chunk_bytes / 1048576.0, free_bytes / 1048576.0, min_free_bytes / 1048576.0);
+    return result;
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
@@ -2877,6 +3317,12 @@ void llama_kv_cache::set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubat
         d[GGML_SJKVARN_DESC_TYPE_K]   = (int32_t) layers[0].k->type;
         d[GGML_SJKVARN_DESC_TYPE_V]   = (int32_t) layers[0].v->type;
         d[GGML_SJKVARN_DESC_SINK_TYPE] = sj_kvarn.sink_type == GGML_TYPE_F16 ? GGML_TYPE_F16 : 0;
+        if (tier == 1 && sj_kvarn_noseal) {
+            // [NOSEAL] nothing of this layer is sealed: positions [sink, N) are all ring rows (the ring never wraps)
+            d[GGML_SJKVARN_DESC_B]     = (int32_t) sj_kvarn.sink;
+            d[GGML_SJKVARN_DESC_B_OLD] = (int32_t) sj_kvarn.sink;
+            d[GGML_SJKVARN_DESC_BODY_TYPE] = sj_kvarn.body_type;
+        }
         if (n_stream > 1) {
             d[GGML_SJKVARN_DESC_TABLE] = 1;
             // every sealed group must map to a live pool record: the kernels index the body with it unchecked
@@ -2963,6 +3409,7 @@ void llama_kv_cache::sj_kvarn_reset_stream(uint32_t strm) {
     st.draining = false;
     st.N = 0;
     st.ring_lo = 0;
+    st.exact_at = -1;
 }
 
 ggml_tensor * llama_kv_cache::build_sj_kvarn_seal(ggml_context * ctx, ggml_tensor * k_store, ggml_tensor * v_store, ggml_tensor * desc, int32_t il) const {
@@ -3082,9 +3529,12 @@ bool llama_kv_cache::maintain_sj_kvarn_stream(llama_context * lctx, uint32_t str
         for (auto & job : graphs) {
             for (int tier = 0; tier < 2; ++tier) {
                 d[GGML_SJKVARN_DESC_RECBYTES] = sj_kvarn_rec_bytes[tier];
-                d[GGML_SJKVARN_DESC_BODY_TYPE] = tier == 1 ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
+                d[GGML_SJKVARN_DESC_BODY_TYPE] = tier == 1 && !sj_kvarn_noseal ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
+                // [NOSEAL] an empty seal range for the never-seal layers
+                d[GGML_SJKVARN_DESC_B_OLD] = tier == 1 && sj_kvarn_noseal ? end : old;
                 ggml_backend_tensor_set(job.desc[tier], d.data(), 0, d.size()*sizeof(int32_t));
             }
+            d[GGML_SJKVARN_DESC_B_OLD] = old;
             success = ggml_backend_graph_compute(job.backend, job.graph) == GGML_STATUS_SUCCESS && success;
         }
         if (!success) {
@@ -3103,6 +3553,192 @@ bool llama_kv_cache::maintain_sj_kvarn_stream(llama_context * lctx, uint32_t str
     sj_kvarn_maintenance_groups += (target - original_B)/sj_kvarn.group;
     LLAMA_LOG_DEBUG("%s: stream %u: B %u -> %u, %u groups, %.3f ms\n", __func__, strm, original_B, target,
         (target - original_B)/sj_kvarn.group, (ggml_time_us() - started)/1000.0);
+    return true;
+}
+
+//
+// [B1] SJ-KVaRN under layer-major prefill
+//
+// The normal order runs, per ubatch c: apply (proposes the sealed end B_c), seal [B_{c-1}, B_c) in every layer, then
+// the graph (store c into the ring, attend). Layer-major order runs layer L for chunks 0..c-1 before chunk c, but
+// before any later layer sees chunk 0. Every layer has its own ring rows and records, and a seal of layer L reads
+// only layer L's ring rows of positions below the start of chunk c, which chunks < c wrote at layer L. So sealing
+// layer L for chunk c right before the slice that stores chunk c at layer L leaves layer L in exactly the state the
+// normal order has there, and the slice sees the same bookkeeping (restored per ubatch). The seal kernel encodes
+// each group from that group's rows alone, so per-layer launches produce the same bytes as the all-layer graph.
+//
+void llama_kv_cache::b1_sj_begin(llama_seq_id seq_id) {
+    if (!sj_kvarn.enabled()) {
+        return;
+    }
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    b1_sj_strm = seq_to_stream[seq_id];
+    b1_sj_pre  = sj_kvarn_st[b1_sj_strm];
+    b1_sj.clear();
+    b1_sj_new.clear();
+    b1_sj_bad = false;
+}
+
+void llama_kv_cache::b1_sj_save(size_t i) {
+    if (!sj_kvarn.enabled()) {
+        return;
+    }
+    auto & st = sj_kvarn_st[b1_sj_strm];
+    if (b1_sj.size() <= i) {
+        b1_sj.resize(i + 1);
+    }
+    // apply() set B_prev = B (the sealed end after the previous ubatch) and proposed B_pending
+    b1_sj[i] = { st.B, st.B_pending, st.N, st.ring_lo, st.draining };
+    if (st.B_pending > st.B) {
+        if (sj_kvarn_paged) {
+            // the normal order takes these records from the free list in its maintenance right after this apply,
+            // before the next apply: same order, so the same records
+            const uint32_t g0 = (st.B - sj_kvarn.sink)/sj_kvarn.group, g1 = (st.B_pending - sj_kvarn.sink)/sj_kvarn.group;
+            std::vector<uint32_t> fresh;
+            for (uint32_t g = g0; g < g1; ++g) {
+                if (st.table[g] < 0) { fresh.push_back(g); }
+            }
+            if (!sj_kvarn_alloc_groups(b1_sj_strm, g0, g1)) {
+                LLAMA_LOG_ERROR("%s: [B1] SJ-KVaRN record pool exhausted (B %u -> %u)\n", __func__, st.B, st.B_pending);
+                b1_sj_bad = true;
+                return;
+            }
+            b1_sj_new.insert(b1_sj_new.end(), fresh.begin(), fresh.end());
+        }
+        ++sj_kvarn_maintenance_count;
+        sj_kvarn_maintenance_groups += (st.B_pending - st.B)/sj_kvarn.group;
+    }
+    st.B = st.B_pending; // the next apply starts from this ubatch's sealed end, as after its maintenance
+}
+
+bool llama_kv_cache::b1_sj_seek(size_t i) {
+    if (!sj_kvarn.enabled()) {
+        return true;
+    }
+    if (b1_sj_bad || i >= b1_sj.size()) {
+        return false;
+    }
+    auto & st = sj_kvarn_st[b1_sj_strm];
+    const auto & v = b1_sj[i];
+    st.B_prev    = v.B_old;
+    st.B         = v.B;
+    st.B_pending = v.B;
+    st.N         = v.N;
+    st.ring_lo   = v.ring_lo;
+    st.draining  = v.draining;
+    b1_sj_cur    = i;
+    return true;
+}
+
+void llama_kv_cache::b1_sj_rewind() {
+    if (!sj_kvarn.enabled()) {
+        return;
+    }
+    // apply() only moved bookkeeping and cell metadata; nothing was sealed or stored yet. Give back the records this
+    // call took, newest first, so the free list is back in its old order.
+    auto & st = sj_kvarn_st[b1_sj_strm];
+    for (auto it = b1_sj_new.rbegin(); it != b1_sj_new.rend(); ++it) {
+        const int32_t r = st.table[*it];
+        GGML_ASSERT(r >= 0 && sj_kvarn_ref[r] == 1);
+        sj_kvarn_ref[r] = 0;
+        sj_kvarn_free.push_back(r);
+        st.table[*it] = -1;
+    }
+    std::vector<int32_t> table = std::move(st.table);
+    st = b1_sj_pre;
+    st.table = std::move(table);
+    b1_sj.clear();
+    b1_sj_new.clear();
+}
+
+bool llama_kv_cache::b1_sj_seal(llama_context * lctx, int32_t il0, int32_t il1) {
+    if (!sj_kvarn.enabled() || b1_sj_cur >= b1_sj.size()) {
+        return true;
+    }
+    const auto & v = b1_sj[b1_sj_cur];
+    if (v.B <= v.B_old) {
+        return true;
+    }
+    const uint32_t strm = b1_sj_strm;
+    const auto & st = sj_kvarn_st[strm];
+    const int32_t hi = il1 < 0 ? std::numeric_limits<int32_t>::max() : il1;
+    // multi-stream: the descriptor carries the stream's group table behind the fixed entries
+    const int64_t desc_n = GGML_SJKVARN_DESC_N_ENTRIES + (sj_kvarn_paged ? (int64_t) sj_kvarn_n_groups_seq : 0);
+    if (b1_sj_graphs.size() < sj_kvarn_st.size()) {
+        b1_sj_graphs.resize(sj_kvarn_st.size());
+    }
+    auto & graphs = b1_sj_graphs[strm];
+    if (graphs.size() < layers.size()) {
+        graphs.resize(layers.size());
+    }
+    std::vector<int32_t> d(desc_n, 0);
+    if (sj_kvarn_paged) {
+        // the records of this ubatch's groups were taken in b1_sj_save; later ubatches' records are taken too, but
+        // the seal reads only the entries of [B_old, B)
+        d[GGML_SJKVARN_DESC_TABLE] = 1;
+        for (uint32_t g = 0; g < sj_kvarn_n_groups_seq; ++g) {
+            d[GGML_SJKVARN_DESC_N_ENTRIES + g] = std::max<int32_t>(0, st.table[g]);
+        }
+    }
+    bool synced = false;
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const auto & layer = layers[ikv];
+        if ((int32_t) layer.il < il0 || (int32_t) layer.il >= hi) {
+            continue;
+        }
+        auto & job = graphs[ikv];
+        if (!job.graph) {
+            job.backend = lctx->sj_kvarn_backend(layer.body->buffer);
+            if (!job.backend) {
+                return false;
+            }
+            const size_t nodes = 16;
+            ggml_init_params ip = {nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(nodes, false), nullptr, true};
+            job.ctx.reset(ggml_init(ip));
+            if (!job.ctx) { LLAMA_LOG_ERROR("%s: ggml_init failed\n", __func__); return false; }
+            job.desc[0] = ggml_new_tensor_1d(job.ctx.get(), GGML_TYPE_I32, desc_n);
+            ggml_set_input(job.desc[0]);
+            ggml_tensor * graph_seal = ggml_sj_kvarn_seal_dyn(job.ctx.get(), layer.body, layer.k_stream[strm], layer.v_stream[strm], job.desc[0],
+                hparams.n_embd_head_k(layer.il), sj_kvarn.group, layer.sj_kvarn_bits_k, layer.sj_kvarn_bits_v, 16, sj_kvarn_n_groups_seal);
+            if (!ggml_backend_supports_op(job.backend, graph_seal)) {
+                LLAMA_LOG_ERROR("%s: backend %s does not support the seal op (layer %d)\n", __func__, ggml_backend_name(job.backend), layer.il);
+                return false;
+            }
+            ggml_cgraph * gf = ggml_new_graph_custom(job.ctx.get(), nodes, false);
+            ggml_build_forward_expand(gf, graph_seal);
+            job.buffer.reset(ggml_backend_alloc_ctx_tensors(job.ctx.get(), job.backend));
+            if (!job.buffer) { LLAMA_LOG_ERROR("%s: seal buffer allocation failed\n", __func__); return false; }
+            job.graph = gf;
+        }
+        if (!synced) {
+            // this layer's ring rows were written by the previous slice, which may still be computing
+            ggml_backend_sched_synchronize(lctx->get_sched());
+            synced = true;
+        }
+        const int tier = layer.sj_kvarn_tier;
+        // the same bounded chunks and descriptor as maintain_sj_kvarn_stream
+        for (uint32_t old = v.B_old; old < v.B;) {
+            const uint32_t end = std::min(v.B, old + sj_kvarn.group*sj_kvarn_n_groups_seal);
+            d[GGML_SJKVARN_DESC_S]         = sj_kvarn.sink;
+            d[GGML_SJKVARN_DESC_CAP]       = sj_kvarn_cap;
+            d[GGML_SJKVARN_DESC_B_OLD]     = old;
+            d[GGML_SJKVARN_DESC_B]         = end;
+            d[GGML_SJKVARN_DESC_N]         = v.N;
+            d[GGML_SJKVARN_DESC_G]         = sj_kvarn.group;
+            d[GGML_SJKVARN_DESC_D]         = hparams.n_embd_head_k(layers[0].il);
+            d[GGML_SJKVARN_DESC_HKV]       = hparams.n_head_kv(layers[0].il);
+            d[GGML_SJKVARN_DESC_TYPE_K]    = layers[0].k->type;
+            d[GGML_SJKVARN_DESC_TYPE_V]    = layers[0].v->type;
+            d[GGML_SJKVARN_DESC_RECBYTES]  = sj_kvarn_rec_bytes[tier];
+            d[GGML_SJKVARN_DESC_BODY_TYPE] = tier == 1 ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
+            ggml_backend_tensor_set(job.desc[0], d.data(), 0, d.size()*sizeof(int32_t));
+            if (ggml_backend_graph_compute(job.backend, job.graph) != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: seal of layer %d failed\n", __func__, layer.il);
+                return false;
+            }
+            old = end;
+        }
+    }
     return true;
 }
 
@@ -3194,8 +3830,21 @@ bool llama_kv_cache::sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0) {
     // same values. Seals that ran ahead of that point (later prompt ubatches, decode, idle seals) are reopened from
     // the ring rows (they re-seal from the same rows into the same records), and an unfinished decode flush is
     // dropped (a cold prefill has none in flight at a grid line).
-    if (!sj_kvarn.enabled() || sj_kvarn_grid == 0 || p0 <= 0 ||
-            seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+    if (!sj_kvarn.enabled() || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    {
+        // [#240] an exact checkpoint restored this stream at p0: it already is the state the prefill had there
+        // (exact_at is the cell count the restore left, so compare it with the cell of p0)
+        const uint32_t se_strm = seq_to_stream[seq_id];
+        auto & se = sj_kvarn_st[se_strm];
+        const bool exact = se.exact_at == (int64_t) sj_kvarn_cell_of(se_strm, p0);
+        se.exact_at = -1;
+        if (exact) {
+            return false;
+        }
+    }
+    if (sj_kvarn_grid == 0 || p0 <= 0) {
         return false;
     }
     const uint32_t strm = seq_to_stream[seq_id];
@@ -3615,6 +4264,121 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
+    if (dst->type == GGML_TYPE_I32) {
+        // [#175] one bit per KV position (bit j%32 of word j/32 set = visible).
+        // Positions past n_kv in the last word stay masked; general layouts use the F16 fallback below.
+        const int64_t n_kv = dst->op_params[0];
+        const int64_t n_w  = dst->ne[0];
+        GGML_ASSERT(n_kv > 0 && n_w == (n_kv + 31)/32);
+
+        // fork: pack the common sequence-prefix mask without an intermediate F16 allocation.
+        if (dst->ne[3] == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
+                n_tokens > 0 && !ubatch->is_pos_2d() && kq_mask_fast_enabled()) {
+            const llama_seq_id seq_id = ubatch->seq_id[0][0];
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            bool ok = n_kv <= (int64_t) cells.size();
+            for (uint32_t i = 0; ok && i < n_tokens; ++i) {
+                const llama_seq_id seq = ubatch->seq_id[i][0];
+                ok = ubatch->pos[i] >= 0 && (seq == seq_id || cells.seq_covers_used(seq));
+            }
+            if (ok && cells.seq_covers_used(seq_id)) {
+                const llama_pos * pos = cells.pos_data();
+                uint32_t * words = (uint32_t *) dst->data;
+                // A contiguous used range rules out holes. A query at the maximum position sees every used cell.
+                const int64_t n_prefix = std::min<int64_t>(n_kv, cells.used_max_p1());
+                bool ordered = cells.used_min() == 0 && cells.used_max_p1() == cells.get_used();
+                const bool all_visible = n_tokens == 1 && ubatch->pos[0] >= cells.seq_pos_max(seq_id);
+                const auto & seq_pos = cells.seq_pos_get(seq_id);
+                auto first_hidden = seq_pos.end();
+                bool clear_tail = false;
+                if (ordered && !all_visible && n_tokens <= 32) {
+                    const llama_pos min_query = *std::min_element(ubatch->pos, ubatch->pos + n_tokens);
+                    first_hidden = seq_pos.upper_bound({ min_query, UINT32_MAX });
+                    auto tail_end = first_hidden;
+                    for (uint32_t n = 0; tail_end != seq_pos.end() && n < 32; ++n) {
+                        ++tail_end;
+                    }
+                    clear_tail = tail_end == seq_pos.end();
+                }
+                // Recent queries need only clear future cells; their physical order does not matter.
+                if (ordered && !all_visible && !clear_tail) {
+                    uint32_t n_unordered = 0;
+                    for (int64_t j = 1; j < n_prefix; ++j) {
+                        n_unordered += uint32_t(pos[j - 1] > pos[j]);
+                    }
+                    ordered = n_unordered == 0;
+                }
+                if (ordered) {
+                    for (uint32_t i = 0; i < n_tokens; ++i) {
+                        const int64_t n_visible = all_visible || clear_tail ? n_prefix : std::upper_bound(pos, pos + n_prefix, ubatch->pos[i]) - pos;
+                        uint32_t * row = words + i*n_w;
+                        int64_t end = n_visible/32;
+                        std::fill(row, row + end, ~uint32_t(0));
+                        if (n_visible%32) {
+                            row[end++] = (uint32_t(1) << (n_visible%32)) - 1;
+                        }
+                        std::fill(row + end, row + n_w, uint32_t(0));
+                        if (clear_tail) {
+                            for (auto it = first_hidden; it != seq_pos.end(); ++it) {
+                                if (it->first > ubatch->pos[i] && it->second < n_prefix) {
+                                    row[it->second/32] &= ~(uint32_t(1) << (it->second%32));
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    const uint32_t query_pos = (uint32_t) ubatch->pos[i];
+                    for (int64_t iw = 0; iw < n_w; ++iw) {
+                        uint32_t bits = 0;
+                        const int64_t end = std::min<int64_t>(32, n_kv - 32*iw);
+                        for (int64_t b = 0; b < end; ++b) {
+                            bits |= uint32_t((uint32_t) pos[32*iw + b] <= query_pos) << b;
+                        }
+                        words[i*n_w + iw] = bits;
+                    }
+                }
+                return;
+            }
+        }
+
+        thread_local std::vector<ggml_fp16_t> scratch;
+        const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+        scratch.resize((size_t) (n_kv*n_rows));
+
+        ggml_tensor tmp = *dst;
+        tmp.type  = GGML_TYPE_F16;
+        tmp.ne[0] = n_kv;
+        tmp.nb[0] = sizeof(ggml_fp16_t);
+        tmp.nb[1] = tmp.nb[0]*tmp.ne[0];
+        tmp.nb[2] = tmp.nb[1]*tmp.ne[1];
+        tmp.nb[3] = tmp.nb[2]*tmp.ne[2];
+        tmp.data  = scratch.data();
+        set_input_kq_mask(&tmp, ubatch, causal_attn);
+
+        const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+        uint32_t * words = (uint32_t *) dst->data;
+        for (int64_t r = 0; r < n_rows; ++r) {
+            const ggml_fp16_t * row = scratch.data() + r*n_kv;
+            uint32_t          * w   = words + r*n_w;
+            for (int64_t iw = 0; iw < n_w; ++iw) {
+                const int64_t j0 = iw*32;
+                const int64_t nj = std::min<int64_t>(32, n_kv - j0);
+                uint32_t bits = 0;
+                for (int64_t b = 0; b < nj; ++b) {
+                    const ggml_fp16_t v = row[j0 + b];
+                    // the f16 mask holds 0 or -INF here (ALiBi masks never take this path)
+                    GGML_ASSERT(v == keep || v == drop);
+                    bits |= (uint32_t) (v == keep) << b;
+                }
+                w[iw] = bits;
+            }
+        }
+        return;
+    }
+
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
 
@@ -3978,7 +4742,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
 
     if (sj_kvarn.enabled()) {
-        GGML_UNUSED(flags);
+        if (flags & LLAMA_STATE_SEQ_FLAGS_SJ_EXACT) {
+            state_write_sj_ckpt(io, seq_id); // [#240] the exact checkpoint section alone
+            return;
+        }
         state_write_sj_kvarn(io, seq_id);
         return;
     }
@@ -4062,6 +4829,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    scratch_cancel();
     if (sj_kvarn.enabled() && !other) {
         // see the matching refusal in state_read_sinfo (block KV streaming is refused at construction anyway)
         if (kv_stream_runtime.runtime != nullptr) {
@@ -4069,11 +4837,43 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
                 "llama_state_*: loading KV cache state is not supported while block KV "
                 "streaming is active (--kv-stream-arena-mib)");
         }
-        GGML_UNUSED(flags);
+        if (flags & LLAMA_STATE_SEQ_FLAGS_SJ_EXACT) {
+            state_read_sj_ckpt(io, seq_id); // [#240]
+            return;
+        }
         state_read_sj_kvarn(io, seq_id);
         return;
     }
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
+}
+
+void llama_kv_cache::state_mirror_cell_ext(const llama_kv_cache & source, const slot_info_vec_t & slots) {
+    // Raw indexer keys disable RoPE in their cache hparams, so their legacy
+    // state section omits x/y. The attention section owns those positions.
+    // Recover them after restoring the shared layout, without changing the
+    // serialized format or touching unrelated cells.
+    if (!source.has_cell_ext()) {
+        return;
+    }
+    // an empty layout means the attention restore wrote no cells (partial-only restores of a cache without a
+    // sliding window return early), so there is nothing to mirror
+    if (slots.empty()) {
+        return;
+    }
+    GGML_ASSERT(v_cells.size() == source.v_cells.size() && slots.size() == v_cells.size());
+    for (const auto & slot : slots) {
+        for (size_t s = 0; s < slot.n_stream(); ++s) {
+            const uint32_t stream = slot.strm[s];
+            GGML_ASSERT(stream < v_cells.size());
+            auto & dst = v_cells[stream];
+            const auto & src = source.v_cells[stream];
+            for (uint32_t cell : slot.idxs[s]) {
+                GGML_ASSERT(cell < dst.size() && cell < src.size());
+                GGML_ASSERT(!dst.is_empty(cell) && !src.is_empty(cell) && dst.pos_get(cell) == src.pos_get(cell));
+                dst.ext_set(cell, src.ext_get(cell));
+            }
+        }
+    }
 }
 
 void llama_kv_cache::state_read_sinfo(
@@ -4082,6 +4882,7 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
+    scratch_cancel();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -4291,6 +5092,10 @@ void llama_kv_cache::state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id se
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
     if (seq_id == -1 && n_stream > 1) {
         throw std::runtime_error("SJ-KVaRN cache: with several sequences (--parallel > 1) the state is saved per sequence");
+    }
+    if (sj_kvarn_noseal) {
+        // the never-seal layers keep [sink, sealed end) in ring rows that the saved state does not carry
+        throw std::runtime_error("SJ-KVaRN cache: cannot save state with LLAMA_SJKVARN_NOSEAL (an investigation switch)");
     }
 
     // one sequence per stream: its stream holds exactly that sequence
@@ -4560,7 +5365,7 @@ uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id 
     const uint32_t B = st[0], B_prev = st[1], sj_N = st[2];
     const bool draining = st[3] != 0;
     const uint32_t R = version >= 2 ? st[4] : B; // first saved ring position
-    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev < S || B_prev > B ||
+    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev < S || B_prev > B || (B_prev - S) % G != 0 || sj_N > cells.size() || st[3] > 1 ||
             R > B || (R < B && (R < S || (R - S) % G != 0))) {
         throw std::runtime_error("SJ-KVaRN cache: corrupt state (sealed end " + std::to_string(B) + ", " + std::to_string(n) + " cells)");
     }
@@ -4669,6 +5474,125 @@ uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id 
     LLAMA_LOG_DEBUG("%s: restored %u cells, sealed end %u (%u groups), tail %u rows\n", __func__, n, B, n_rec, n - std::min(n, B));
 
     return n;
+}
+
+//
+// [#240] SJ-KVaRN exact checkpoint section. A prompt checkpoint of a hybrid model holds the recurrent state at n; the
+// attention cache stays live in the slot and is cut back to n. Without this section an SJ-KVaRN cut can only resume
+// where a cold prefill's sealed state is known (the restore grid, llama_sj_kvarn_prefill_cut()). With it, the
+// checkpoint also stores the seal state at n and the staging (ring) rows of [B, n), so a restore puts the attention
+// cache back exactly as it was at n: B and the drain flag as saved, the records of groups at or above B dropped (they
+// re-seal later from the same rows), the ring rows rewritten (they may have been overwritten by a long answer). The
+// records below B are taken from the live cache, which must still hold them (sealed end >= B; checked here and by
+// the server through llama_sj_kvarn_ckpt_sealed_end()).
+//   u32 magic "SJCK", u32 version 1, u32 n, B, B_prev, B_pending, draining, n_layers, per layer u64 k_row, v_row,
+//   per layer: K rows [max(B, sink), n), V rows [max(B, sink), n) (ring order),
+//   trailer: u32 B, u32 n, u32 magic "SJCE"
+//
+void llama_kv_cache::state_write_sj_ckpt(llama_io_write_i & io, llama_seq_id seq_id) const {
+    GGML_ASSERT(sj_kvarn.enabled());
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: needs one sequence");
+    }
+    const uint32_t strm = seq_to_stream[seq_id];
+    const auto & st = sj_kvarn_st[strm];
+    const auto & cells = v_cells[strm];
+    const uint32_t n = cells.used_max_p1();
+    const uint32_t S = sj_kvarn.sink;
+    if (st.B > S && st.B > n) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: sealed end lies beyond the sequence");
+    }
+    const uint32_t lo = std::max(st.B, S);
+    if (n > lo && (n - lo > sj_kvarn_cap || lo < std::max(st.ring_lo, S))) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: the ring no longer holds the open rows");
+    }
+    const uint32_t hdr[8] = { LLAMA_SJ_KVARN_CKPT_MAGIC, 1u, n, st.B, st.B_prev, st.B_pending, st.draining ? 1u : 0u, (uint32_t) layers.size() };
+    io.write(hdr, sizeof(hdr));
+    for (const auto & layer : layers) {
+        const uint64_t rows[2] = { (uint64_t) layer.k->nb[1], (uint64_t) layer.v->nb[1] };
+        io.write(rows, sizeof(rows));
+    }
+    for (const auto & layer : layers) {
+        for (int is_v = 0; is_v < 2; ++is_v) {
+            ggml_tensor * t = is_v ? layer.v : layer.k;
+            const size_t r = t->nb[1], o = (size_t) strm*t->nb[2];
+            for (uint32_t p = lo; p < n;) {
+                const uint32_t row = sj_kvarn_ring_row(p);
+                const uint32_t m   = std::min(n - p, S + sj_kvarn_cap - row);
+                io.write_tensor(t, o + (size_t) row*r, (size_t) m*r);
+                p += m;
+            }
+        }
+    }
+    const uint32_t trl[3] = { st.B, n, LLAMA_SJ_KVARN_CKPT_END_MAGIC };
+    io.write(trl, sizeof(trl));
+}
+
+void llama_kv_cache::state_read_sj_ckpt(llama_io_read_i & io, llama_seq_id seq_id) {
+    GGML_ASSERT(sj_kvarn.enabled());
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: needs one sequence");
+    }
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & st = sj_kvarn_st[strm];
+    uint32_t hdr[8];
+    io.read(hdr, sizeof(hdr));
+    const uint32_t n = hdr[2], B = hdr[3], B_prev = hdr[4], B_pending = hdr[5], n_layers = hdr[7];
+    const uint32_t S = sj_kvarn.sink, G = sj_kvarn.group;
+    if (hdr[0] != LLAMA_SJ_KVARN_CKPT_MAGIC || hdr[1] != 1u) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: unknown section format");
+    }
+    if (n_layers != layers.size()) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: saved from a cache with a different layer count");
+    }
+    for (const auto & layer : layers) {
+        uint64_t rows[2];
+        io.read(rows, sizeof(rows));
+        if (rows[0] != (uint64_t) layer.k->nb[1] || rows[1] != (uint64_t) layer.v->nb[1]) {
+            throw std::runtime_error("SJ-KVaRN exact checkpoint: saved from a cache with a different row layout");
+        }
+    }
+    const uint32_t lo = std::max(B, S);
+    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev > B || B_pending < B || B_pending > n ||
+            (n > lo && n - lo > sj_kvarn_cap)) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: corrupt section (sealed end " + std::to_string(B) + ", n " + std::to_string(n) + ")");
+    }
+    // the live cache supplies the records below B and the cells of [0, n)
+    if (st.B_pending != st.B || st.B < B || v_cells[strm].used_max_p1() < n) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: the live cache no longer holds the sealed records below " +
+                std::to_string(B) + " (sealed end " + std::to_string(st.B) + ", " + std::to_string(v_cells[strm].used_max_p1()) + " cells)");
+    }
+    for (const auto & layer : layers) {
+        for (int is_v = 0; is_v < 2; ++is_v) {
+            ggml_tensor * t = is_v ? layer.v : layer.k;
+            const size_t r = t->nb[1], o = (size_t) strm*t->nb[2];
+            for (uint32_t p = lo; p < n;) {
+                const uint32_t row = sj_kvarn_ring_row(p);
+                const uint32_t m   = std::min(n - p, S + sj_kvarn_cap - row);
+                io.read_tensor(t, o + (size_t) row*r, (size_t) m*r);
+                p += m;
+            }
+        }
+    }
+    uint32_t trl[3];
+    io.read(trl, sizeof(trl));
+    if (trl[0] != B || trl[1] != n || trl[2] != LLAMA_SJ_KVARN_CKPT_END_MAGIC) {
+        io.discard();
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: corrupt section trailer");
+    }
+    if (sj_kvarn_paged) {
+        sj_kvarn_release_groups(strm, (B - S)/G); // groups at or above B re-seal later from the restored rows
+    }
+    // ring rows still valid: [B, n) were just rewritten; below B the live rows of [ring_lo, B) survive unless one of
+    // the rewritten rows held them (positions below n - cap)
+    st.ring_lo  = std::min(lo, std::max(st.ring_lo, n > sj_kvarn_cap ? n - sj_kvarn_cap : 0u));
+    st.B        = B;
+    st.B_prev   = B_prev;
+    st.B_pending = B_pending;
+    st.draining = hdr[6] != 0;
+    st.N        = n;
+    st.exact_at = n;
+    LLAMA_LOG_DEBUG("%s: stream %u restored at %u: sealed end %u, %u open rows\n", __func__, strm, n, B, n - std::min(n, lo));
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
@@ -5299,10 +6223,10 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+        llama_kv_cache * kv, bool single_seq) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
-    const uint32_t n_stream = kv->get_n_stream();
+    const uint32_t n_stream = single_seq ? 1 : kv->get_n_stream();
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
     sinfos.resize(1);
@@ -5367,6 +6291,31 @@ bool llama_kv_cache_context::apply() {
     }
 
     return true;
+}
+
+bool llama_kv_cache_context::b1_supported() const {
+    // block streaming switches phases inside apply(), which is not a pure function of the ubatch. SJ-KVaRN keeps its
+    // seal bookkeeping per ubatch (b1_sj_*).
+    return status == LLAMA_MEMORY_STATUS_SUCCESS && !ubatches.empty() && !has_kv_stream_targets();
+}
+
+void llama_kv_cache_context::b1_save() {
+    if (b1_n_kv.size() <= i_cur) {
+        b1_n_kv.resize(i_cur + 1, 0);
+    }
+    b1_n_kv[i_cur] = n_kv;
+    kv->b1_sj_save(i_cur);
+}
+
+bool llama_kv_cache_context::b1_seek(size_t i) {
+    if (i >= b1_n_kv.size() || i >= ubatches.size()) {
+        return false;
+    }
+    // the cells of later ubatches stay stored: they hold larger positions than every token of ubatch i, so the
+    // causal rule hides them exactly like the empty cells the normal order would see
+    i_cur = i;
+    n_kv  = b1_n_kv[i];
+    return kv->b1_sj_seek(i);
 }
 
 llama_memory_status llama_kv_cache_context::get_status() const {

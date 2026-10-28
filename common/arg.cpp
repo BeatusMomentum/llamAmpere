@@ -12,6 +12,7 @@
 #include "speculative.h"
 #include "spec-defaults.h"
 #include "preset.h"
+#include "../src/llama-ext.h" // llama_parse_moe_keep_map
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1042,6 +1043,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.cors_origins = "localhost";
     }
 
+    if (params.n_cpu_moe_auto && !params.tensor_buft_overrides.empty()) {
+        throw std::invalid_argument("--n-cpu-moe auto cannot be combined with -ot/--cpu-moe/--n-cpu-moe N");
+    }
+
     // pad tensor_buft_overrides for llama_params_fit:
     const size_t ntbo = llama_max_tensor_buft_overrides();
     while (params.tensor_buft_overrides.size() < ntbo) {
@@ -1409,9 +1414,27 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
 
-        const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+        bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+        const bool any_mtp = adaptive_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (any_mtp && !params.sampling.spec_lossy_explicit) {
+            params.sampling.spec_lossy = true;
+            LOG_INF("FYI: mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling\n");
+        }
+        // mb-MTP with no depth flags: adaptive depth 3..5 (as --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3
+        // --spec-draft-n-max 5); an explicit --spec-draft-n-max or --spec-draft-n-min-adaptive keeps the user's depth
+        if (any_mtp && params.sampling.spec_lossy &&
+                !(params.speculative.user_set & (COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX | COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE))) {
+            std::replace(params.speculative.types.begin(), params.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
+            adaptive_mtp = true;
+            params.speculative.draft.n_max          = 5;
+            params.speculative.draft.n_min_adaptive = 3;
+        }
         if (adaptive_mtp && (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
             throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
+        }
+        if (params.speculative.draft.depth_policy == "cdepth" && !adaptive_mtp) {
+            throw std::invalid_argument("error: --spec-depth-policy cdepth needs --spec-type draft-mtp-adaptive");
         }
 
         params.lr.init();
@@ -2007,6 +2030,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_idle_slots = value;
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--warm-prefill"},
+        {"--no-warm-prefill"},
+        "after a chat reply, prefill the part of the next request that is already known (history + reply + start of the next user turn) "
+        "in the background on the same slot; any new request stops it at the next ubatch boundary (default: disabled)",
+        [](common_params & params, bool value) {
+            params.warm_prefill = value;
+        }
+    ).set_env("LLAMA_ARG_WARM_PREFILL").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
@@ -2882,6 +2914,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SJKVARN_FLUSH_CHUNK"));
     add_opt(common_arg(
+        {"--kv-gpu-tokens"}, "N",
+        "QSA layers with SJ-KVaRN: number of KV cells kept in GPU memory; older cells are sealed into pinned RAM and "
+        "fetched on demand; 0 = keep every cell on the GPU (default: 32768)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("resident KV cell count must be nonnegative");
+            }
+            params.kv_gpu_tokens = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KV_GPU_TOKENS"));
+    add_opt(common_arg(
         {"--sjkvarn-transform"}, "FILE|URL",
         "SJ-KVaRN cache: per-layer, per-KV-head K/V transform file (SJWU format, calibrated for one model) applied in place "
         "of the Hadamard on the layers it lists; an http(s) URL is downloaded to the cache; disables the fused write "
@@ -3203,15 +3246,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
-        {"-ncmoe", "--n-cpu-moe"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        {"-ncmoe", "--n-cpu-moe"}, "N|auto",
+        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU\n"
+        "'auto': keep as many expert layers on the GPU as fit next to the KV cache and the compute buffers of the\n"
+        "chosen -c/-ub (per --fit-target margin), the rest in the CPU; replaces -ngl and the MoE cache placement",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.n_cpu_moe_auto = true;
+                return;
+            }
+            const int n = std::stoi(value);
+            if (n < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
+            llm_add_n_cpu_ffn_overrides(n, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-prefetch"}, "off|auto|1|2|3",
+        "predict future MoE routes on the GPU and stage uncached experts behind demand copies (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.moe_prefetch = 0;
+            } else if (value == "auto") {
+                params.moe_prefetch = -1;
+            } else if (value == "1" || value == "2" || value == "3") {
+                params.moe_prefetch = value[0] - '0';
+            } else {
+                throw std::invalid_argument("moe-prefetch must be off, auto, 1, 2, or 3");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
+    add_opt(common_arg(
+        {"--moe-arena"}, "on|off",
+        "store expert gate/up/down blocks together in pinned RAM (default: on when it fits with 7 GiB startup headroom)",
+        [](common_params &, const std::string & value) {
+            if (value != "on" && value != "off") { throw std::invalid_argument("expected on or off"); }
+            common_set_env("LLAMA_MOE_ARENA", value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-profile"}, "FILE",
+        "warm the startup card hot set from measured expert usage (fn/fast profile format)",
+        [](common_params &, const std::string & value) { common_set_env("GGML_MOE_CACHE_PROFILE_LOAD", value); }
+    ));
+    add_opt(common_arg(
+        {"--moe-cpu-split"}, {"--no-moe-cpu-split"},
+        "host CPU threads compute part of each layer's experts that are not in VRAM, instead of copying their "
+        "weights over PCIe (expert cache with hit-first only; default: on for Flash-Next models)",
+        [](common_params &, bool value) { common_set_env("GGML_MOE_CPU_SPLIT", value ? "1" : "0"); }
+    ));
     add_opt(common_arg(
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
@@ -3247,6 +3331,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--spec-moe-keep"}, "N",
+        "MTP draft only: experts the router picks at rank >= N run only when they are already resident in VRAM "
+        "(--moe-cache); the others are left out of the draft. The verify pass is unchanged, so output is unchanged; "
+        "only the draft acceptance can move (default: -1, off)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("expected -1 (off) or N >= 0");
+            }
+            params.moe_draft_keep = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_MOE_KEEP"));
+    add_opt(common_arg(
+        {"--moe-keep-map"}, "MAP",
+        "LOSSY, changes answers: main-model experts at route rank >= N that are not resident in VRAM are left out. "
+        "MAP = N (every layer) or a list of L:N, A-B:N, *:N (e.g. 0-11:10,12-47:5); unlisted layers keep every expert "
+        "(default: off)",
+        [](common_params & params, const std::string & value) {
+            int32_t keep_default = -1;
+            std::vector<int32_t> keep_layer;
+            std::string error;
+            if (!llama_parse_moe_keep_map(value.c_str(), 65536, keep_default, keep_layer, error)) {
+                throw std::invalid_argument(error);
+            }
+            params.moe_keep_map = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_KEEP_MAP"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
@@ -4622,7 +4733,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's K cache type from -ctk; %s for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)",
+            "(default: the main model's K cache type from -ctk; %s for an MTP drafter over a SJ-KVaRN trunk, including a separate MTP draft file; a quantized trunk is copied instead of f16; pass f16 to force f16)",
             get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[0])
         ),
         [](common_params & params, const std::string & value) {
@@ -4634,7 +4745,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's V cache type from -ctv; %s for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)",
+            "(default: the main model's V cache type from -ctv; %s for an MTP drafter over a SJ-KVaRN trunk, including a separate MTP draft file; a quantized trunk is copied instead of f16; pass f16 to force f16)",
             get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[1])
         ),
         [](common_params & params, const std::string & value) {
@@ -4699,6 +4810,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_ctx = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CTX"));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch", "-ubd", "--ubatch-size-draft"}, "N",
+        "physical batch size of an MTP draft context; the prompt pass is split into pieces of at most N tokens, which shrinks the draft's\n"
+        "compute buffer (default: -1 = 2048 for an MTP draft loaded with -md, the main -ub otherwise; 0 = always the main -ub)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
@@ -4759,6 +4881,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
+
+    add_opt(common_arg(
+        {"--spec-depth-policy"}, "streak|cdepth",
+        "draft depth policy for --spec-type draft-mtp-adaptive: 'streak' = streak controller (default); "
+        "'cdepth' = per-token confidence rule between --spec-draft-n-min-adaptive and --spec-draft-n-max (lossless)",
+        [](common_params & params, const std::string & value) {
+            if (value != "streak" && value != "cdepth") {
+                throw std::invalid_argument("--spec-depth-policy must be 'streak' or 'cdepth'");
+            }
+            params.speculative.draft.depth_policy = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DEPTH_POLICY"));
+
+    add_opt(common_arg(
+        {"--spec-depth-model"}, "FILE",
+        "CDEPTH coefficient file (default: built-in table)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.depth_model = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DEPTH_MODEL"));
+
+    add_opt(common_arg(
+        {"--spec-depth-theta"}, "X",
+        string_format("CDEPTH: multiplier on the stop thresholds, above 1 stops earlier (default: %.2f)", (double) params.speculative.draft.depth_theta),
+        [](common_params & params, const std::string & value) {
+            const float x = std::stof(value);
+            if (!(x > 0.0f && x < 100.0f)) {
+                throw std::invalid_argument("--spec-depth-theta must be in (0, 100)");
+            }
+            params.speculative.draft.depth_theta = x;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DEPTH_THETA"));
 
     add_opt(common_arg(
         {"--spec-chain"}, "0|1|N",
@@ -4867,6 +5021,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-mb-mtp"},
+        {"--no-spec-mb-mtp"},
+        "mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling. Keep a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens; "
+        "--no-spec-mb-mtp keeps exact (lossless) acceptance (default: on with --spec-type draft-mtp or draft-mtp-adaptive, otherwise off); with no depth flags it drafts at adaptive depth 3-5",
+        [](common_params & params, bool value) {
+            params.sampling.spec_lossy = value;
+            params.sampling.spec_lossy_explicit = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MB_MTP"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"

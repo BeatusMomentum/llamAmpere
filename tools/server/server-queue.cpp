@@ -132,7 +132,13 @@ void server_queue::wait_until_no_sleep() {
 void server_queue::terminate() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     running = false;
+    stopped = true;
     condition_tasks.notify_all();
+}
+
+bool server_queue::is_terminated() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return stopped;
 }
 
 bool server_queue::process_new_tasks(bool is_yielding) {
@@ -559,6 +565,16 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             if (should_stop()) {
                 return nullptr;
             }
+            // the task loop was terminated (server shutdown): no result will ever arrive, and the client may stay
+            // connected for as long as its own timeout, so answer with an error now
+            if (queue_tasks.is_terminated()) {
+                auto err = std::make_unique<server_task_result_error>();
+                err->id       = id_tasks.empty() ? -1 : *id_tasks.begin();
+                err->err_type = ERROR_TYPE_UNAVAILABLE;
+                err->err_msg  = "server is shutting down";
+                stop();
+                return err;
+            }
         } else {
             if (result->is_error()) {
                 stop(); // cancel remaining tasks
@@ -573,6 +589,9 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             }
             if (result->is_stop()) {
                 received_count++;
+                if (on_stop) {
+                    on_stop(*result);
+                }
             }
             return result;
         }

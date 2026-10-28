@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-i8qk.cuh"
+#include "fattn-prefill-policy.h"
 
 #include <cstdlib>
 
@@ -13,7 +15,8 @@ static __global__ void fattn_sj_kvarn_expand_prefill(
         const char * K, const char * V, const char * body, const int32_t * desc,
         const size_t k_row_stride, const size_t k_head_stride,
         const size_t v_row_stride, const size_t v_head_stride,
-        half2 * K_out, half2 * V_out, const int n_out, const int p_begin, const int head_first, const bool skip_body) {
+        half2 * K_out, half2 * V_out, const int n_out, const int p_begin, const int head_first, const bool skip_body,
+        const char * mask, const size_t mask_pitch, const int mask_queries) {
     constexpr int D2 = 128;
     constexpr int rows = 16;
     extern __shared__ half2 tile[];
@@ -26,6 +29,24 @@ static __global__ void fattn_sj_kvarn_expand_prefill(
     if (p0 >= kv.S && p0 < kv.B) {
         if (skip_body) {
             return; // trellis body: ggml_cuda_sj_kvarn_trellis_expand_body (fattn-sjkvarn-lowbits.cu) writes these rows
+        }
+        if ((reinterpret_cast<uintptr_t>(body) & 1) && mask) {
+            bool visible = false;
+            for (int q0 = 0; q0 < mask_queries; q0 += 16) {
+                const int q = q0 + tid/rows;
+                const bool live = q < mask_queries && __half2float(reinterpret_cast<const half *>(mask + q*mask_pitch)[p0 + tid%rows]) > -INFINITY;
+                if (__syncthreads_or(live)) {
+                    visible = true;
+                    break;
+                }
+            }
+            if (!visible) {
+                for (int i = tid; i < rows*D2; i += 256) {
+                    K_out[out_offset + i] = make_half2(0.0f, 0.0f);
+                    V_out[out_offset + i] = make_half2(0.0f, 0.0f);
+                }
+                return;
+            }
         }
         const int group = (p0 - kv.S)/kv.G;
         const int token = (p0 - kv.S)%kv.G;
@@ -159,6 +180,11 @@ struct fattn_sj_kvarn_prefill_plan {
     int    work_q           = 0;
     size_t parts_bytes      = 0;     // work_q*n_head*256 floats
     size_t meta_bytes       = 0;     // work_q*n_head float2
+    // [I8SJ] unless GGML_CUDA_FA_I8QK=0, the group's attention runs the int8-QK kernel (fattn-i8qk.cu) on the expanded f16 K/V
+    // (not chunked plans: the int8 kernel writes no partials). Its int8 K takes n_kv*256 bytes per KV head of the group
+    // behind the output temporary; the head grouping counts those bytes, so the scratch stays within the same budget.
+    bool   i8qk             = false;
+    size_t i8qk_offset      = 0;     // bytes from the scratch start to the int8 K
 };
 
 static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc, const ggml_tensor * dst) {
@@ -188,7 +214,11 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     const size_t kv_bytes_per_head = 2*kv_elements_per_head*sizeof(half);
     const size_t output_elements_per_head = size_t(Q->ne[1])*gqa*256;
     const size_t output_bytes_per_head = output_elements_per_head*sizeof(float);
-    const bool grouped = size_t(K->ne[2]) > budget/kv_bytes_per_head;
+    const bool i8qk = ggml_cuda_fattn_i8qk_sj_kvarn_wanted(cc, dst);
+    const size_t i8qk_bytes_per_head = i8qk ? kv_elements_per_head : 0; // int8 K
+    // the trellis chunk decision keeps the f16-only test; the int8 K bytes only regroup the expanded (unchunked) plan
+    const bool grouped_f16 = size_t(K->ne[2]) > budget/kv_bytes_per_head;
+    const bool grouped = size_t(K->ne[2]) > budget/(kv_bytes_per_head + i8qk_bytes_per_head);
     int heads_per_group = K->ne[2];
     static const bool kv_chunks = [] {
         const char * value = getenv("GGML_SJKVARN_PREFILL_KV_CHUNKS");
@@ -201,7 +231,7 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
         const int v = value ? atoi(value) : 0;
         return v >= 256 && v % 256 == 0 ? v : 0;
     }();
-    if ((grouped || force_chunk_kv > 0) && trellis && kv_chunks && dst->src[3] != nullptr && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
+    if ((grouped_f16 || force_chunk_kv > 0) && trellis && kv_chunks && dst->src[3] != nullptr && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
             Q->ne[2] % K->ne[2] == 0 && gqa <= 8 && ggml_is_contiguous(dst)) {
         // [TRPF] KV chunks: K/V chunk (all heads) + one launch's partials + metas + the running (max, sum) per row
         const size_t n_head = Q->ne[2];
@@ -242,7 +272,7 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
         if (!head_groups || dst->src[3] == nullptr || dst->src[3]->ne[2] != 1) {
             return p;
         }
-        heads_per_group = std::min(size_t(K->ne[2]), budget/(kv_bytes_per_head + output_bytes_per_head));
+        heads_per_group = std::min(size_t(K->ne[2]), budget/(kv_bytes_per_head + output_bytes_per_head + i8qk_bytes_per_head));
         if (heads_per_group == 0) {
             return p;
         }
@@ -257,6 +287,11 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     p.kv_elements = kv_elements_per_head*heads_per_group;
     p.output_bytes = grouped ? output_bytes_per_head*heads_per_group : 0;
     p.scratch_bytes = 2*p.kv_elements*sizeof(half) + p.output_bytes;
+    if (i8qk) {
+        p.i8qk = true;
+        p.i8qk_offset = GGML_PAD(p.scratch_bytes, 128);
+        p.scratch_bytes = p.i8qk_offset + i8qk_bytes_per_head*heads_per_group;
+    }
     return p;
 }
 
@@ -273,7 +308,7 @@ size_t ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size(const int device, co
     const size_t n_head_kv = dst->src[1]->ne[2];
     const size_t budget = fattn_sj_kvarn_prefill_trellis(dst) ? fattn_sj_kvarn_prefill_trellis_budget() : fattn_sj_kvarn_prefill_budget();
     const size_t bound = std::max(p.scratch_bytes,
-        std::min(budget, n_head_kv*2*size_t(ggml_get_op_params_i32(dst, 6))*256*sizeof(half)));
+        std::min(budget, n_head_kv*(2*sizeof(half) + (p.i8qk ? 1 : 0))*size_t(ggml_get_op_params_i32(dst, 6))*256));
     return GGML_PAD(ggml_nbytes(dst), 128) + bound;
 }
 
@@ -309,7 +344,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         offset + plan.scratch_bytes <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
     ggml_cuda_pool_alloc<half> scratch_pool(ctx.pool());
     half * scratch_ptr = reserved ? (half *) ((char *) dst->data + offset) :
-        scratch_pool.alloc(2*kv_elements + output_bytes/sizeof(half));
+        scratch_pool.alloc(plan.i8qk ? (plan.scratch_bytes + sizeof(half) - 1)/sizeof(half) : 2*kv_elements + output_bytes/sizeof(half));
 
     float * output = grouped ? (float *) (scratch_ptr + 2*kv_elements) : (float *) dst->data;
 
@@ -333,11 +368,13 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             const ggml_cuda_kernel_launch_params launch_params(dim3(cn/16, heads, 1), dim3(32, 8, 1), 16*128*sizeof(half2), ctx.stream());
             ggml_cuda_kernel_launch(fattn_sj_kvarn_expand_prefill, launch_params,
                 (const char *) K->data, (const char *) V->data,
-                (const char *) dst->src[5]->data, (const int32_t *) dst->src[6]->data,
+                ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
                 K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-                (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, 0, true);
+                (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, 0, true,
+                dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
+                dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1]);
             CUDA_CHECK(cudaGetLastError());
-            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), (const char *) dst->src[5]->data,
+            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), ggml_cuda_qsa_resident_body(dst->src[5]),
                 (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
                 (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, heads, 0, ctx.stream());
 
@@ -363,8 +400,10 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
                 q.data = (char *) Q->data + q0*Q->nb[1];
                 q.ne[1] = qn;
                 ggml_tensor m = *mask;
-                m.data = (char *) mask->data + q0*mask->nb[1] + size_t(c0)*mask->nb[0];
-                m.ne[0] = cn;
+                const bool packed_mask = mask->type == GGML_TYPE_I32;
+                GGML_ASSERT(!packed_mask || c0 % 32 == 0);
+                m.data = (char *) mask->data + q0*mask->nb[1] + size_t(packed_mask ? c0/32 : c0)*mask->nb[0];
+                m.ne[0] = packed_mask ? (cn + 31)/32 : cn;
                 m.ne[1] = qn;
                 m.view_src = nullptr;
                 m.view_offs = 0;
@@ -404,12 +443,17 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 16*128*sizeof(half2), ctx.stream());
         ggml_cuda_kernel_launch(fattn_sj_kvarn_expand_prefill, launch_params,
             (const char *) K->data, (const char *) V->data,
-            (const char *) dst->src[5]->data, (const int32_t *) dst->src[6]->data,
+            ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
             K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-            (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, head_first, trellis);
+            (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, head_first, trellis,
+            // Int8 K smoothing averages every expanded row, including masked ones.
+            // Match the full-body path: zeroing resident-only masked tiles changes
+            // that mean and therefore the quantization of visible keys.
+            !plan.i8qk && dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
+            dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1]);
         CUDA_CHECK(cudaGetLastError());
         if (trellis) {
-            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), (const char *) dst->src[5]->data,
+            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), ggml_cuda_qsa_resident_body(dst->src[5]),
                 (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
                 (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, heads, head_first, ctx.stream());
         }
@@ -459,7 +503,29 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             }
         }
 
-        if (gqa > 4) {
+        // [HQ4] the GQA-packing probe of the generic D256 route (GGML_CUDA_FA_PREFILL_NCOLS2, fattn-prefill-policy.h)
+        // also picks this expand-once route's tile: 2 = 32 queries x 2 heads, exact for GQA 6 (no padded heads);
+        // 1 = 64 queries x 1 head. Unset (or 8, or an arm that does not divide the GQA ratio) = the rule below.
+        const int hq4 = ggml_cuda_fa_prefill_ncols2_pick(ggml_cuda_fa_prefill_ncols2_env(), ggml_cuda_info().devices[ctx.device].cc,
+            256, 256, Q->ne[1], gqa, Q->ne[3] == 1, true);
+        if (plan.i8qk && ggml_cuda_fattn_i8qk_applies_f16kv(ggml_cuda_info().devices[ctx.device].cc, &out)) {
+            // [I8SJ] int8 Q.K on the expanded f16 K (v1 K prep: mean smoothing + per-token scale), f16 V read in place
+            ggml_cuda_flash_attn_ext_i8qk(ctx, &out, 0, heads, (char *) scratch_ptr + plan.i8qk_offset, (half *) v.data);
+        } else if (gqa > 8 && gqa <= 16 && ggml_cuda_fa_sparse_g16() != 0 && out.src[0]->ne[1] >= ggml_cuda_fa_sparse_g16_minq() &&
+                ggml_cuda_info().devices[ctx.device].cc >= GGML_CUDA_CC_AMPERE &&
+                ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_cuda_info().devices[ctx.device].cc, &out, ggml_cuda_fa_sparse_g16(), 16)) {
+            // [G16] all heads of 4 (or 2) queries share one sparse tile, K/V gathered once per KV head
+            ggml_cuda_fa_sparse_g16_note("sjkvarn_prefill", ggml_cuda_fa_sparse_g16());
+            if (ggml_cuda_fa_sparse_g16() == 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 4, 16>(ctx, &out);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 2, 16>(ctx, &out);
+            }
+        } else if (hq4 == 2) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 32, 2>(ctx, &out);
+        } else if (hq4 == 1) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 64, 1>(ctx, &out);
+        } else if (gqa > 4) {
             ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8>(ctx, &out);
         } else if (gqa > 2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 16, 4>(ctx, &out);

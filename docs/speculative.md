@@ -83,6 +83,12 @@ See:
 
 Chained MTP drafts N tokens in one GPU decode. It currently supports dense Qwen3.5-family models and requires flash attention. For recurrent models, batch and ubatch sizes below N + 2 are raised to N + 2.
 
+#### Coalesced MTP prompt reads
+
+`GGML_MTP_PREFILL_OVERLAP=1` coalesces the target hidden-state reads used by MTP catch-up into one synchronized read per logical batch, with one host copy per sequence. It is off by default; only the value `1` enables it. This removes a backend synchronization per prompt token and lets the host submit the next target batch sooner. Generation catch-up uses the same coalesced reads.
+
+The option preserves hidden-state bytes, draft batch shapes, KV writes, and prompt-cache state. It does not add a CUDA stream or change GPU arithmetic. Target and draft compute buffers can still be shared, and hidden-state transfers between host and device still occur. There are no card-specific tuning parameters for this option.
+
 #### GPU greedy verification
 
 On CUDA, greedy MTP verification keeps token selection on the backend. It is opt-in
@@ -596,3 +602,7 @@ statistics ngram_map_k: #calls(b,g,a) = 6 1690 26, #gen drafts = 26, #acc drafts
 
 To measure the end-to-end effect of speculative decoding (throughput, latency, and draft acceptance) across diverse prompts, see the SPEED-Bench client in [tools/server/bench/speed-bench](../tools/server/bench/speed-bench/README.md).
 It runs against a running `llama-server` and can compare a baseline run against a speculative-decoding run.
+
+## Mode-biased MTP
+
+mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling. It uses a default maximum draft depth of 6 when enabled. Explicit `--spec-draft-n-max` values take precedence. Use `--spec-mb-mtp` to enable it explicitly or `LLAMA_ARG_SPEC_MB_MTP=0` to opt out through the environment. Mode-biased acceptance can change output; exact output, cache identity, and KL comparisons must pass `--no-spec-mb-mtp`.

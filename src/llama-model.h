@@ -16,8 +16,10 @@
 
 struct llama_cparams;
 struct llama_ubatch;
+struct llama_ple_cache;
 struct llama_model_loader;
 struct llama_model;
+struct ggml_moe_cache_tensor_desc;
 
 // available models
 enum llm_type {
@@ -652,6 +654,12 @@ struct llama_prec_policy {
     void load(llama_model_loader & ml, const llama_model & model);
 };
 
+// [B1] where an expert tensor's bytes live in its GGUF file (see llama_model::b1_src)
+struct llama_b1_file_src {
+    int    fd   = -1;
+    size_t offs = 0;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -727,6 +735,7 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+    std::unique_ptr<llama_ple_cache> ple_cache;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
@@ -787,6 +796,11 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // [B1] where each expert tensor's bytes live in the GGUF files (filled by the loader only when LLAMA_B1 is set,
+    // so the layer-major prefill can borrow resident expert VRAM and copy the weights back from the file)
+    std::unordered_map<std::string, llama_b1_file_src> b1_src;
+    std::vector<int> b1_fds; // dup()ed file descriptors, closed by the destructor
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -810,6 +824,8 @@ struct llama_model {
     llama_ftype ftype() const;
 
     size_t size() const; // file size
+    size_t moe_arena_size() const;
+    void moe_resident_init(ggml_backend_dev_t device, const ggml_moe_cache_tensor_desc * tensors, int count) const;
     size_t n_tensors() const;
     size_t n_devices() const;
     const float * tensor_split() const;
@@ -842,6 +858,8 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    void pin_borrowed_host_tensor(ggml_tensor * tensor) const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
@@ -856,7 +874,7 @@ protected:
     llama_model_params params;
 
     struct impl;
-    std::unique_ptr<impl> pimpl;
+    std::shared_ptr<impl> pimpl;
 };
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);

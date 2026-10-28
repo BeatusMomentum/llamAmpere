@@ -309,6 +309,16 @@ class Keys:
     class WKV:
         HEAD_SIZE = "{arch}.wkv.head_size"
 
+    class LiliCorr:
+        HIDDEN_SIZE     = "lilicorr.hidden_size"
+        CANDIDATE_TOPK  = "lilicorr.candidate_topk"
+        NUM_HEADS       = "lilicorr.num_heads"
+        NUM_LAYERS      = "lilicorr.num_layers"
+        FACTOR_DIM      = "lilicorr.factor_dim"
+        MLP_HIDDEN_SIZE = "lilicorr.mlp_hidden_size"
+        VECTOR_EPS      = "lilicorr.vector_eps"
+        LOGIT_SCALE     = "lilicorr.logit_scale"
+
     class PosNet:
         EMBEDDING_LENGTH = "{arch}.posnet.embedding_length"
         BLOCK_COUNT      = "{arch}.posnet.block_count"
@@ -1260,6 +1270,19 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    LILICORR_TOKEN_PROJ           = auto()
+    LILICORR_PASS_HIDDEN_PROJ     = auto()
+    LILICORR_SLOT_EMBD            = auto()
+    LILICORR_RANK_EMBD            = auto()
+    LILICORR_ATTN_BIAS            = auto()
+    LILICORR_CONTEXT_PROJ         = auto()
+    LILICORR_ATTN_IN_PROJ         = auto()
+    LILICORR_OUTPUT_NORM          = auto()
+    LILICORR_ANCHOR_NORM          = auto()
+    LILICORR_FACTOR_INPUT_PROJ    = auto()
+    LILICORR_OUT_HEAD             = auto()
+    LILICORR_IN_HEAD              = auto()
+    LILICORR_ANCHOR_OUT_HEAD      = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -2078,6 +2101,19 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.LILICORR_TOKEN_PROJ:                   "lilicorr.token_proj",
+    MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ:             "lilicorr.pass_hidden_proj",
+    MODEL_TENSOR.LILICORR_SLOT_EMBD:                    "lilicorr.slot_embedding",
+    MODEL_TENSOR.LILICORR_RANK_EMBD:                    "lilicorr.rank_embedding",
+    MODEL_TENSOR.LILICORR_ATTN_BIAS:                    "lilicorr.attention_bias",
+    MODEL_TENSOR.LILICORR_CONTEXT_PROJ:                 "lilicorr.context_proj",
+    MODEL_TENSOR.LILICORR_ATTN_IN_PROJ:                 "lilicorr.layers.{bid}.attn.in_proj",
+    MODEL_TENSOR.LILICORR_OUTPUT_NORM:                  "lilicorr.output_norm",
+    MODEL_TENSOR.LILICORR_ANCHOR_NORM:                  "lilicorr.anchor_norm",
+    MODEL_TENSOR.LILICORR_FACTOR_INPUT_PROJ:            "lilicorr.factor_input_proj",
+    MODEL_TENSOR.LILICORR_OUT_HEAD:                     "lilicorr.out_head",
+    MODEL_TENSOR.LILICORR_IN_HEAD:                      "lilicorr.in_head",
+    MODEL_TENSOR.LILICORR_ANCHOR_OUT_HEAD:              "lilicorr.anchor_out_head",
     MODEL_TENSOR.D2T:                       "d2t",
     MODEL_TENSOR.ATTN_V_GATE:               "blk.{bid}.attn_v_gate",
     MODEL_TENSOR.ATTN_V_EXP:                "blk.{bid}.attn_v_exps",
@@ -5505,6 +5541,19 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.LILICORR_TOKEN_PROJ,
+        MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ,
+        MODEL_TENSOR.LILICORR_SLOT_EMBD,
+        MODEL_TENSOR.LILICORR_RANK_EMBD,
+        MODEL_TENSOR.LILICORR_ATTN_BIAS,
+        MODEL_TENSOR.LILICORR_CONTEXT_PROJ,
+        MODEL_TENSOR.LILICORR_ATTN_IN_PROJ,
+        MODEL_TENSOR.LILICORR_OUTPUT_NORM,
+        MODEL_TENSOR.LILICORR_ANCHOR_NORM,
+        MODEL_TENSOR.LILICORR_FACTOR_INPUT_PROJ,
+        MODEL_TENSOR.LILICORR_OUT_HEAD,
+        MODEL_TENSOR.LILICORR_IN_HEAD,
+        MODEL_TENSOR.LILICORR_ANCHOR_OUT_HEAD,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5998,6 +6047,14 @@ class GGMLQuantizationType(IntEnum):
     EXL3_6  = 55
     EXL3_7  = 56
     EXL3_8  = 57
+    AIT2    = 110
+    AIT3    = 111
+    AIT4    = 112
+    AIT2P   = 113
+    AIT5_U  = 114
+    AIT2_U  = 115
+    AIT3_U  = 116
+    AIT4_U  = 117
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6063,6 +6120,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
     MOSTLY_Q5_CR         = 45  # except 1d tensors, ConvRot-rotated Q5_0
     MOSTLY_Q6_CR         = 46  # except 1d tensors, ConvRot-rotated Q6_K
+    MOSTLY_AI4           = 52  # AI+ trellis weights, except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -6161,6 +6219,7 @@ class VisionProjectorType:
     GLM5V = "glm5v"
     YOUTUVL = "youtuvl"
     NEMOTRON_V2_VL = "nemotron_v2_vl"
+    NEMOTRON_OMNI = "nemotron_omni"
     QWEN3TTS_SPKENC = "qwen3tts_spkenc" # audio: ECAPA-TDNN speaker encoder
     QWEN3TTS_GEN = "qwen3tts_gen" # audio generation: code_predictor
     POCKETTTS_SPKENC = "pockettts_spkenc" # audio: mimi encoder as voice-prompt encoder
@@ -6236,6 +6295,14 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.EXL3_6:  (256, 32 * 6),
     GGMLQuantizationType.EXL3_7:  (256, 32 * 7),
     GGMLQuantizationType.EXL3_8:  (256, 32 * 8),
+    GGMLQuantizationType.AIT2: (512, 130),
+    GGMLQuantizationType.AIT3: (512, 194),
+    GGMLQuantizationType.AIT4: (512, 258),
+    GGMLQuantizationType.AIT2P: (512, 130),
+    GGMLQuantizationType.AIT5_U: (128, 82),
+    GGMLQuantizationType.AIT2_U: (128, 34),
+    GGMLQuantizationType.AIT3_U: (128, 50),
+    GGMLQuantizationType.AIT4_U: (128, 66),
 }
 
 

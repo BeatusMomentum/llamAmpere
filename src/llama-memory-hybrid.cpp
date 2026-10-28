@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -143,6 +144,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_full() {
     return std::make_unique<llama_memory_hybrid_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid::init_full_single_seq() {
+    return std::make_unique<llama_memory_hybrid_context>(this, true);
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
@@ -217,6 +222,22 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
         mem_attn->state_write(io, seq_id, flags);
     }
     mem_recr->state_write(io, seq_id, flags);
+    state_write_sj_exact(io, seq_id, flags);
+}
+
+void llama_memory_hybrid::state_write_sj_exact(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    // [#240] SJ-KVaRN exact checkpoint: a suffix behind the recurrent state (see LLAMA_STATE_SEQ_FLAGS_SJ_EXACT)
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && (flags & LLAMA_STATE_SEQ_FLAGS_SJ_EXACT) && mem_attn->is_sj_kvarn()) {
+        mem_attn->state_write_sj_ckpt(io, seq_id);
+    }
+}
+
+void llama_memory_hybrid::state_read_sj_exact(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // [#240] read the suffix when the blob has one: checkpoints saved without it (older builds, sidecar files of
+    // v0.5.4) end with the recurrent state and load as before
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && io.n_left() > 0 && mem_attn->is_sj_kvarn()) {
+        mem_attn->state_read_sj_ckpt(io, seq_id);
+    }
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -228,6 +249,7 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
 
     try {
         mem_recr->state_read(io, seq_id, flags);
+        state_read_sj_exact(io, seq_id, flags);
     } catch (...) {
         // the attention part is already restored - undo it
         if (read_attn) {
@@ -248,8 +270,8 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
-llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
-    ctx_attn(mem->get_mem_attn()->init_full()),
+llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem, bool single_seq) :
+    ctx_attn(single_seq ? mem->get_mem_attn()->init_full_single_seq() : mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
@@ -295,6 +317,33 @@ bool llama_memory_hybrid_context::apply() {
     res = res & ctx_attn->apply();
     res = res & ctx_recr->apply();
 
+    return res;
+}
+
+bool llama_memory_hybrid_context::b1_supported() const {
+    return status == LLAMA_MEMORY_STATUS_SUCCESS && !ubatches.empty() && ctx_attn && ctx_recr &&
+           ctx_attn->b1_supported() && ctx_recr->b1_supported();
+}
+
+void llama_memory_hybrid_context::b1_save() {
+    ctx_attn->b1_save();
+    ctx_recr->b1_save();
+}
+
+bool llama_memory_hybrid_context::b1_seek(size_t i) {
+    if (i >= ubatches.size() || !ctx_attn->b1_seek(i) || !ctx_recr->b1_seek(i)) {
+        return false;
+    }
+    i_next = i;
+    return true;
+}
+
+std::vector<uint32_t> llama_memory_hybrid_context::b1_ubatch_sizes() const {
+    std::vector<uint32_t> res;
+    res.reserve(ubatches.size());
+    for (const auto & ub : ubatches) {
+        res.push_back(ub.n_tokens);
+    }
     return res;
 }
 

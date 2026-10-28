@@ -63,11 +63,15 @@ llama_memory_recurrent::llama_memory_recurrent(
         this->rs_ring = n_rs_seq > 0 && !this->gdn_replay && arch_ok && !env_off;
         const char * env_rows = getenv("LLAMA_RS_RING_ROWS");
         this->rs_ring_rows_all = this->rs_ring && env_rows != nullptr && strcmp(env_rows, "1") == 0;
+        const char * env_skip = getenv("LLAMA_RS_SHIFT_SKIP");
+        this->rs_shift_skip = n_rs_seq > 0 && !this->rs_ring && !this->gdn_replay &&
+                              (env_skip == nullptr || strcmp(env_skip, "0") != 0);
         if (n_rs_seq > 0) {
             // one line so A/B cells can confirm the rollback layout from the server log
-            LLAMA_LOG_INFO("%s: rollback layout = %s (n_rs_seq %u%s%s)\n", __func__,
+            LLAMA_LOG_INFO("%s: rollback layout = %s (n_rs_seq %u%s%s%s)\n", __func__,
                     this->rs_ring ? (this->rs_ring_rows_all ? "ring, set_rows for every ubatch" : "ring") : "shift",
-                    n_rs_seq, env_off ? ", LLAMA_RS_RING=0" : "", this->gdn_replay ? ", gdn_replay" : "");
+                    n_rs_seq, env_off ? ", LLAMA_RS_RING=0" : "", this->gdn_replay ? ", gdn_replay" : "",
+                    this->rs_shift_skip ? ", LLAMA_RS_SHIFT_SKIP: no shift, rollback <= n - 1" : "");
         }
     }
     rs_base.assign(mem_size, 0);
@@ -333,6 +337,11 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     rs_valid[seq_id] = have - (uint32_t) rollback;
                     cell.pos = p0 - 1;
                     return true;
+                }
+                if (rs_shift_skip) {
+                    // [VSHIFT] say so: a refused rollback costs a re-read of the prompt, never wrong words
+                    LLAMA_LOG_WARN("%s: [VSHIFT] rollback of %d refused for seq %d (have %u)\n", __func__,
+                            (int) rollback, seq_id, have);
                 }
                 return false;
             }
@@ -941,6 +950,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (n_rs_seq != 0 && (size_t) seq_id < rs_valid.size()) {
                 const uint64_t grown = (uint64_t) rs_valid[seq_id] + n_seq_tokens;
                 rs_valid[seq_id] = grown > n_rs_seq ? n_rs_seq : (uint32_t) grown;
+                // [VSHIFT] without the shift only the groups this ubatch wrote (0..n-1) are real
+                if (rs_shift_skip && n_seq_tokens <= n_rs_seq) {
+                    rs_valid[seq_id] = n_seq_tokens - 1;
+                }
             }
         }
     }
@@ -1764,6 +1777,59 @@ bool llama_memory_recurrent_context::apply() {
     return true;
 }
 
+bool llama_memory_recurrent_context::b1_supported() const {
+    // the shift rollback layout (n_rs_seq > 0, used by MTP drafting) replays like the plain one: every layer range
+    // writes the same snapshot planes for each ubatch, and the views carry the pending rollback group (rs_idx). The
+    // ring layout and gdn_replay change per-cell state while the inputs are set (rs_base, replay_len), so they stay off.
+    return status == LLAMA_MEMORY_STATUS_SUCCESS && !is_full && !ubatches.empty() &&
+           !mem->rs_ring && !mem->gdn_replay;
+}
+
+void llama_memory_recurrent_context::b1_save() {
+    if (b1_views.size() <= i_next) {
+        b1_views.resize(i_next + 1);
+    }
+    auto & v = b1_views[i_next];
+    v.head  = mem->head;
+    v.n     = mem->n;
+    v.used  = mem->used;
+    v.rs_z  = mem->rs_z;
+    v.cells = mem->cells;
+    // s_copy() reads a sequence's pending rollback group in the first ubatch that uses its cell and clears it, so in
+    // the normal order ubatch 0 reads the pending group and later ubatches read group 0. Every layer range sets the
+    // inputs of every ubatch again, so each view keeps the rs_idx its ubatch sees in the normal order.
+    if (i_next == 0) {
+        v.rs_idx = mem->rs_idx;
+    } else {
+        const auto & p = b1_views[i_next - 1];
+        v.rs_idx = p.rs_idx;
+        for (uint32_t i = 0; i < p.n; ++i) {
+            const auto & cell = p.cells[p.head + i];
+            if (!cell.seq_id.empty()) {
+                const llama_seq_id seq = *cell.seq_id.begin();
+                if (seq >= 0 && (size_t) seq < v.rs_idx.size()) {
+                    v.rs_idx[seq] = 0;
+                }
+            }
+        }
+    }
+}
+
+bool llama_memory_recurrent_context::b1_seek(size_t i) {
+    if (i >= b1_views.size() || i >= ubatches.size()) {
+        return false;
+    }
+    const auto & v = b1_views[i];
+    mem->head  = v.head;
+    mem->n     = v.n;
+    mem->used  = v.used;
+    mem->rs_z  = v.rs_z;
+    mem->cells = v.cells;
+    mem->rs_idx = v.rs_idx;
+    i_next = i;
+    return true;
+}
+
 llama_memory_status llama_memory_recurrent_context::get_status() const {
     return status;
 }
@@ -1879,7 +1945,7 @@ uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_snap_shift() const {
-    if (mem->n_rs_seq == 0 || is_full || mem->rs_ring) {
+    if (mem->n_rs_seq == 0 || is_full || mem->rs_ring || mem->rs_shift_skip) {
         return 0;
     }
     const llama_ubatch & ubatch = get_ubatch();

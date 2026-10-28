@@ -1384,6 +1384,13 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
     const bool has_token = batch_inp.token != nullptr;
     const bool has_embd  = batch_inp.embd  != nullptr;
 
+    if (batch_inp.n_tokens > 0) {
+        batch_ext->tokens.reserve(batch_ext->tokens.size() + (size_t) batch_inp.n_tokens);
+        if (has_embd) {
+            batch_ext->embd.reserve(batch_ext->embd.size() + (size_t) batch_inp.n_tokens * n_embd_row);
+        }
+    }
+
     static const llama_seq_id default_seq_id    = 0;
     static const int32_t      default_n_seq_id  = 1;
 
@@ -1441,6 +1448,26 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
 
         batch_ext->tokens.push_back(t);
     }
+}
+
+bool llama_batch_compat::can_reuse_mtp(const llama_batch & batch, size_t n_tokens_max, size_t n_embd_row) {
+    constexpr size_t max_hidden_bytes = 128u * 1024u * 1024u;
+    if (batch.n_tokens < 16 || (size_t) batch.n_tokens > n_tokens_max || batch.n_tokens > 8192 ||
+            !batch.token || !batch.embd || !batch.logits || n_embd_row == 0 ||
+            n_embd_row > max_hidden_bytes / sizeof(float) / (size_t) batch.n_tokens) {
+        return false;
+    }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.logits[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_batch_compat::reset(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row) {
+    batch_ext.clear();
+    init(batch_ext, batch_inp, n_embd_row);
 }
 
 llama_batch_compat::llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row) {

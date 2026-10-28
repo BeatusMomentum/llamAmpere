@@ -5,6 +5,9 @@
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-ai4.h"
+#include "ggml-ai4-decode.h"
+#include "ggml-ait.h"
 
 #include <math.h>
 #include <string.h>
@@ -5967,6 +5970,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TQ6_0:
         case GGML_TYPE_TQ5_0:
+        case GGML_TYPE_AIT5_U:
+        case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT4_U:
+        case GGML_TYPE_AIT2:
+        case GGML_TYPE_AIT3:
+        case GGML_TYPE_AIT4:
+        case GGML_TYPE_AIT2P:
             // WHT-rotated / TurboQuant types: no scalar-domain validation.
             break;
         default:
@@ -5991,6 +6002,43 @@ static inline float ggml_exl3_mul1_decode(uint32_t code) {
     const float h = GGML_FP16_TO_FP32((ggml_fp16_t) s);
     const float v = h * GGML_FP16_TO_FP32((ggml_fp16_t) 0x1eee) + GGML_FP16_TO_FP32((ggml_fp16_t) 0xc931); // exact in fp32
     return GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(v));
+}
+
+// ---- AI+ host slab decoder (ggml-ai4-decode.h) ----
+size_t ggml_ai4_slab_nbytes(enum ggml_type type, int64_t K) {
+    if (ggml_ait_rate(type) != 0) {
+        // AIT: chunks are 32 rows x 512 K, so a 16-row slab is half a chunk row; the decoder addresses (row, col) directly
+        return K > 0 && K % AIT_KB == 0 ? (size_t) 16 * (size_t) (K / AIT_KS) * (64 * ggml_ait_rate(type) + 2) : 0;
+    }
+    const int k = ggml_ai4_rate(type);
+    if (k == 0 || K <= 0 || K % AI4U_UK != 0) {
+        return 0;
+    }
+    return (size_t) ai4x_slab_bytes_k(K, k);
+}
+
+bool ggml_ai4_dequantize_slab(enum ggml_type type, const void * data, int64_t K, int64_t g, float * y) {
+    const size_t sb = ggml_ai4_slab_nbytes(type, K);
+    if (sb == 0 || data == NULL || y == NULL || g < 0) {
+        return false;
+    }
+    if (ggml_ait_rate(type) != 0) {
+        // AIT: rotated-basis weight (level x row scale x col scale / 64), then undo the H256 rotation per 256-K block
+        const int k = ggml_ait_rate(type), code = ggml_ait_code(type);
+        for (int r = 0; r < 16; ++r) {
+            float * yr = y + (int64_t) r * K;
+            const int64_t m = 16 * g + r;
+            for (int64_t c = 0; c < K; ++c) {
+                yr[c] = ait_weight_rot_c((const uint8_t *) data, K, k, code, m, c);
+            }
+            for (int64_t b = 0; b < K; b += AI4_HB) {
+                ai4_unrotate256(yr + b);
+            }
+        }
+        return true;
+    }
+    aik_dequantize_slab_c(ggml_ai4_rate(type), ggml_ai4_trellis_mul(type), (const uint8_t *) data + (size_t) g * sb, y, K);
+    return true;
 }
 
 void ggml_exl3_dequantize_row_group(const void * GGML_RESTRICT data, int64_t K, int64_t N, int bits, int64_t g, float * GGML_RESTRICT y) {
