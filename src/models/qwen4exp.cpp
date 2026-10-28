@@ -1611,10 +1611,6 @@ void llama_model_qwen4exp::graph::build_qsa_store(
     }
     packed = ggml_reshape_3d(ctx0, packed, packed->ne[0], 1, n_tokens);
     auto * raw_write = mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il);
-    if (mctx_hyb->has_host_raw()) {
-        // Only fresh keys cross to the host; never migrate the full original-key history.
-        ggml_backend_sched_set_tensor_backend(sched, raw_write, backend_cpu);
-    }
     ggml_build_forward_expand(gf, raw_write);
 
     // the raw keys and the persistent pooled slots, see llama_memory_hybrid_idx::mem_idx_stale
@@ -1624,8 +1620,6 @@ void llama_model_qwen4exp::graph::build_qsa_store(
     ggml_tensor * rows = kpool_cache.gather_key_gate(ggml_reshape_1d(ctx0, inp_kpool->new_pool_idxs, kpool*n_new));
     ggml_backend_t pool_backend = nullptr;
     if (mctx_hyb->has_host_raw()) {
-        // Gather before transferring: only the members of new/stale pools visit the device.
-        ggml_backend_sched_set_tensor_backend(sched, rows, backend_cpu);
         const auto pool_buft = kpool_cache.get_pool_buffer_type();
         for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
             auto * backend = ggml_backend_sched_get_backend(sched, b);
@@ -1638,6 +1632,12 @@ void llama_model_qwen4exp::graph::build_qsa_store(
             }
         }
         GGML_ASSERT(pool_backend);
+        // Device-mapped history: the pool's device writes fresh keys and gathers new pool members in place.
+        // Plain host history: only fresh keys cross to the host and only gathered members visit the device.
+        auto * raw_backend = ggml_backend_supports_buft(pool_backend, kpool_cache.get_raw_buffer_type()) ?
+                pool_backend : backend_cpu;
+        ggml_backend_sched_set_tensor_backend(sched, raw_write, raw_backend);
+        ggml_backend_sched_set_tensor_backend(sched, rows, raw_backend);
     }
     rows = ggml_reshape_3d(ctx0, rows, idx_dim, kpool, n_new);
 

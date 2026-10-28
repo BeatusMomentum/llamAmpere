@@ -1955,6 +1955,66 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     return &ggml_backend_cuda_buffer_type_host;
 }
 
+// fork: exact QSA raw indexer history in mapped pinned host memory. Its CUDA device gathers and scatters
+// rows in place (supports_op admits only GET_ROWS, SET_ROWS and views), so the full history never takes
+// VRAM, and only the rows an op names cross the bus. Host I/O (state save/restore, clear) is plain memcpy.
+static const char * ggml_backend_cuda_qsa_raw_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_CUDA_NAME "_QSA_Raw_Host";
+}
+
+static bool ggml_backend_buft_is_cuda_qsa_raw_host(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.get_name == ggml_backend_cuda_qsa_raw_host_buffer_type_name;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_qsa_raw_host_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_cuda_set_device((int) (intptr_t) buft->context);
+    void * ptr = nullptr;
+    void * dev_ptr = nullptr;
+    if (cudaHostAlloc(&ptr, std::max<size_t>(size, 1), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostGetDevicePointer(&dev_ptr, ptr, 0) != cudaSuccess || dev_ptr != ptr) {
+        // kernels address the history through its host pointer, which needs unified addressing
+        (void) cudaGetLastError();
+        if (ptr) { CUDA_CHECK(cudaFreeHost(ptr)); }
+        GGML_LOG_ERROR("%s: cannot map %.2f MiB of pinned indexer history\n", __func__, size/1048576.0);
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    return buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_qsa_raw_host_buffer_type(ggml_backend_dev_t dev) {
+    static std::mutex mutex;
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+            types[i] = {
+                /* .iface    = */ {
+                    /* .get_name         = */ ggml_backend_cuda_qsa_raw_host_buffer_type_name,
+                    /* .alloc_buffer     = */ ggml_backend_cuda_qsa_raw_host_buffer_alloc,
+                    /* .alloc_buffer_n   = */ NULL,
+                    /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                    /* .get_max_size     = */ NULL,
+                    /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                    /* .get_alloc_size_n = */ NULL,
+                    /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                },
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ (void *) (intptr_t) i,
+            };
+        }
+        initialized = true;
+    }
+    for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+        if (types[i].device == dev) { return &types[i]; }
+    }
+    return nullptr;
+}
+
 struct ggml_backend_cuda_kv_stream_runtime {
     int device = 0;
     size_t stage_bytes = 0;
@@ -10132,6 +10192,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), cuda_ctx->device);
                 assert(((ggml_backend_buft_is_cuda(node->buffer->buft) ||
                          ggml_backend_buft_is_cuda_kv_stream(node->buffer->buft) ||
+                         ggml_backend_buft_is_cuda_qsa_raw_host(node->buffer->buft) ||
                          ggml_cuda_qsa_resident_is_buft(node->buffer->buft)) &&
                         node->buffer->buft->device == expected_dev) ||
                        ((integrated || ggml_cuda_host_weights_enabled()) &&
@@ -10141,6 +10202,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         assert(node->src[j]->buffer);
                         assert(((ggml_backend_buft_is_cuda(node->src[j]->buffer->buft) ||
                                  ggml_backend_buft_is_cuda_kv_stream(node->src[j]->buffer->buft) ||
+                                 ggml_backend_buft_is_cuda_qsa_raw_host(node->src[j]->buffer->buft) ||
                                  ggml_cuda_qsa_resident_is_buft(node->src[j]->buffer->buft)) &&
                                 node->src[j]->buffer->buft->device == expected_dev) ||
                                ((integrated || ggml_cuda_host_weights_enabled()) &&
@@ -11129,6 +11191,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         const auto * src = op->src[i];
+        if (src && src->buffer && ggml_backend_buft_is_cuda_qsa_raw_host(src->buffer->buft) &&
+            (src->buffer->buft->device != dev || !(ggml_op_is_empty(op->op) ||
+             (i == 0 && (op->op == GGML_OP_GET_ROWS || op->op == GGML_OP_SET_ROWS))))) {
+            return false; // never stream the mapped history: only named rows cross the bus
+        }
         if (src && src->buffer && ggml_cuda_qsa_resident_is_buft(src->buffer->buft)) {
             if (src->buffer->buft->device != dev ||
                 !((op->op == GGML_OP_FLASH_ATTN_EXT && i == 5) || op->op == GGML_OP_SJKVARN_SEAL)) {
@@ -11714,6 +11781,7 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
     return (ggml_backend_buft_is_cuda(buft) && buft->device == dev)
         || (ggml_backend_buft_is_cuda_kv_stream(buft) && buft->device == dev)
         || (ggml_cuda_qsa_resident_is_buft(buft) && buft->device == dev)
+        || (ggml_backend_buft_is_cuda_qsa_raw_host(buft) && buft->device == dev)
         || ((integrated || ggml_cuda_host_weights_enabled()) && ggml_backend_buft_is_cuda_host(buft));
 }
 
@@ -12047,6 +12115,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_qsa_resident_device_bytes") == 0) {
         return (void *) ggml_backend_cuda_qsa_resident_device_bytes;
+    }
+    if (strcmp(name, "ggml_backend_cuda_qsa_raw_host_buffer_type") == 0) {
+        return (void *) ggml_backend_cuda_qsa_raw_host_buffer_type;
     }
     if (strcmp(name, "ggml_backend_cuda_qsa_resident_buffer_type") == 0) {
         return (void *) ggml_backend_cuda_qsa_resident_buffer_type;

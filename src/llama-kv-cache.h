@@ -149,7 +149,9 @@ public:
                           size_t kv_stream_stage_bytes = 0,
                           void * kv_stream_phase_arena = nullptr,
                           size_t kv_stream_maximum_pool_bytes = 0,
-           llama_sj_kvarn_config   sj_kvarn = llama_sj_kvarn_config());
+           llama_sj_kvarn_config   sj_kvarn = llama_sj_kvarn_config(),
+        // fork: keep the K rows in device-mapped pinned host memory (QSA raw indexer history)
+                            bool   k_host_mapped = false);
 
     ~llama_kv_cache() { scratch_cancel(); }
 

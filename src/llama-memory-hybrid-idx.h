@@ -154,6 +154,9 @@ public:
         ggml_backend_buffer_type_t get_pool_buffer_type() const {
             return ggml_backend_buffer_get_type(pooled->buffer);
         }
+        ggml_backend_buffer_type_t get_raw_buffer_type() const {
+            return ggml_backend_buffer_get_type(key_gate->view_src->buffer);
+        }
 
     private:
         friend class llama_memory_hybrid_idx_context;

@@ -99,9 +99,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, type = %s\n", __func__, kv_size, ggml_type_name(type_k_idx));
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload && !host_raw, unified_idx,
+            model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload, unified_idx,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, "idx_", 0, nullptr, 0, llama_sj_kvarn_config(), host_raw);
     }()) {
     if (compact_pool) {
         pool_storage.resize(model.hparams.n_layer_all, nullptr);

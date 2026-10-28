@@ -243,7 +243,8 @@ llama_kv_cache::llama_kv_cache(
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
                      size_t kv_stream_maximum_pool_bytes,
-       llama_sj_kvarn_config   sj_kvarn) :
+       llama_sj_kvarn_config   sj_kvarn,
+                     bool   k_host_mapped) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream((unified && !sj_kvarn.enabled()) ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -646,6 +647,16 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            if (k_host_mapped) {
+                // the device reads and writes rows in place; a device without mapping keeps them in plain host memory
+                using mapped_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+                auto * get_type = reinterpret_cast<mapped_type_fn>(ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_raw_host_buffer_type"));
+                auto * mapped = get_type ? get_type(dev) : nullptr;
+                buft = mapped ? mapped : ggml_backend_cpu_buffer_type();
+                dev_name = ggml_backend_buft_name(buft);
+            }
 
             if (kv_stream_stage_bytes != 0 && !hparams.no_alloc) {
                 if (kv_stream_dev != nullptr && kv_stream_dev != dev) {
