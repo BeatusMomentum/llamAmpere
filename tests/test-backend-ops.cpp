@@ -18617,7 +18617,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // {output, input}: qkv, attn gate, attn q, ssm_out/attn_output, shexp gate/up, shexp down
         for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {12288, 2560}, {2560, 6144}, {640, 2560}, {2560, 640}}) {
             for (int64_t n : {1024, 12288}) {
-                for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+                // 640-wide inputs (shared-expert down) are IQ4_NL / Q2_0 in the model; 256-block types cannot hold them
+                const std::vector<ggml_type> types = mk.second % 256 == 0
+                    ? std::vector<ggml_type>{GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}
+                    : std::vector<ggml_type>{GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0};
+                for (ggml_type t : types) {
                     test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
                 }
             }
