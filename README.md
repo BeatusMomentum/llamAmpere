@@ -1,4 +1,4 @@
-> **llamAmpere v0.6**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head, and Qwen3.8 Flash-Next with experts split between the card and RAM.
+> **llamAmpere v0.6.1**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head, and Qwen3.8 Flash-Next with experts split between the card and RAM.
 
 ## What's new in v0.6
 
@@ -12,12 +12,14 @@
   release notes.
 - Nemotron 3.5 Bolt / Super, EXL3 speed-ups with the same output, and a fix for SJ-KVaRN with image prompts.
 - Swift 1.5 v0.6 vs v0.5 speed table and gates: [release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
+- **New in v0.6.1:** a crash fix. The 12 GB command (`LLAMA_KQ_MASK_PACKED=1` with SJ-KVaRN) no longer stops at
+  startup. No speed change. [Release notes](docs/llamampere-v0.6.1/RELEASE_NOTES.md).
 
-**Build and run (v0.6, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
+**Build and run (v0.6.1, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
 CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
 
 ```bash
-git clone -b v0.6 https://github.com/JakeATX/llamAmpere.git
+git clone -b v0.6.1 https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
   -DLLAMA_BUILD_BORINGSSL=ON
