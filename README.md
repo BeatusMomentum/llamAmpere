@@ -8,7 +8,7 @@
 - **Faster prompt reading on Swift 1.5 27B** (+5.3% at 100K) from a new GDN-layer kernel, same output.
 - **AI+ model file for Swift 1.5 27B** (our own weight format for Ampere and newer): 14.4 GB, 10.4% lower KL than
   IQ4_XS-M, 8.9% faster 100K prompt reading and 1.1 GB less card memory (writing speed +2.3%, not significant).
-  Older AI+ files no longer load; download the ATX-AI4 file below.
+  Older AI+ files no longer load; download the [ATX-AI4 file](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4).
 - **Qwen3.8 Flash-Next:** expert cache on the card with the rest of the experts in RAM, a fast whole-prompt read, and
   `--kv-gpu-tokens N` to keep only part of the KV cache on the card. Launch command and numbers: coming soon in the
   release notes.
@@ -25,15 +25,15 @@ cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_
   -DLLAMA_BUILD_BORINGSSL=ON
 cmake --build build-sm86 -j8 --target llama-server
 ./build-sm86/bin/llama-server \
-  --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
+  --hf-repo jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4 \
   --hf-file qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf -c 262144 \
   -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1 \
   --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 5 --spec-draft-p-min 0
 ```
 
 The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
-To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp) instead, change `--hf-file` to
-`ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
+To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp) instead, use
+`--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
 
 ---
 
