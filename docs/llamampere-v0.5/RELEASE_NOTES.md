@@ -411,3 +411,103 @@ New flags:
 - SJ-KVaRN builds on the KVarN method by huawei-csl (https://github.com/huawei-csl/KVarN).
 - The TurboQuant KV cache types and TurboQuant weight types come from TheTom's TurboQuant fork of llama.cpp.
 - The EXL3 format, the trellis codebooks and their arithmetic are Turboderp's exllamav3.
+
+## Moved from the README (v0.5 and v0.5.x)
+
+## What's new in v0.5
+
+- **SJ-KVaRN**, a new compressed KV cache, in 4/4, 3/3t and 3/2t configurations. It builds on the KVarN method
+  (huawei-csl/KVarN).
+  - At 4/4 it has 41% lower KL than v0.4's tq5_0/turbo4 cache for 2% more cache memory.
+  - The full 262,144-token context fits on one 24 GB card at 4/4: 21,924 MiB peak at full depth.
+- **Faster decode at 100K.** On our coding/agentic/RAG task benchmark at 100K depth, v0.5 with tq5_0/turbo4 is
+  +8.41% ± 5.76% over v0.4, and with SJ-KVaRN 4/4 +6.77% ± 2.68%.
+- **Prompt cache on by default.** A RAM tier sized from host memory plus a 16 GiB disk tier, for every KV type,
+  SJ-KVaRN included. A resumed conversation skips the full re-prefill. `--no-cache-disk` turns the disk tier off.
+- **12 GB cards (RTX 3060 12 GB):** a 2.3 bpw Swift 1.5 model with SJ-KVaRN 3/3t and the MTP drafter, 204,800 tokens
+  of context in about 11 GB.
+- **Faster MTP verify decode on EXL3 models**, and a catch-up to upstream llama.cpp and TheTom's TurboQuant fork.
+- **New in v0.5.1:** SJ-KVaRN works with parallel decode slots (`--parallel N`, optionally `--kv-unified`);
+  `--parallel 1` output is unchanged. [Release notes](docs/llamampere-v0.5.1/RELEASE_NOTES.md).
+- **New in v0.5.2:** several prefill and SJ-KVaRN fixes were added, improving reliability and speed. The RAM prompt
+  cache keeps the newest 4 checkpoints plus one per doubling (`--cache-ram-checkpoints 0` keeps all). Optional
+  per-model SJ-KVaRN transform files (`--sjkvarn-transform`). [Release notes](docs/llamampere-v0.5.2/RELEASE_NOTES.md).
+- **New in v0.5.3:** bug fixes only. With SJ-KVaRN, a conversation resumed from the prompt cache (RAM or disk)
+  now gives the same answer as reading it fresh; the disk cache works when `--mmproj` is loaded; the tree builds for
+  RTX 50-series cards. [Release notes](docs/llamampere-v0.5.3/RELEASE_NOTES.md).
+- **New in v0.5.4:** a crash fix. With `--parallel 3` or more and the MTP drafter on, the server no longer stops
+  with `failed to remove sequence N`. No speed change. [Release notes](docs/llamampere-v0.5.4/RELEASE_NOTES.md).
+- **New in v0.5.5:** `--eval-cache DIR`, an opt-in, read-only prompt cache on disk for eval and benchmark prompts.
+  Long prompts that an eval sends on every run load from a prebuilt folder instead of being read again, with the
+  same output at temperature 0. Ready-made folders for Swift 1.5:
+  [jakeatx/llamampere-evalcache](https://huggingface.co/datasets/jakeatx/llamampere-evalcache). Also bug fixes for
+  the MTP drafter state, `id_slot` and the automatic fit. [Release notes](docs/llamampere-v0.5.5/RELEASE_NOTES.md).
+- **Coming next:** a Swift 1.5 EXL3 4.0 bpw model.
+- **Read more:** the [SJ-KVaRN paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper) and the standalone codec,
+  [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT).
+
+Release notes, including what we tried and did not ship: [docs/llamampere-v0.5/RELEASE_NOTES.md](docs/llamampere-v0.5/RELEASE_NOTES.md). Recommended settings for every card size: [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
+
+### Build and run, v0.5 commands (still valid in v0.6)
+
+**Build and run (v0.5 commands, still valid in v0.6, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
+CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
+
+```bash
+git clone https://github.com/JakeATX/llamAmpere.git
+cd llamAmpere
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DLLAMA_BUILD_BORINGSSL=ON
+cmake --build build-sm86 -j8 --target llama-server
+```
+
+`-DLLAMA_BUILD_BORINGSSL=ON` builds HTTPS support from source so `-hf` can download the model. Without it, a machine
+that has no OpenSSL development files gets a build whose `-hf` fails with "HTTPS is not supported".
+
+Other NVIDIA cards are not tuned for, but the tree builds for them with a different `-DCMAKE_CUDA_ARCHITECTURES`
+value (the commands below then use your build folder name): `89` for RTX 40-series (Ada; compile-checked only) and
+`120` for RTX 50-series (Blackwell, needs CUDA toolkit 12.8 or newer; built and op-tested on an RTX 5070).
+
+Fastest decode (tq5_0 K / turbo4 V):
+
+```bash
+./build-sm86/bin/llama-server \
+  --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
+  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -ngl 99 -fa on -ctk tq5_0 -ctv turbo4 -b 4096 -ub 1024 --parallel 1
+```
+
+Lowest KL at about the same speed (SJ-KVaRN 4/4):
+
+```bash
+./build-sm86/bin/llama-server \
+  --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
+  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1
+```
+
+For a smaller cache, use `-ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type auto` (3/3t) or
+`-ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto` (3/2t). The server listens on http://127.0.0.1:8080
+(OpenAI-compatible API). The MTP drafter and the prompt cache are on by default.
+
+**12 GB cards (RTX 3060 12 GB, 3080 12 GB, 3080 Ti), 204,800-token context.** Same build. Run from the `llamAmpere`
+directory; the model download is 9.0 GB.
+
+```bash
+LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
+  -hf jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP-GGUF \
+  -hff ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP.gguf \
+  -c 204800 --parallel 1 -ngl 99 -fa on -fit off -b 4096 -ub 512 \
+  --no-context-shift --jinja \
+  -ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type sjkvarn4t \
+  --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
+  --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 \
+  --cache-type-s q8_0 \
+  --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0 \
+  --spec-draft-vocab-map docs/mtp-vocab/atx_65536.txt \
+  --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-window 8192 \
+  --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
+```
+
+With a 203,568-token prompt this peaked at 12,052 MiB on the whole card, including about 1 GB used by the desktop;
+the server process itself used about 11.1 GB.
