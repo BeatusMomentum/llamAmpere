@@ -19,7 +19,7 @@
 #include <unistd.h>
 #endif
 
-static constexpr int64_t PLE_PF_DEFAULT_THREADS = 16;
+static constexpr int64_t PLE_PF_DEFAULT_THREADS = 2;
 static constexpr int64_t PLE_PF_DEFAULT_MIN     = 4096;
 
 static int64_t ple_pf_env(const char * name, int64_t def) {
@@ -93,6 +93,9 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
 
     const char * mode = getenv("LLAMA_PLE_PF_MODE");
     pf->use_pread = !(mode && strcmp(mode, "fault") == 0);
+    // by default the readers only queue the reads (posix_fadvise WILLNEED): nothing is copied, so two threads keep
+    // the disk busy without taking CPU from the prompt setup; the gather waits on any page still in flight
+    pf->use_advise = pf->use_pread && (mode ? strcmp(mode, "advise") == 0 : !user);
 #if defined(__linux__)
     if (pf->use_pread) {
         std::string path;
@@ -103,6 +106,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
         if (pf->fd < 0) {
             LLAMA_LOG_WARN("%s: [PLEPF] cannot open the file behind the PLE table, reading by page faults\n", __func__);
             pf->use_pread = false;
+            pf->use_advise = false;
         } else {
             pf->file_off = off;
             // the descriptor's own readahead state: read exactly the pages asked for
@@ -111,10 +115,11 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     }
 #else
     pf->use_pread = false;
+    pf->use_advise = false;
 #endif
 
     LLAMA_LOG_WARN("%s: [PLEPF] PLE prefetch on: %d threads, %s, calls of %u+ tokens, %" PRIu64 " tokens ahead\n", __func__,
-            pf->n_threads, pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead);
+            pf->n_threads, pf->use_advise ? "advise" : pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead);
     return pf;
 }
 
@@ -310,7 +315,9 @@ int64_t llama_ple_prefetch::reader() {
             }
         }
 #if defined(__linux__)
-        if (use_pread) {
+        if (use_advise) {
+            posix_fadvise(fd, (off_t) (pages[i]*4096), 4096, POSIX_FADV_WILLNEED);
+        } else if (use_pread) {
             if (pread(fd, buf, sizeof(buf), (off_t) (pages[i]*4096)) < 0) {
                 // a failed read only costs the gather a fault
             }
