@@ -6,7 +6,9 @@
   its replacement, so more drafted tokens survive and deeper drafts pay off (adaptive draft depth 3-5 by default). The output leans slightly toward the
   model's most likely tokens (0.009 KL per token at depth 6 on Swift 1.5); `--no-spec-mb-mtp` gives exact sampling.
 - **Faster prompt reading on Swift 1.5 27B** (+5.3% at 100K) from a new GDN-layer kernel, same output.
-- **AI+ model files** (our weight format for Ampere and newer) run in v0.6.
+- **AI+ model file for Swift 1.5 27B** (our own weight format for Ampere and newer): 14.4 GB, 10.4% lower KL than
+  IQ4_XS-M, 8.9% faster 100K prompt reading and 1.1 GB less card memory (writing speed +2.3%, not significant).
+  Older AI+ files (names without "v2") no longer load; download the v2 file below.
 - **Qwen3.8 Flash-Next:** expert cache on the card with the rest of the experts in RAM, a fast whole-prompt read, and
   `--kv-gpu-tokens N` to keep only part of the KV cache on the card. Launch command and numbers: coming soon in the
   release notes.
@@ -14,7 +16,7 @@
 - Swift 1.5 v0.6 vs v0.5 speed table and gates: [release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
 
 **Build and run (v0.6, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
-CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
+CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 14.4 GB.
 
 ```bash
 git clone -b v0.6 https://github.com/JakeATX/llamAmpere.git
@@ -24,12 +26,14 @@ cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_
 cmake --build build-sm86 -j8 --target llama-server
 ./build-sm86/bin/llama-server \
   --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
-  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-AIplus-v2-4.2bpw.gguf -c 262144 \
   -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1 \
   --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 5 --spec-draft-p-min 0
 ```
 
 The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
+To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp) instead, change `--hf-file` to
+`ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
 
 ---
 
