@@ -110,3 +110,15 @@ the text can differ between runs. That is expected, not a bug. Details: "Run-to-
 
 Filled in as each gate finishes: full build, CPU tests, a Swift 1.5 smoke run of the command above on an RTX 3090 Ti,
 and a Flash-Next smoke run.
+
+## Moved from the README (v0.6 extras)
+
+- **Also in v0.6:** Nemotron 3.5 Bolt / Super, EXL3 speed-ups with the same output, and a fix for SJ-KVaRN with image prompts. Swift 1.5 v0.6 vs v0.5 speed table and gates are above.
+
+- **Flash-Next:** expert cache on the card with the rest of the experts in RAM, a fast whole-prompt read, and `--kv-gpu-tokens N` to keep only part of the KV cache on the card.
+
+Experimental Qwen3.8-Next CUDA router storage: `LLAMA_QWEN_ROUTER_BF16=1` converts F32 routed and shared-expert gates to BF16 while loading, using existing CUDA BF16 operations. The default remains F32; CPU mappings and model files stay unchanged. Weight representability does not establish identical arithmetic or prompt-cache replay; qualify quality and speed before deployment. Drafter expert sharing stays off.
+
+For v0.6 recommended configurations on cards with 12 GB or less, set `LLAMA_KQ_MASK_PACKED=1`; the global default remains off. On the frozen R10 Swift 1.5 SJ-KVaRN 3/2t recipe at 204,800 context and microbatch 512, packing saved 188 MiB with identical output and prompt-cache state. Six paired Taichi timing brackets measured generation +0.12% and prompt processing -1.59%; these historical measurements are the tradeoff, not a new speed result for the integrated build. See [v0.6 packed-mask notes](docs/llamampere-v0.6/CHANGELOG.md).
+
+Packed attention masks are opt-in with `LLAMA_KQ_MASK_PACKED=1` (default off, CPU/CUDA flash attention only). Native MMA and int8-QK mask readers use one bit per entry instead of F16. Unsupported readers, including sparse gather, resident-body fetch, and direct decode readers, expand to F16 scratch and may give back the memory saving. ALiBi, training, KV streaming, and architectures with custom mask layouts keep their existing masks.
