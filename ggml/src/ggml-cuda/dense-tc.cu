@@ -11,7 +11,8 @@ static std::once_flag   g_dense_tc_once[GGML_CUDA_MAX_DEVICES];
 static int dense_tc_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_CUDA_DENSE_TC");
-        return e ? atoi(e) : -1; // -1 = auto
+        // Different prompt chunk sizes can change results after a cache restore. Keep opt-in until stable.
+        return e ? atoi(e) : 0; // -1 = auto, 0 = off
     }();
     return mode;
 }
