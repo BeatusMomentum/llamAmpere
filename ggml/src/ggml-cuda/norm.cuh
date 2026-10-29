@@ -30,6 +30,12 @@ void ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx,
                                    void *                      q8_dst,
                                    ggml_type                   q8_type);
 
+// [GATEDNORM] RMS_NORM(x) -> MUL(weight) -> MUL(sigmoid(gate)) in one kernel, bit-identical to the three ops (rows of
+// at most 256 columns, one weight row, gate of x's shape; dst contiguous, may alias x or gate exactly)
+bool ggml_cuda_rms_norm_mul_gate_supported(const ggml_tensor * norm);
+void ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, const ggml_tensor * weight,
+                                    const ggml_tensor * gate, float * dst);
+
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

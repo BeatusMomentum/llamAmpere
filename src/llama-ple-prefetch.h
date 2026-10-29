@@ -39,6 +39,10 @@ public:
     // pos0 = position of the first token (0: the predecessors before the call read as EOS)
     bool start(const llama_batch_ext & batch, llama_pos pos0);
 
+    // [PFGAP] the caller knows the tokens of the next prompt call before decode builds its batch: start reading now.
+    // A following start() of these tokens (or of a prefix of them) at the same pos0 keeps the reads going.
+    void hint(const llama_token * tokens, size_t n, llama_pos pos0);
+
     // the next ubatch of this call (n_tokens, in call order) is about to gather: waits until its pages are read and lets
     // the readers move on. idx = the rows the graph input computed.
     // Returns true when the ubatch was covered, so the caller skips its own madvise.
@@ -50,9 +54,11 @@ public:
 private:
     llama_ple_prefetch() = default;
 
-    void build();   // runs on the coordinator thread: rows, pages, then the readers
+    void begin(llama_pos pos0); // toks is set: reset the call state and start the coordinator
+    void build();   // runs on the coordinator thread: rows and page runs chunk by chunk, readers follow behind
     int64_t reader();  // one reader thread, returns the time of its last read
-    size_t allowed_for(uint64_t n_tok) const;
+    size_t chunks_for(uint64_t n_tok) const;
+    bool   run_ready(size_t i) const; // under mtx: run i exists and may be read, or there is nothing more to read
 
     const llama_model * model = nullptr;
     const ggml_tensor * ple   = nullptr;
@@ -60,6 +66,7 @@ private:
     // configuration
     int      n_threads = 0;
     bool     use_pread = true;
+    bool     use_advise = false; // [PFGAP] file mode: ask the kernel to queue the reads instead of copying them
     uint32_t n_min     = 256;
     uint32_t n_ubatch  = 0;
     uint64_t n_ahead   = 0;      // tokens read ahead of the gather
@@ -74,11 +81,18 @@ private:
     // the current call
     std::vector<int32_t> toks;   // token ids of the call
     std::vector<int32_t> pred;   // guessed rows, n_heads per token, -1 = unknown predecessor
-    std::vector<uint64_t> pages; // page keys in read order (file page for pread, virtual page for fault)
-    std::vector<uint32_t> page_chunk;
-    std::vector<size_t>   chunk_end;   // pages[0, chunk_end[c]) cover chunks 0..c
-    std::unique_ptr<std::atomic<int64_t>[]> remaining; // unread pages per chunk
+    // [PFGAP] runs of consecutive pages, one read each, in chunk order (published chunk by chunk as build() goes)
+    static constexpr uint32_t RUN_MAX = 256; // pages per run (1 MiB)
+    std::unique_ptr<uint64_t[]> run_key;   // first page key (file page for pread/advise, virtual page for fault)
+    std::unique_ptr<uint32_t[]> run_len;
+    std::unique_ptr<uint32_t[]> run_chunk;
+    std::unique_ptr<std::atomic<int64_t>[]> remaining; // unread runs per chunk (PENDING until the chunk is built)
     size_t n_chunks = 0;
+    std::atomic<size_t> n_built{0};          // runs published
+    std::atomic<size_t> allowed_chunks{0};   // readers may read runs of chunks below this
+    size_t   n_pages_all = 0;
+    llama_pos pos0_call  = 0;
+    bool     hinted      = false;            // the running call was started by hint()
 
     std::thread              coord;
     std::vector<std::thread> readers;
@@ -88,7 +102,6 @@ private:
     std::atomic<bool>        stopping{false};
     std::atomic<bool>        built{false};
     std::atomic<size_t>      cursor{0};
-    std::atomic<size_t>      allowed{0};
     std::atomic<int64_t>     n_read{0};
     bool                     running = false;
     uint64_t                 consumed = 0; // tokens consumed in this call

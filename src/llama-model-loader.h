@@ -86,6 +86,9 @@ struct llama_model_loader {
     bool load_mtp;
     bool use_moe_arena = false;
     uint32_t moe_arena_layers = 0;
+    // fork: per-tensor answer to "is every F32 router value exactly BF16-representable" (low 16 bits zero)
+    mutable std::unordered_map<std::string, bool> router_bf16_exact;
+    bool router_bf16_exact_check(const char * name) const;
     std::set<const ggml_tensor *> arena_tensors;
     std::unique_ptr<llama_moe_arena> load_moe_arena(llama_progress_callback callback, void * user_data);
 

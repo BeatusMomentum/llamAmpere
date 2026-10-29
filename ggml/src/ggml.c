@@ -5843,7 +5843,9 @@ struct ggml_tensor * ggml_flash_attn_ext(
         GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64);
         GGML_ASSERT(mask->type != GGML_TYPE_I64 || (mask->ne[0] == 1 && mask->ne[1] >= q->ne[1] && mask->ne[2] == 1 && max_bias == 0.0f));
         if (ggml_flash_attn_ext_mask_packed(mask)) {
-            GGML_ASSERT(mask->ne[0] >= k->ne[1]/32 + (k->ne[1]%32 != 0) && mask->ne[1] >= q->ne[1] && max_bias == 0.0f);
+            // the width is checked against the K rows only for a plain cache: an SJ-KVaRN K view spans the whole sink +
+            // ring, the node attends n_kv_pad positions and ggml_flash_attn_ext_set_sj_kvarn checks the mask against that
+            GGML_ASSERT(mask->ne[1] >= q->ne[1] && max_bias == 0.0f);
         }
         // rows may be strided (the CPU and CUDA kernels index the mask by nb[1..3])
         GGML_ASSERT(ggml_is_contiguous_rows(mask));

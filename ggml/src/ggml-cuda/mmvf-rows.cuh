@@ -23,9 +23,11 @@
 // GGML_CUDA_FROWS_MAX_N (default 2 / 8) the widths it takes; GGML_CUDA_FROWS_R=1|2|4|8
 // and GGML_CUDA_FROWS_NT=128|256 force rows per block / threads per block (default: 4 rows per block, 128 threads; the
 // measured best or within 10% of it at every timed shape).
+// GGML_CUDA_FROWS_BF16_F32_ORDER=1 uses the F32 reduction order for BF16 weights when GGML_PREC_F32 is requested.
 
 bool ggml_cuda_frows_wants(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
 
 void ggml_cuda_frows_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 extern int64_t ggml_cuda_frows_count; // launches, for test-backend-ops' required-kernel check
+extern int64_t ggml_cuda_frows_bf16_f32_order_count;

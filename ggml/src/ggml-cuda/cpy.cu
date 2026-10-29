@@ -1,6 +1,7 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include "convert.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -561,7 +562,12 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16) {
-        if (contiguous_srcs) {
+        // [CPYBF16] 4 elements per thread (convert_unary_cont_cuda, the cuBLAS BF16 path's conversion): the same
+        // ggml_cuda_cast per element. GGML_CUDA_NO_CPY_BF16_VEC4=1 keeps the one-element kernel.
+        static const bool no_vec4 = [] { const char * e = getenv("GGML_CUDA_NO_CPY_BF16_VEC4"); return e && atoi(e) != 0; }();
+        if (contiguous_srcs && !no_vec4) {
+            ggml_get_to_bf16_cuda(GGML_TYPE_F32)(src0_ddc, (nv_bfloat16 *) src1_ddc, ne, main_stream);
+        } else if (contiguous_srcs) {
             ggml_cpy_scalar_contiguous_cuda<float, nv_bfloat16>
                 (src0_ddc, src1_ddc, ne, main_stream);
         } else {

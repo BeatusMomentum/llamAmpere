@@ -476,6 +476,9 @@ void llama_moe_arena_apply_flashnext_defaults() {
         { "GGML_CUDA_KQ_TC",                      "q4_K,q5_K,q6_K" },
         { "GGML_CUDA_KQ_TC_WARPS",                "4" },
         { "GGML_CUDA_FROWS",                      "1" },
+        // router weights stored as BF16 (exact: loader checks every value; F32 sum order; =0 keeps F32)
+        { "GGML_CUDA_FROWS_BF16_F32_ORDER",       "1" },
+        { "LLAMA_QWEN_ROUTER_BF16",               "1" },
         // CPU expert split (fork MOEGAP, gated 2026-10-23: 97.5 tok/s plain vs 97.4 recipe, no loops, probe < 75 us).
         // Host threads compute the experts that are not on the card instead of copying their weights over PCIe. The
         // text differs run to run with the split on (CPU and card kernels round differently): valid math, not exact.

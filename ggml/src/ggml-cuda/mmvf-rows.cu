@@ -4,6 +4,7 @@
 #include <cstdlib>
 
 int64_t ggml_cuda_frows_count = 0;
+int64_t ggml_cuda_frows_bf16_f32_order_count = 0;
 
 namespace {
 
@@ -11,6 +12,7 @@ namespace {
 template <typename T> struct frows_io;
 
 template <> struct frows_io<float> {
+    using load_type = uint4;
     static constexpr int V = 4;
     static __device__ __forceinline__ void unpack(const uint4 & u, float (&f)[V]) {
         f[0] = __uint_as_float(u.x); f[1] = __uint_as_float(u.y);
@@ -19,6 +21,7 @@ template <> struct frows_io<float> {
 };
 
 template <> struct frows_io<nv_bfloat16> {
+    using load_type = uint4;
     static constexpr int V = 8;
     static __device__ __forceinline__ void unpack(const uint4 & u, float (&f)[V]) {
         const uint32_t w[4] = { u.x, u.y, u.z, u.w };
@@ -31,6 +34,7 @@ template <> struct frows_io<nv_bfloat16> {
 };
 
 template <> struct frows_io<half> {
+    using load_type = uint4;
     static constexpr int V = 8;
     static __device__ __forceinline__ void unpack(const uint4 & u, float (&f)[V]) {
         const uint32_t w[4] = { u.x, u.y, u.z, u.w };
@@ -45,6 +49,19 @@ template <> struct frows_io<half> {
     }
 };
 
+// Four exactly widened BF16 weights per step, matching the F32 lane assignment.
+// uint16_t is only the storage view; all arithmetic remains F32.
+template <> struct frows_io<uint16_t> {
+    using load_type = uint2;
+    static constexpr int V = 4;
+    static __device__ __forceinline__ void unpack(const uint2 & u, float (&f)[V]) {
+        f[0] = __uint_as_float(u.x << 16);
+        f[1] = __uint_as_float(u.x & 0xFFFF0000u);
+        f[2] = __uint_as_float(u.y << 16);
+        f[3] = __uint_as_float(u.y & 0xFFFF0000u);
+    }
+};
+
 // x: nrows rows of nchunks*V weights, row stride stride_row elements; y: ncols columns of nchunks*V floats, column
 // stride stride_col_y floats; dst: column stride stride_col_dst floats. One block = R consecutive rows.
 template <typename T, int ncols, int R, int NT>
@@ -52,6 +69,7 @@ static __global__ void __launch_bounds__(NT) frows_kernel(
         const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
         const int nchunks, const int nrows, const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst) {
     using IO = frows_io<T>;
+    using load_type = typename IO::load_type;
     constexpr int V  = IO::V;
     constexpr int NW = NT / WARP_SIZE;
 
@@ -61,11 +79,11 @@ static __global__ void __launch_bounds__(NT) frows_kernel(
     const int tid  = threadIdx.x;
 
     // rows past the end read the last row (in bounds) and are never written
-    const uint4 * xr[R];
+    const load_type * xr[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         const int row = min(row0 + r, nrows - 1);
-        xr[r] = (const uint4 *) (x + int64_t(row)*stride_row);
+        xr[r] = (const load_type *) (x + int64_t(row)*stride_row);
     }
     const float4 * y4 = (const float4 *) y;
     const int64_t stride_col_y4 = stride_col_y / 4;
@@ -82,7 +100,7 @@ static __global__ void __launch_bounds__(NT) frows_kernel(
 #pragma unroll 2
     for (int c = tid; c < nchunks; c += NT) {
         // every load of this K step first ...
-        uint4 w[R];
+        load_type w[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             w[r] = __ldg(xr[r] + c);
@@ -155,6 +173,7 @@ static __global__ void __launch_bounds__(NT) frows_kernel(
 
 struct frows_cfg {
     bool    on       = false;
+    bool    bf16_f32_order = false;
     int64_t max_rows = 1024;
     int     rows     = 0; // 0 = by shape
     int     nt       = 0; // 0 = 128
@@ -167,6 +186,8 @@ static const frows_cfg & frows_get_cfg() {
         frows_cfg c;
         const char * on = getenv("GGML_CUDA_FROWS");
         c.on = on != nullptr && atoi(on) != 0;
+        const char * order = getenv("GGML_CUDA_FROWS_BF16_F32_ORDER");
+        c.bf16_f32_order = order != nullptr && atoi(order) != 0;
         if (const char * m = getenv("GGML_CUDA_FROWS_MAX_ROWS")) {
             c.max_rows = atoll(m);
         }
@@ -189,6 +210,7 @@ static const frows_cfg & frows_get_cfg() {
         if (c.on) {
             GGML_LOG_INFO("frows: on, weights up to %lld rows, widths %d..%d, rows per block %d (0 = by shape), threads %d (0 = 128)\n",
                 (long long) c.max_rows, c.min_n, c.max_n, c.rows, c.nt);
+            GGML_LOG_INFO("frows: BF16 F32-order opt-in = %d (F32 precision requests only)\n", c.bf16_f32_order);
         }
         return c;
     }();
@@ -318,8 +340,14 @@ void ggml_cuda_frows_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
                 stride_row, stride_col_y, stride_col_dst, stream);
             break;
         case GGML_TYPE_BF16:
-            frows_switch_ncols<nv_bfloat16>(ncols, rows, nt, (const nv_bfloat16 *) src0->data, y, d, (int) (src0->ne[0] / 8),
-                (int) nrows, stride_row, stride_col_y, stride_col_dst, stream);
+            if (cfg.bf16_f32_order && ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32) {
+                frows_switch_ncols<uint16_t>(ncols, rows, nt, (const uint16_t *) src0->data, y, d,
+                    (int) (src0->ne[0] / 4), (int) nrows, stride_row, stride_col_y, stride_col_dst, stream);
+                ++ggml_cuda_frows_bf16_f32_order_count;
+            } else {
+                frows_switch_ncols<nv_bfloat16>(ncols, rows, nt, (const nv_bfloat16 *) src0->data, y, d,
+                    (int) (src0->ne[0] / 8), (int) nrows, stride_row, stride_col_y, stride_col_dst, stream);
+            }
             break;
         default:
             GGML_ABORT("frows: type %s", ggml_type_name(src0->type));

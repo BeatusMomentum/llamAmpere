@@ -3313,6 +3313,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             return cur;
         }
 
+        if (kq_mask && kq_mask->type == GGML_TYPE_I32 && sj_kvarn_pending.body == nullptr) {
+            // packed mask on a plain cache: one bit per K row (SJ-KVaRN is checked in ggml_flash_attn_ext_set_sj_kvarn)
+            GGML_ASSERT(kq_mask->ne[0] >= (k->ne[1] + 31)/32);
+        }
+
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});

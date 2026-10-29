@@ -5620,6 +5620,17 @@ private:
 
                     slot.mem.seq_rm(slot.id, p0, -1);
 
+                    // [PFGAP] a long text prompt: the per-layer embedding rows it needs start reading now, while the batch
+                    // is still being put together
+                    if (n_tokens_prev == 0 && !slot.task->tokens.has_mtmd && slot.task->n_tokens() > slot.prompt.n_tokens()) {
+                        const int64_t i0 = slot.prompt.n_tokens();
+                        const int64_t i1 = std::min<int64_t>(slot.task->n_tokens(), i0 + n_batch);
+                        if (i1 - i0 >= 4096) {
+                            const llama_tokens all = slot.task->tokens.get_text_tokens();
+                            llama_ple_prefetch_hint(ctx_tgt, all.data() + i0, (int32_t) (i1 - i0), p0);
+                        }
+                    }
+
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
                     if (slot.task->n_tokens_shared > 0) {

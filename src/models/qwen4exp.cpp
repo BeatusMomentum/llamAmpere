@@ -1611,10 +1611,6 @@ void llama_model_qwen4exp::graph::build_qsa_store(
     }
     packed = ggml_reshape_3d(ctx0, packed, packed->ne[0], 1, n_tokens);
     auto * raw_write = mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il);
-    if (mctx_hyb->has_host_raw()) {
-        // Only fresh keys cross to the host; never migrate the full original-key history.
-        ggml_backend_sched_set_tensor_backend(sched, raw_write, backend_cpu);
-    }
     ggml_build_forward_expand(gf, raw_write);
 
     // the raw keys and the persistent pooled slots, see llama_memory_hybrid_idx::mem_idx_stale
@@ -1624,8 +1620,6 @@ void llama_model_qwen4exp::graph::build_qsa_store(
     ggml_tensor * rows = kpool_cache.gather_key_gate(ggml_reshape_1d(ctx0, inp_kpool->new_pool_idxs, kpool*n_new));
     ggml_backend_t pool_backend = nullptr;
     if (mctx_hyb->has_host_raw()) {
-        // Gather before transferring: only the members of new/stale pools visit the device.
-        ggml_backend_sched_set_tensor_backend(sched, rows, backend_cpu);
         const auto pool_buft = kpool_cache.get_pool_buffer_type();
         for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
             auto * backend = ggml_backend_sched_get_backend(sched, b);
@@ -1638,6 +1632,12 @@ void llama_model_qwen4exp::graph::build_qsa_store(
             }
         }
         GGML_ASSERT(pool_backend);
+        // Device-mapped history: the pool's device writes fresh keys and gathers new pool members in place.
+        // Plain host history: only fresh keys cross to the host and only gathered members visit the device.
+        auto * raw_backend = ggml_backend_supports_buft(pool_backend, kpool_cache.get_raw_buffer_type()) ?
+                pool_backend : backend_cpu;
+        ggml_backend_sched_set_tensor_backend(sched, raw_write, raw_backend);
+        ggml_backend_sched_set_tensor_backend(sched, rows, raw_backend);
     }
     rows = ggml_reshape_3d(ctx0, rows, idx_dim, kpool, n_new);
 
@@ -2122,6 +2122,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+
+    // [GDNBF16] ssm_beta and ssm_alpha are BF16, so at 32+ tokens the CUDA cuBLAS path rounds cur to BF16 once per
+    // matmul; cast it once and feed both: the same rounding (round to nearest even) and the same GEMM. Plain matmuls on
+    // cur only (no LoRA or precision policy); small batches take the vector / mmf kernels, which read cur in f32.
+    // LLAMA_NO_GDN_BF16_ONCE=1 keeps the two conversions.
+    {
+        static const bool no_once = [] { const char * e = getenv("LLAMA_NO_GDN_BF16_ONCE"); return e && atoi(e) != 0; }();
+        const auto plain_bf16_mm = [&](const ggml_tensor * t, const ggml_tensor * w) {
+            if (t->op != GGML_OP_MUL_MAT || t->src[0] != w || t->src[1] != cur || w->type != GGML_TYPE_BF16) {
+                return false;
+            }
+            for (int i = 0; i < 4; ++i) {
+                if (t->op_params[i] != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        ggml_tensor * beta_mm = beta->src[0]; // beta = sigmoid(reshape(mm))
+        while (beta_mm != nullptr && beta_mm->op == GGML_OP_RESHAPE) {
+            beta_mm = beta_mm->src[0];
+        }
+        if (!no_once && ubatch.n_tokens >= 32 && cur->type == GGML_TYPE_F32 && ggml_is_contiguous(cur) &&
+                beta_mm != nullptr && plain_bf16_mm(beta_mm, model.layers[il].ssm_beta) &&
+                plain_bf16_mm(alpha, model.layers[il].ssm_alpha)) {
+            ggml_tensor * xb = ggml_cast(ctx0, cur, GGML_TYPE_BF16);
+            cb(xb, "gdn_in_bf16", il);
+            beta_mm->src[1] = xb;
+            alpha->src[1]   = xb;
+        }
+    }
+
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -2210,6 +2242,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+
+    // [GATEDNORM] z ahead of the norm, so RMS_NORM, MUL, SIGMOID, MUL are adjacent nodes the CUDA backend runs as one
+    // kernel (z used to be computed between the norm and the sigmoid)
+    ggml_build_forward_expand(gf, output);
+    ggml_build_forward_expand(gf, z_2d);
 
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
@@ -2417,7 +2454,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     auto it = rs_rows.find(conv_states_all);
     const bool first_use = it == rs_rows.end();
     if (first_use) {
-        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
+        // replay mode keeps rs_idx at 0 and records the pending rollback as replay_len, so the history
+        // group is picked here, as build_conv_state does: group 0 would still hold the rejected draft tokens.
+        ggml_tensor * conv_src = conv_states_all;
+        const uint32_t conv_rollback = mctx_cur->get_replay_len();
+        if (conv_rollback > 0) {
+            const uint32_t n_cells = mctx_cur->get_size();
+            GGML_ASSERT((uint32_t) conv_states_all->ne[1] >= (conv_rollback + 1) * n_cells);
+            conv_src = ggml_view_2d(ctx0, conv_states_all, row_total, n_cells, conv_states_all->nb[1],
+                    (size_t) conv_rollback * n_cells * conv_states_all->nb[1]);
+        }
+        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_src, row_total, n_seqs)).first;
     }
     ggml_tensor * rows = it->second;
 

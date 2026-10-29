@@ -30,7 +30,40 @@ struct qsa_clock_buffer {
     void * host = nullptr;
     int device;
     std::vector<std::unique_ptr<qsa_clock_tensor>> tensors;
+    // fork VRAMPOOL: one device block shared by every layer's maps; cudaMalloc rounds each call
+    // to 2 MiB, so ten calls per layer wasted ~3.5 MiB per layer.
+    char * pool = nullptr;
+    size_t pool_size = 0, pool_used = 0;
+    bool pool_tried = false;
+    std::vector<void *> blocks;
 };
+
+// Carve one layer's device maps from base (nullptr: size only). Every piece is 256-byte aligned.
+static size_t qsa_clock_layout(ggml_cuda_qsa_clock_map & m, ggml_cuda_qsa_clock_map ** device_map, char * base) {
+    size_t off = 0;
+    auto take = [&](size_t bytes) -> char * {
+        char * p = base ? base + off : nullptr;
+        off += (bytes + 255) & ~size_t(255);
+        return p;
+    };
+    char * card = take(size_t(m.slots)*m.heads*GGML_QSA_PAGE_HEAD_BYTES);
+    char * meta = take(size_t(m.records)*m.heads*GGML_QSA_META_HEAD_BYTES);
+    char * table = take(size_t(m.records)*(m.group/4)*sizeof(int32_t));
+    char * tags = take(m.slots*sizeof(int32_t));
+    char * stamp = take(m.slots*sizeof(uint32_t));
+    char * ref = take(m.slots*sizeof(int32_t));
+    char * miss_page = take(m.slots*sizeof(int32_t));
+    char * miss_slot = take(m.slots*sizeof(int32_t));
+    char * ctl = take(16*sizeof(uint32_t));
+    char * dmap = take(sizeof(ggml_cuda_qsa_clock_map));
+    if (base) {
+        m.card = card; m.meta = meta; m.table = (int32_t *) table; m.tags = (int32_t *) tags;
+        m.stamp = (uint32_t *) stamp; m.ref = (int32_t *) ref; m.miss_page = (int32_t *) miss_page;
+        m.miss_slot = (int32_t *) miss_slot; m.ctl = (uint32_t *) ctl;
+        *device_map = (ggml_cuda_qsa_clock_map *) dmap;
+    }
+    return off;
+}
 
 static const char * qsa_clock_name(ggml_backend_buffer_type_t buft) {
     return static_cast<qsa_clock_type *>(buft->context)->name.c_str();
@@ -75,17 +108,9 @@ static void qsa_clock_free(ggml_backend_buffer_t buffer) {
         GGML_LOG_INFO("QSA CLOCK: slots=%u calls=%llu page_misses=%llu selected_cells=%llu last_misses=%u overflow=%u\n",
             e->map.slots, (unsigned long long) counters[6], (unsigned long long) counters[4],
             (unsigned long long) counters[5], uint32_t(counters[1]), uint32_t(counters[2]));
-        CUDA_CHECK(cudaFree(e->map.card));
-        CUDA_CHECK(cudaFree(e->map.tags));
-        CUDA_CHECK(cudaFree(e->map.meta));
-        CUDA_CHECK(cudaFree(e->map.table));
-        CUDA_CHECK(cudaFree(e->map.stamp));
-        CUDA_CHECK(cudaFree(e->map.ref));
-        CUDA_CHECK(cudaFree(e->map.miss_page));
-        CUDA_CHECK(cudaFree(e->map.miss_slot));
-        CUDA_CHECK(cudaFree(e->map.ctl));
-        CUDA_CHECK(cudaFree(e->device_map));
     }
+    for (void * block : b->blocks) CUDA_CHECK(cudaFree(block));
+    if (b->pool) CUDA_CHECK(cudaFree(b->pool));
     if (b->host) CUDA_CHECK(cudaFreeHost(b->host));
     delete b;
 }
@@ -105,7 +130,7 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
     auto entry = std::make_unique<qsa_clock_tensor>();
     auto & m = entry->map;
     void * mapped = nullptr;
-    const auto * b = static_cast<qsa_clock_buffer *>(buffer->context);
+    auto * b = static_cast<qsa_clock_buffer *>(buffer->context);
     CUDA_CHECK(cudaHostGetDevicePointer(&mapped, b->host, 0));
     m.host = static_cast<const char *>(mapped) + (static_cast<const char *>(tensor->data) - static_cast<const char *>(b->host));
     m.stride = t->stride;
@@ -118,26 +143,30 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
         return GGML_STATUS_FAILED;
     }
     ggml_cuda_set_device(t->device);
-    cudaError_t error = cudaMalloc(&m.card, size_t(m.slots)*m.heads*GGML_QSA_PAGE_HEAD_BYTES);
-    if (error == cudaSuccess) error = cudaMalloc(&m.meta, size_t(m.records)*m.heads*GGML_QSA_META_HEAD_BYTES);
-    if (error == cudaSuccess) error = cudaMalloc(&m.table, size_t(m.records)*(m.group/4)*sizeof(int32_t));
-    if (error == cudaSuccess) error = cudaMalloc(&m.tags, m.slots*sizeof(int32_t));
-    if (error == cudaSuccess) error = cudaMalloc(&m.stamp, m.slots*sizeof(uint32_t));
-    if (error == cudaSuccess) error = cudaMalloc(&m.ref, m.slots*sizeof(int32_t));
-    if (error == cudaSuccess) error = cudaMalloc(&m.miss_page, m.slots*sizeof(int32_t));
-    if (error == cudaSuccess) error = cudaMalloc(&m.miss_slot, m.slots*sizeof(int32_t));
-    if (error == cudaSuccess) error = cudaMalloc(&m.ctl, 16*sizeof(uint32_t));
-    if (error == cudaSuccess) error = cudaMalloc(&entry->device_map, sizeof(m));
-    if (error != cudaSuccess) {
-        (void) cudaGetLastError();
-        for (void * ptr : {static_cast<void *>(m.card), static_cast<void *>(m.meta), static_cast<void *>(m.table),
-                static_cast<void *>(m.tags), static_cast<void *>(m.stamp), static_cast<void *>(m.ref),
-                static_cast<void *>(m.miss_page), static_cast<void *>(m.miss_slot), static_cast<void *>(m.ctl),
-                static_cast<void *>(entry->device_map)}) {
-            if (ptr) cudaFree(ptr);
+    const size_t need = qsa_clock_layout(m, nullptr, nullptr);
+    if (!b->pool_tried) {
+        // Layers in one buffer share a shape, so size the pool for all of them up front.
+        b->pool_tried = true;
+        const size_t layers = buffer->size/ggml_nbytes(tensor);
+        if (layers > 1 && cudaMalloc((void **) &b->pool, layers*need) == cudaSuccess) {
+            b->pool_size = layers*need;
+        } else {
+            (void) cudaGetLastError();
+            b->pool = nullptr;
         }
-        return GGML_STATUS_ALLOC_FAILED;
     }
+    char * base = nullptr;
+    if (b->pool && b->pool_size - b->pool_used >= need) {
+        base = b->pool + b->pool_used;
+        b->pool_used += need;
+    } else {
+        if (cudaMalloc((void **) &base, need) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        b->blocks.push_back(base);
+    }
+    qsa_clock_layout(m, &entry->device_map, base);
     CUDA_CHECK(cudaMemset(m.tags, 0xff, m.slots*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(m.table, 0xff, size_t(m.records)*(m.group/4)*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(m.stamp, 0, m.slots*sizeof(uint32_t)));

@@ -2370,7 +2370,14 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
             ggml_backend_dev_memory(dev, &free, &total);
             const size_t card_limit = (size_t) 23552 << 20;
             const size_t headroom = std::max<size_t>(256u << 20, total > card_limit ? total - card_limit + (64u << 20) : 0);
-            const size_t need = required[i] + headroom;
+            size_t handoff_growth = 0;
+            if (mtp_hidden.ring && ubatch_rows_cb && dev == model.dev_output()) {
+                // Handoff storage is allocated after this reserve, outside the compute graph.
+                const size_t handoff_bytes = GGML_PAD(((size_t) n_tokens + 1) * model.hparams.n_embd_out() * sizeof(float), 2u << 20);
+                const size_t current_bytes = mtp_hidden.buf ? ggml_backend_buffer_get_size(mtp_hidden.buf.get()) : 0;
+                handoff_growth = handoff_bytes > current_bytes ? handoff_bytes - current_bytes : 0;
+            }
+            const size_t need = required[i] + handoff_growth + headroom;
             trim += need > free ? need - free : 0;
         }
         if (trim > 0) {
@@ -5217,10 +5224,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     // [PLEPF] start reading the PLE pages of a prompt call; stopped when the call returns
-    if (!ple_pf_tried) {
-        ple_pf_tried = true;
-        ple_pf = llama_ple_prefetch::create(model, cparams.n_ubatch);
-    }
+    ple_pf_init();
     struct ple_pf_guard {
         llama_ple_prefetch * p = nullptr;
         ~ple_pf_guard() {
@@ -10105,4 +10109,27 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_context::ple_pf_init() {
+    if (!ple_pf_tried) {
+        ple_pf_tried = true;
+        ple_pf = llama_ple_prefetch::create(model, cparams.n_ubatch);
+    }
+}
+
+void llama_context::ple_pf_hint(const llama_token * tokens, size_t n, llama_pos pos0) {
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return;
+    }
+    ple_pf_init();
+    if (ple_pf) {
+        ple_pf->hint(tokens, n, pos0);
+    }
+}
+
+void llama_ple_prefetch_hint(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0) {
+    if (ctx && tokens && n_tokens > 0) {
+        ctx->ple_pf_hint(tokens, (size_t) n_tokens, pos0);
+    }
 }

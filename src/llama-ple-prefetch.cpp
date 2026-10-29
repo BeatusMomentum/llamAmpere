@@ -19,6 +19,9 @@
 #include <unistd.h>
 #endif
 
+static constexpr int64_t PLE_PF_DEFAULT_THREADS = 0;
+static constexpr int64_t PLE_PF_DEFAULT_MIN     = 4096;
+
 static int64_t ple_pf_env(const char * name, int64_t def) {
     const char * v = getenv(name);
     return v && *v ? (int64_t) atoll(v) : def;
@@ -60,14 +63,18 @@ static bool ple_pf_resolve(const void * addr, std::string & path, uint64_t & off
 #endif
 
 std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model & model, uint32_t n_ubatch) {
-    const int64_t n_thr = ple_pf_env("LLAMA_PLE_PREFETCH", 0);
+    // Opt in with LLAMA_PLE_PREFETCH=N reader threads; read-ahead can churn the page cache on low-RAM hosts.
+    const bool    user  = getenv("LLAMA_PLE_PREFETCH") != nullptr;
+    const int64_t n_thr = ple_pf_env("LLAMA_PLE_PREFETCH", ple_pf_env("LLAMA_PLE_PF_THREADS", PLE_PF_DEFAULT_THREADS));
     if (n_thr <= 0) {
         return nullptr;
     }
     const ggml_tensor * t = model.per_layer_tok_embd;
     if (model.arch != LLM_ARCH_QWEN4EXP || !t || !model.can_prefetch.count(t) || !t->data || !t->buffer ||
             !ggml_backend_buffer_is_host(t->buffer) || model.hparams.ple_n_heads == 0 || model.hparams.ple_ngram_size < 2) {
-        LLAMA_LOG_WARN("%s: [PLEPF] LLAMA_PLE_PREFETCH is set but this model has no lazily mapped qwen4exp PLE table, off\n", __func__);
+        if (user) {
+            LLAMA_LOG_WARN("%s: [PLEPF] LLAMA_PLE_PREFETCH is set but this model has no lazily mapped qwen4exp PLE table, off\n", __func__);
+        }
         return nullptr;
     }
 
@@ -75,14 +82,18 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->model     = &model;
     pf->ple       = t;
     pf->n_threads = (int) std::min<int64_t>(n_thr, 512);
-    pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", 256));
-    pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", 2*(int64_t) n_ubatch));
+    // by default only long calls (a short check or catch-up batch is cheaper to fault in) and the whole call ahead
+    pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN));
+    pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", user ? 2*(int64_t) n_ubatch : INT64_MAX/2));
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
     pf->n_rows    = (uint64_t) t->ne[1];
 
     const char * mode = getenv("LLAMA_PLE_PF_MODE");
     pf->use_pread = !(mode && strcmp(mode, "fault") == 0);
+    // by default the readers only queue the reads (posix_fadvise WILLNEED): nothing is copied, so two threads keep
+    // the disk busy without taking CPU from the prompt setup; the gather waits on any page still in flight
+    pf->use_advise = pf->use_pread && (mode ? strcmp(mode, "advise") == 0 : !user);
 #if defined(__linux__)
     if (pf->use_pread) {
         std::string path;
@@ -93,6 +104,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
         if (pf->fd < 0) {
             LLAMA_LOG_WARN("%s: [PLEPF] cannot open the file behind the PLE table, reading by page faults\n", __func__);
             pf->use_pread = false;
+            pf->use_advise = false;
         } else {
             pf->file_off = off;
             // the descriptor's own readahead state: read exactly the pages asked for
@@ -101,10 +113,11 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     }
 #else
     pf->use_pread = false;
+    pf->use_advise = false;
 #endif
 
     LLAMA_LOG_WARN("%s: [PLEPF] PLE prefetch on: %d threads, %s, calls of %u+ tokens, %" PRIu64 " tokens ahead\n", __func__,
-            pf->n_threads, pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead);
+            pf->n_threads, pf->use_advise ? "advise" : pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead);
     return pf;
 }
 
@@ -117,39 +130,90 @@ llama_ple_prefetch::~llama_ple_prefetch() {
 #endif
 }
 
-bool llama_ple_prefetch::start(const llama_batch_ext & batch, llama_pos pos0) {
-    stop();
+static constexpr int64_t PLE_PF_PENDING = INT64_MAX/4; // remaining[] of a chunk build() has not reached yet
 
+bool llama_ple_prefetch::start(const llama_batch_ext & batch, llama_pos pos0) {
     const size_t n = batch.tokens.size();
     if (n < n_min) {
+        stop();
         return false;
     }
     llama_seq_id seq = -1;
     for (const auto & tok : batch.tokens) {
         if (tok.seq_ids.size() != 1) {
+            stop();
             return false;
         }
         const llama_seq_id s = *tok.seq_ids.begin();
         if (seq < 0) {
             seq = s;
         } else if (s != seq) {
+            stop();
             return false;
         }
     }
 
     const auto & hp = model->hparams;
     const llama_token img = hp.ple_image_token_id != 0 ? (llama_token) hp.ple_image_token_id : (llama_token) hp.ple_eos_token_id;
+
+    // [PFGAP] the call the caller hinted: keep its reads (the batch may stop early, the reads past it are only spare)
+    if (running && hinted && pos0 == pos0_call && n <= toks.size()) {
+        bool same = true;
+        for (size_t i = 0; i < n && same; ++i) {
+            same = (batch.tokens[i].has_embd ? img : batch.tokens[i].id) == toks[i];
+        }
+        if (same) {
+            hinted = false;
+            return true;
+        }
+    }
+
+    stop();
     toks.resize(n);
     for (size_t i = 0; i < n; ++i) {
         toks[i] = batch.tokens[i].has_embd ? img : batch.tokens[i].id;
     }
+    begin(pos0);
+    return true;
+}
+
+void llama_ple_prefetch::hint(const llama_token * tokens, size_t n, llama_pos pos0) {
+    if (!tokens || n < n_min) {
+        return;
+    }
+    if (running && pos0 == pos0_call && n == toks.size() && std::equal(tokens, tokens + n, toks.begin())) {
+        return;
+    }
+    stop();
+    toks.assign(tokens, tokens + n);
+    begin(pos0);
+    hinted = true;
+}
+
+void llama_ple_prefetch::begin(llama_pos pos0) {
+    const size_t n = toks.size();
+    pos0_call = pos0;
     seq_start = pos0 == 0;
+    hinted    = false;
+
+    // the run arrays at their upper bound (each row touches at most two pages); written front to back only
+    const size_t cap = n*(size_t) model->hparams.ple_n_heads*2 + 1;
+    run_key.reset(new uint64_t[cap]);
+    run_len.reset(new uint32_t[cap]);
+    run_chunk.reset(new uint32_t[cap]);
+    n_chunks = (n + CHUNK - 1)/CHUNK;
+    remaining.reset(new std::atomic<int64_t>[n_chunks]);
+    for (size_t c = 0; c < n_chunks; ++c) {
+        remaining[c].store(PLE_PF_PENDING);
+    }
 
     stopping  = false;
     built     = false;
     cursor    = 0;
-    allowed   = 0;
+    n_built   = 0;
+    allowed_chunks = chunks_for((uint64_t) n_ubatch + n_ahead);
     n_read    = 0;
+    n_pages_all = 0;
     consumed  = 0;
     t_wait_us = 0;
     n_ubatch_c = 0;
@@ -160,15 +224,18 @@ bool llama_ple_prefetch::start(const llama_batch_ext & batch, llama_pos pos0) {
     running    = true;
 
     coord = std::thread([this]() { build(); });
-    return true;
+    llama_thread_off_caller_cpu(coord); // the readers it starts inherit its CPU set
 }
 
-size_t llama_ple_prefetch::allowed_for(uint64_t n_tok) const {
-    if (n_chunks == 0) {
-        return 0;
+size_t llama_ple_prefetch::chunks_for(uint64_t n_tok) const {
+    return (size_t) std::min<uint64_t>(n_chunks, n_tok/CHUNK + (n_tok % CHUNK != 0));
+}
+
+bool llama_ple_prefetch::run_ready(size_t i) const {
+    if (stopping.load()) {
+        return true;
     }
-    const size_t c = (size_t) std::min<uint64_t>(n_chunks, (n_tok + CHUNK - 1)/CHUNK);
-    return c == 0 ? 0 : chunk_end[c - 1];
+    return i < n_built.load() ? run_chunk[i] < allowed_chunks.load() : built.load();
 }
 
 void llama_ple_prefetch::build() {
@@ -180,56 +247,61 @@ void llama_ple_prefetch::build() {
     const int64_t per_gram = hp.ple_heads_per_ngram;
     const int64_t eos      = hp.ple_eos_token_id;
 
-    // the rows, as llm_graph_input_qwen4exp_ple::set_input computes them; a predecessor before the call is unknown,
-    // unless the call starts the sequence (then it reads as EOS)
-    pred.assign((size_t) (n*n_heads), -1);
-    std::vector<int64_t> ctx(n_gram);
-    for (int64_t i = 0; i < n; ++i) {
-        ctx[0] = toks[i];
-        int64_t known = 0;
-        bool    cut   = false;
-        for (int64_t s = 1; s < n_gram; ++s) {
-            if (!cut && i - s < 0) {
-                if (!seq_start) {
-                    break;
-                }
-                cut = true;
-            }
-            const int64_t t = cut ? -1 : toks[i - s];
-            cut = cut || t < 0 || t == eos;
-            ctx[s] = cut ? eos : t;
-            known  = s;
-        }
-        for (int64_t g = 2; g <= n_gram && g - 1 <= known; ++g) {
-            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < g; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
-            }
-            const int64_t base = (g - 2) * per_gram;
-            for (int64_t k = 0; k < per_gram; ++k) {
-                const int64_t h = base + k;
-                pred[(size_t) (i*n_heads + h)] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
-            }
-        }
+    // [PFGAP] the readers start first and follow the chunks as they are published
+    std::vector<int64_t> last(n_threads, 0);
+    readers.clear();
+    readers.reserve(n_threads);
+    for (int i = 0; i < n_threads; ++i) {
+        readers.emplace_back([this, i, &last]() { last[i] = reader(); });
     }
 
-    // the pages, chunk by chunk in token order, each page once
     const uint64_t base  = use_pread ? file_off : (uint64_t) (uintptr_t) ple->data;
     const uint64_t key0  = base / 4096;
     const uint64_t nkeys = (base + n_rows*row_size + 4095)/4096 - key0 + 1;
     std::vector<uint8_t> seen(nkeys, 0);
+    std::vector<uint64_t> cp;   // the new pages of one chunk
+    cp.reserve((size_t) CHUNK*n_heads*2);
 
-    n_chunks = (size_t) ((n + CHUNK - 1)/CHUNK);
-    chunk_end.assign(n_chunks, 0);
-    remaining.reset(new std::atomic<int64_t>[n_chunks]);
-    pages.clear();
-    page_chunk.clear();
-    pages.reserve((size_t) n*n_heads/2);
-    page_chunk.reserve((size_t) n*n_heads/2);
-    for (size_t c = 0; c < n_chunks; ++c) {
-        const size_t p0 = pages.size();
-        const int64_t i1 = std::min<int64_t>(n, (int64_t) (c + 1)*CHUNK);
-        for (int64_t i = (int64_t) c*CHUNK; i < i1; ++i) {
+    // the rows, as llm_graph_input_qwen4exp_ple::set_input computes them; a predecessor before the call is unknown,
+    // unless the call starts the sequence (then it reads as EOS)
+    pred.assign((size_t) (n*n_heads), -1);
+    std::vector<int64_t> ctx(n_gram);
+    size_t nr = 0;
+    for (size_t c = 0; c < n_chunks && !stopping.load(std::memory_order_relaxed); ++c) {
+        const int64_t i0 = (int64_t) c*CHUNK;
+        const int64_t i1 = std::min<int64_t>(n, i0 + CHUNK);
+        for (int64_t i = i0; i < i1; ++i) {
+            ctx[0] = toks[i];
+            int64_t known = 0;
+            bool    cut   = false;
+            for (int64_t s = 1; s < n_gram; ++s) {
+                if (!cut && i - s < 0) {
+                    if (!seq_start) {
+                        break;
+                    }
+                    cut = true;
+                }
+                const int64_t t = cut ? -1 : toks[i - s];
+                cut = cut || t < 0 || t == eos;
+                ctx[s] = cut ? eos : t;
+                known  = s;
+            }
+            for (int64_t g = 2; g <= n_gram && g - 1 <= known; ++g) {
+                uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+                for (int64_t j = 1; j < g; ++j) {
+                    mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+                }
+                const int64_t hb = (g - 2) * per_gram;
+                for (int64_t k = 0; k < per_gram; ++k) {
+                    const int64_t h = hb + k;
+                    pred[(size_t) (i*n_heads + h)] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
+                }
+            }
+        }
+
+        // the chunk's pages not read for an earlier chunk, sorted, then merged into runs of consecutive pages
+        cp.clear();
+        for (int64_t i = i0; i < i1; ++i) {
             for (int64_t h = 0; h < n_heads; ++h) {
                 const int32_t r = pred[(size_t) (i*n_heads + h)];
                 if (r < 0 || (uint64_t) r >= n_rows) {
@@ -240,36 +312,42 @@ void llama_ple_prefetch::build() {
                 for (uint64_t k = k0; k <= k1; ++k) {
                     if (!seen[k - key0]) {
                         seen[k - key0] = 1;
-                        pages.push_back(k);
+                        cp.push_back(k);
                     }
                 }
             }
         }
-        std::sort(pages.begin() + p0, pages.end());
-        page_chunk.resize(pages.size(), (uint32_t) c);
-        chunk_end[c] = pages.size();
-        remaining[c].store((int64_t) (pages.size() - p0));
+        std::sort(cp.begin(), cp.end());
+        const size_t r0 = nr;
+        for (size_t j = 0; j < cp.size(); ++j) {
+            if (nr > r0 && cp[j] == run_key[nr - 1] + run_len[nr - 1] && run_len[nr - 1] < RUN_MAX) {
+                ++run_len[nr - 1];
+            } else {
+                run_key[nr] = cp[j];
+                run_len[nr] = 1;
+                run_chunk[nr] = (uint32_t) c;
+                ++nr;
+            }
+        }
+        n_pages_all += cp.size();
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            remaining[c].store((int64_t) (nr - r0));
+            n_built.store(nr);
+        }
+        cv_work.notify_all();
+        if (nr == r0) {
+            cv_done.notify_all();
+        }
     }
     t_build_us = ggml_time_us() - t_start_us;
-
     {
         std::lock_guard<std::mutex> lk(mtx);
-        // the first ubatch and the read-ahead
-        allowed = std::max(allowed.load(), allowed_for((uint64_t) n_ubatch + n_ahead));
         built = true;
     }
-    cv_done.notify_all();
     cv_work.notify_all();
+    cv_done.notify_all();
 
-    if (stopping) {
-        return;
-    }
-    std::vector<int64_t> last(n_threads, 0);
-    readers.clear();
-    readers.reserve(n_threads);
-    for (int i = 0; i < n_threads; ++i) {
-        readers.emplace_back([this, i, &last]() { last[i] = reader(); });
-    }
     for (auto & th : readers) {
         th.join();
     }
@@ -282,37 +360,37 @@ void llama_ple_prefetch::build() {
 }
 
 int64_t llama_ple_prefetch::reader() {
-    char buf[4096];
+    std::vector<char> buf(use_pread && !use_advise ? (size_t) RUN_MAX*4096 : 0);
     int64_t t_last = 0;
     for (;;) {
-        if (stopping.load(std::memory_order_relaxed)) {
-            break;
-        }
         const size_t i = cursor.fetch_add(1);
-        if (i >= pages.size()) {
+        if (!run_ready(i)) {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv_work.wait(lk, [&]() { return run_ready(i); });
+        }
+        if (stopping.load() || i >= n_built.load()) {
             break;
         }
-        if (i >= allowed.load()) {
-            std::unique_lock<std::mutex> lk(mtx);
-            cv_work.wait(lk, [&]() { return stopping.load() || allowed.load() > i; });
-            if (stopping) {
-                break;
-            }
-        }
+        const uint64_t off = run_key[i]*4096, len = (uint64_t) run_len[i]*4096;
 #if defined(__linux__)
-        if (use_pread) {
-            if (pread(fd, buf, sizeof(buf), (off_t) (pages[i]*4096)) < 0) {
+        if (use_advise) {
+            posix_fadvise(fd, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
+        } else if (use_pread) {
+            if (pread(fd, buf.data(), (size_t) len, (off_t) off) < 0) {
                 // a failed read only costs the gather a fault
             }
         } else
 #endif
         {
-            const volatile char * p = (const volatile char *) (uintptr_t) (pages[i]*4096);
-            buf[0] = *p;
+            char sink = 0;
+            for (uint64_t o = 0; o < len; o += 4096) {
+                sink ^= *(const volatile char *) (uintptr_t) (off + o);
+            }
+            GGML_UNUSED(sink);
         }
-        n_read.fetch_add(1, std::memory_order_relaxed);
+        n_read.fetch_add(run_len[i], std::memory_order_relaxed);
         t_last = ggml_time_us();
-        if (remaining[page_chunk[i]].fetch_sub(1) == 1) {
+        if (remaining[run_chunk[i]].fetch_sub(1) == 1) {
             std::lock_guard<std::mutex> lk(mtx);
             cv_done.notify_all();
         }
@@ -325,13 +403,6 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
         return false;
     }
     const int64_t tw = ggml_time_us();
-    {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv_done.wait(lk, [&]() { return built.load() || stopping.load(); });
-    }
-    if (stopping) {
-        return false;
-    }
     const uint64_t t0 = consumed, t1 = t0 + n_tokens;
     consumed = t1;
     if (t1 > toks.size()) {
@@ -340,9 +411,9 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
     }
     {
         std::lock_guard<std::mutex> lk(mtx);
-        const size_t a = allowed_for(t1 + n_ahead);
-        if (a > allowed) {
-            allowed = a;
+        const size_t a = chunks_for(t1 + n_ahead);
+        if (a > allowed_chunks.load()) {
+            allowed_chunks.store(a);
         }
     }
     cv_work.notify_all();
@@ -361,6 +432,9 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
             }
             return true;
         });
+    }
+    if (stopping) {
+        return false;
     }
     t_wait_us += ggml_time_us() - tw;
     ++n_ubatch_c;
@@ -384,21 +458,21 @@ void llama_ple_prefetch::stop() {
         coord.join();
     }
     running = false;
+    hinted  = false;
 
-    LLAMA_LOG_WARN("%s: [PLEPF] %zu tokens: %zu pages (%.0f MiB) guessed in %.1f ms, %" PRId64 " read, last read at %.1f ms; "
-            "%d ubatches waited %.1f ms in all%s", __func__, toks.size(), pages.size(), pages.size()*4096.0/1048576.0,
-            t_build_us.load()/1e3, n_read.load(), t_last_read_us.load()/1e3, n_ubatch_c, t_wait_us/1e3,
+    LLAMA_LOG_WARN("%s: [PLEPF] %zu tokens: %zu pages (%.0f MiB) in %zu reads, guessed in %.1f ms, %" PRId64 " read, last read at %.1f ms; "
+            "%d ubatches waited %.1f ms in all%s", __func__, toks.size(), n_pages_all, n_pages_all*4096.0/1048576.0,
+            (size_t) n_built.load(), t_build_us.load()/1e3, n_read.load(), t_last_read_us.load()/1e3, n_ubatch_c, t_wait_us/1e3,
             n_ubatch_u ? " (some ubatches fell outside the call)" : "");
     LLAMA_LOG_CONT("\n");
 
     toks.clear();
     pred.clear();
     pred.shrink_to_fit();
-    pages.clear();
-    pages.shrink_to_fit();
-    page_chunk.clear();
-    page_chunk.shrink_to_fit();
-    chunk_end.clear();
+    run_key.reset();
+    run_len.reset();
+    run_chunk.reset();
     remaining.reset();
     n_chunks = 0;
+    n_built  = 0;
 }
