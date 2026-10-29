@@ -5224,10 +5224,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     // [PLEPF] start reading the PLE pages of a prompt call; stopped when the call returns
-    if (!ple_pf_tried) {
-        ple_pf_tried = true;
-        ple_pf = llama_ple_prefetch::create(model, cparams.n_ubatch);
-    }
+    ple_pf_init();
     struct ple_pf_guard {
         llama_ple_prefetch * p = nullptr;
         ~ple_pf_guard() {
@@ -10112,4 +10109,27 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_context::ple_pf_init() {
+    if (!ple_pf_tried) {
+        ple_pf_tried = true;
+        ple_pf = llama_ple_prefetch::create(model, cparams.n_ubatch);
+    }
+}
+
+void llama_context::ple_pf_hint(const llama_token * tokens, size_t n, llama_pos pos0) {
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return;
+    }
+    ple_pf_init();
+    if (ple_pf) {
+        ple_pf->hint(tokens, n, pos0);
+    }
+}
+
+void llama_ple_prefetch_hint(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0) {
+    if (ctx && tokens && n_tokens > 0) {
+        ctx->ple_pf_hint(tokens, (size_t) n_tokens, pos0);
+    }
 }

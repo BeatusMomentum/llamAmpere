@@ -3,6 +3,7 @@
 #include "mmq.cuh"
 #include "mmq-prefill.cuh"
 #include "quantize.cuh"
+#include "dense-tc.cuh"
 #include "mmid.cuh"
 
 #include <cstdint>
@@ -496,6 +497,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+
+    // [PFGAP-U3] dense quantized prompt matmuls take dequant + bf16 cuBLAS (FP32 accumulate) where detected faster
+    if (n_experts == 0 && ggml_cuda_dense_tc_wants(type, ne11)) {
+        return false;
+    }
 
     bool mmq_supported;
 

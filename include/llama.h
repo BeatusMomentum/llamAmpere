@@ -961,6 +961,11 @@ extern "C" {
     // live cache to still hold the sealed records below that end (llama_sj_kvarn_seq_sealed_end() >= the result).
     LLAMA_API int32_t llama_sj_kvarn_ckpt_sealed_end(const uint8_t * data, size_t size, llama_pos * pos_end);
 
+    // The tokens of the next prompt call on one sequence, starting at pos0, before it is decoded: models with a disk-mapped
+    // per-layer embedding table start reading the rows it will need now. A following llama_decode of these tokens (or of
+    // a prefix of them) at pos0 continues those reads. No-op for other models and for short calls.
+    LLAMA_API void llama_ple_prefetch_hint(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 

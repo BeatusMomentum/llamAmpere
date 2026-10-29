@@ -4603,6 +4603,63 @@ struct test_rms_norm_mul_cast : public test_case {
     }
 };
 
+// RMS_NORM rows of <= 256 columns (CUDA [NORMROWS] / [GATEDNORM]): mode 0 = RMS_NORM -> MUL(w) -> MUL(sigmoid(z)),
+// 1 = RMS_NORM -> SCALE (the GDN l2 norm), 2 = RMS_NORM -> MUL(w); strided = x is a view with a wider row stride
+struct test_rms_norm_gate : public test_case {
+    const std::array<int64_t, 3> ne;
+    const int mode;
+    const bool strided;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, mode, strided, eps);
+    }
+
+    test_rms_norm_gate(std::array<int64_t, 3> ne = {128, 48, 64}, int mode = 0, bool strided = false, float eps = 1e-6f)
+        : ne(ne), mode(mode), strided(strided), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (strided) {
+            ggml_tensor * p = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0]*3, ne[1], ne[2]);
+            ggml_set_name(p, "x_parent");
+            x = ggml_view_3d(ctx, p, ne[0], ne[1], ne[2], p->nb[1], p->nb[2], ne[0]*sizeof(float));
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        }
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out;
+        if (mode == 1) {
+            out = ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/ne[0]), 1.0f/sqrtf((float) ne[0]));
+        } else if (mode == 2) {
+            out = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        } else {
+            ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+            ggml_set_name(z, "z");
+            ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+            out = ggml_mul(ctx, n, ggml_sigmoid(ctx, z));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -11477,16 +11534,19 @@ struct test_moe_reduce : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const int  shexp_gate; // 0: none; 1: + shexp * sigmoid(w . y), routed sum first; 2: gated term first
 
     test_moe_reduce(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            int shexp_gate = 0) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), shexp_gate(shexp_gate) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        return VARS_TO_STR7(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds,
+            shexp_gate);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -11539,6 +11599,24 @@ struct test_moe_reduce : public test_case {
             }
         }
         ggml_set_name(out, "moe_reduce");
+        if (shexp_gate == 0) {
+            return out;
+        }
+        // the shared-expert gate of the Qwen3-Next style FFN ([MOECOMBINE] on CUDA)
+        // the routed sum is ordered first in either operand order, as in the model graph
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, out);
+        }
+        const int64_t K = 96;
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);
+        ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(w, "shexp_gate_w");
+        ggml_set_name(y, "shexp_gate_y");
+        ggml_set_name(x, "shexp");
+        ggml_tensor * gated = ggml_mul(ctx, x, ggml_sigmoid(ctx, ggml_mul_mat(ctx, w, y)));
+        out = shexp_gate == 1 ? ggml_add(ctx, out, gated) : ggml_add(ctx, gated, out);
+        ggml_set_name(out, "moe_combine");
         return out;
     }
 };
@@ -14855,8 +14933,28 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 }
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// [PFGAP-U3] Flash-Next dense prompt matmul shapes {output, input} at 1024 / 12288 tokens
+static void add_fn_dense_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {12288, 2560}, {2560, 6144}, {640, 2560}, {2560, 640}}) {
+        for (int64_t n : {1024, 12288}) {
+            // 640-wide inputs (shared-expert down) are IQ4_NL / Q2_0 in the model; 256-block types cannot hold them
+            const std::vector<ggml_type> types = mk.second % 256 == 0
+                ? std::vector<ggml_type>{GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}
+                : std::vector<ggml_type>{GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0};
+            for (ggml_type t : types) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [PFGAP-U3] GGML_TEST_FN_DENSE_PERF=1 also limits the eval list to the Flash-Next dense shapes
+    if (getenv("GGML_TEST_FN_DENSE_PERF") != nullptr) {
+        add_fn_dense_cases(test_cases);
+        return test_cases;
+    }
     // MMQ_PAIR: native IQ expert formats, dense/ID, broadcast/nonbroadcast,
     // mixed compatible formats, partial column tile, parallel-ID threshold,
     // and explicit fallback guards. CUDA mode 2 proves exactness separately
@@ -16069,6 +16167,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_cast({2560, 4, 64}));
     test_cases.emplace_back(new test_rms_norm_mul_cast({2560, 4, 37}));
     test_cases.emplace_back(new test_rms_norm_mul_cast({1000, 3, 5}));
+    for (int mode : {0, 1, 2}) {
+        for (bool strided : {false, true}) {
+            for (auto ne : std::vector<std::array<int64_t, 3>>{{128, 48, 64}, {128, 16, 37}, {64, 7, 5}, {33, 5, 3},
+                                                                {256, 4, 9}, {200, 3, 2}, {257, 3, 2}, {1, 4, 3}}) {
+                test_cases.emplace_back(new test_rms_norm_gate(ne, mode, strided));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
@@ -18282,6 +18388,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_reduce(2560, 10, 64, false, false, false, 1));
+    test_cases.emplace_back(new test_moe_reduce(2560, 10, 64, false, false, false, 2));
+    test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true,  true,  1));
+    test_cases.emplace_back(new test_moe_reduce(2048, 8,  4,  false, true,  false, 1)); // too few tokens: not fused
 
     add_gated_delta_net_range_cases(test_cases, false);
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 65, 1, 3, false, true));
@@ -18598,6 +18708,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [PFGAP-U3] Flash-Next non-routed prompt matmuls (attention, GDN output, shared expert): GGML_TEST_FN_DENSE_PERF=1
+    if (getenv("GGML_TEST_FN_DENSE_PERF") != nullptr) {
+        add_fn_dense_cases(test_cases);
+        return test_cases;
+    }
+    // [GATEDNORM] Flash-Next GDN norms at a 12288-token ubatch: GGML_TEST_GDN_NORM_PERF=1 runs only these
+    if (getenv("GGML_TEST_GDN_NORM_PERF") != nullptr) {
+        test_cases.emplace_back(new test_rms_norm_gate({128, 48, 12288}, 0, false));
+        test_cases.emplace_back(new test_rms_norm_gate({128, 16, 12288}, 1, true));
+        test_cases.emplace_back(new test_rms_norm_gate({128, 48, 12288}, 2, false));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_BF16, {2560, 12288, 1, 1}));
+        return test_cases;
+    }
     // [AIV2] GGML_TEST_AIV2_PERF=1: only the AI+ gate-2 rival list (IQ2_XXS..IQ4_XS, today's AI+, EXL3 2/3/4 with and
     // without the Hadamard glue) at the 27B FFN shapes 17408 x 5120 and 5120 x 17408, widths 1 / 4 / 5 / 8
     if (getenv("GGML_TEST_AIV2_PERF") != nullptr) {

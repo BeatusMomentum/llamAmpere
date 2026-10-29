@@ -810,8 +810,10 @@ void llama_b1::start_streaming() {
     io_error = false;
     for (int w = 0; w < n_workers; ++w) {
         workers.emplace_back(&llama_b1::worker, this, w);
+        llama_thread_off_caller_cpu(workers.back());
     }
     coord = std::thread(&llama_b1::coordinator, this);
+    llama_thread_off_caller_cpu(coord);
 }
 
 void llama_b1::reserve_layer_bind(int il) {
