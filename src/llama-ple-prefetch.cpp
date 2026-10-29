@@ -19,7 +19,7 @@
 #include <unistd.h>
 #endif
 
-static constexpr int64_t PLE_PF_DEFAULT_THREADS = 2;
+static constexpr int64_t PLE_PF_DEFAULT_THREADS = 0;
 static constexpr int64_t PLE_PF_DEFAULT_MIN     = 4096;
 
 static int64_t ple_pf_env(const char * name, int64_t def) {
@@ -63,9 +63,7 @@ static bool ple_pf_resolve(const void * addr, std::string & path, uint64_t & off
 #endif
 
 std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model & model, uint32_t n_ubatch) {
-    // [PFGAP] on by default for long prompt calls: the prompt's rows (~2 GiB at 100K tokens) are otherwise read by
-    // page faults one at a time inside the first layers, a multi-second card stall when the table is not cached.
-    // LLAMA_PLE_PREFETCH=0 turns it off, =N sets the reader threads.
+    // Opt in with LLAMA_PLE_PREFETCH=N reader threads; read-ahead can churn the page cache on low-RAM hosts.
     const bool    user  = getenv("LLAMA_PLE_PREFETCH") != nullptr;
     const int64_t n_thr = ple_pf_env("LLAMA_PLE_PREFETCH", ple_pf_env("LLAMA_PLE_PF_THREADS", PLE_PF_DEFAULT_THREADS));
     if (n_thr <= 0) {
